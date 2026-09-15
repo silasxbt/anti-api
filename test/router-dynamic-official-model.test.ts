@@ -28,12 +28,16 @@ mock.module("~/services/antigravity/account-manager", () => ({
 
 mock.module("~/services/codex/chat", () => ({
     createCodexCompletion: async () => ({ contentBlocks: [], stopReason: "end_turn", usage: {} }),
+    isCodexInsecureTlsEnabled: () => false,
+    listCodexModelsForAccount: async () => [],
     isCodexModelSupportedForAccount: () => undefined,
     isCodexUnsupportedModelError: () => false,
 }))
 
 mock.module("~/services/copilot/chat", () => ({
     createCopilotCompletion: async () => ({ contentBlocks: [], stopReason: "end_turn", usage: {} }),
+    isCopilotInsecureTlsEnabled: () => false,
+    listCopilotModelsForAccount: async () => [],
 }))
 
 mock.module("~/services/auth/store", () => ({

@@ -3,6 +3,7 @@ import { dirname, join } from "path"
 
 import { runCli } from "./main"
 import { startRustProxy, stopRustProxy } from "./lib/rust-proxy"
+import { runPackagedRuntime } from "./lib/packaged-runtime"
 
 const exeDir = dirname(process.execPath)
 const publicDir = join(exeDir, "public")
@@ -28,13 +29,16 @@ process.on("SIGTERM", () => {
     process.exit(143)
 })
 
-if (existsSync(rustProxyPath)) {
-    await startRustProxy()
-}
-
-try {
-    const rawArgs = process.argv.slice(2)
-    await runCli(rawArgs.length > 0 ? rawArgs : ["start"])
-} finally {
+// citty terminates the process directly on command/startup errors. Keep a
+// synchronous last-resort cleanup hook so those exits cannot orphan the child.
+process.on("exit", () => {
     stopRustProxy()
-}
+})
+
+await runPackagedRuntime(process.argv.slice(2), {
+    sidecarAvailable: existsSync(rustProxyPath),
+    startSidecar: startRustProxy,
+    stopSidecar: stopRustProxy,
+    runCli,
+    startupFailed: () => typeof process.exitCode === "number" && process.exitCode !== 0,
+})

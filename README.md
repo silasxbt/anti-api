@@ -19,7 +19,14 @@
 
 > **Scope and authorization**: Anti-API is an independent, unofficial interoperability project. Some integrations use provider CLI, web, or internal endpoints and may break without notice. Compatibility does not imply provider affiliation or endorsement. Use only accounts and services you own or are explicitly authorized to administer, subject to each provider's current terms. Do not disable security updates or provider controls to preserve compatibility.
 
-## What's New (v3.2.0)
+## What's New (v3.2.1)
+
+- **Packaged sidecar lifecycle** - Compiled `start` and `remote` commands now keep the Rust proxy alive for the full server lifetime, while one-shot commands never start it. Signals, startup exceptions, and direct CLI exits all clean up the child process.
+- **Deterministic Bun test suite** - Shared Codex and Copilot module mocks expose the complete runtime surface used by later server imports, preventing test-file order from producing false missing-export failures.
+- **Release validation** - Verified 196 Bun tests, Rust release compilation, both Bun entrypoint bundles, and a compiled-runtime smoke test covering both loopback listeners, sidecar authentication, graceful shutdown, one-shot behavior, and forced-startup cleanup.
+
+<details>
+<summary>v3.2.0</summary>
 
 - **Provider compatibility and routing** - Improved Antigravity Gemini 3.1 request encoding, dynamic Copilot/model normalization, Codex reasoning-effort handling, and Responses API multimodal conversion for Zed, Codex, and Grok. Flow and account routes now preserve a sticky cursor and wrap through every eligible fallback entry.
 - **Six supported providers** - Antigravity, ChatGPT Codex, GitHub Copilot, Zed hosted models, Amazon Kiro, and xAI Grok can be imported, listed, quota-checked, and routed from the dashboard (subject to each provider's current access and terms).
@@ -30,6 +37,8 @@
 - **Cancellation, limits, and log safety** - Propagated request aborts through routed providers, bounded request bodies and streams, applied cooldown-aware 404/429 failover, and removed upstream response bodies and credential material from logs.
 
 Release verification covered the TypeScript check, 190 Bun tests, Rust tests and release build, production dashboard bundle, archive layout, checksum generation, and local HTTP smoke checks. Live provider calls still require credentials owned or administered by the operator.
+
+</details>
 
 ## What's New (v3.1.0)
 
@@ -479,7 +488,14 @@ MIT
 
 > **范围与授权说明**：Anti-API 是独立、非官方的互操作项目。部分集成使用提供商的 CLI、网页或内部端点，可能随时失效。兼容性不代表提供商隶属或背书。仅可使用本人拥有或被明确授权管理的账号与服务，并须遵守各提供商现行条款；不得为维持兼容而停用安全更新或提供商控制。
 
-## 更新内容 (v3.2.0)
+## 更新内容 (v3.2.1)
+
+- **打包版 sidecar 生命周期** - 编译后的 `start` 与 `remote` 命令会在服务器整个生命周期内保留 Rust proxy；单次命令不会启动 sidecar。信号退出、启动异常以及 CLI 直接退出都会清理子进程。
+- **稳定的 Bun 测试套件** - Codex 与 Copilot 的共享模块 mock 现在提供后续 server 导入所需的完整运行时导出，避免测试文件顺序造成虚假的缺失导出错误。
+- **发布验证** - 已通过 196 个 Bun 测试、Rust release 编译、两个 Bun 入口构建，以及编译运行时冒烟测试；覆盖双回环监听、sidecar 鉴权、优雅关闭、单次命令和强制启动失败清理。
+
+<details>
+<summary>v3.2.0</summary>
 
 - **Provider 兼容性与路由** - 改进 Antigravity Gemini 3.1 请求编码、Copilot/模型动态规范化、Codex reasoning effort，以及 Zed、Codex、Grok 的 Responses 多模态转换；Flow 与 Account 路由现在保留粘性游标，并循环尝试所有可用的回退条目。
 - **六家 Provider** - 支持 Antigravity、ChatGPT Codex、GitHub Copilot、Zed 托管模型、Amazon Kiro 与 xAI Grok 的账号导入、列表、额度检查和路由（仍受各提供商当前权限与条款约束）。
@@ -490,6 +506,8 @@ MIT
 - **取消、限制与日志安全** - 将请求取消传播到各路由 provider，限制请求体和流大小，对 404/429 应用冷却与故障转移，并移除日志中的上游响应正文和凭证材料。
 
 发布前已完成 TypeScript 检查、190 个 Bun 测试、Rust 测试与 release 构建、生产面板打包、归档布局、校验和生成及本地 HTTP 冒烟测试。真实 Provider 请求仍需由操作者提供本人拥有或获授权管理的凭证。
+
+</details>
 
 ## 更新内容 (v3.1.0)
 

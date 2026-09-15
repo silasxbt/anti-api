@@ -27,3 +27,9 @@ test("TypeScript generates one in-memory token for spawn and proxy requests", ()
     expect(bridgeSource).toContain("[SIDECAR_TOKEN_HEADER]: sidecarToken")
     expect(bridgeSource).not.toMatch(/writeFile|Bun\.write/)
 })
+
+test("packaged runtime registers process-exit cleanup for direct CLI exits", () => {
+    const source = readFileSync(join(import.meta.dir, "../src/packaged-main.ts"), "utf8")
+    expect(source).toContain('process.on("exit"')
+    expect(source).toContain("stopRustProxy()")
+})

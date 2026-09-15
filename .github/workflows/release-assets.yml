@@ -36,13 +36,13 @@ jobs:
           cat > RELEASE_NOTES.md <<EOF
           ## Anti-API v${{ steps.package.outputs.version }}
 
-          This release contains the compatibility, routing, security, and packaging fixes implemented for the current issue audit.
+          This patch fixes packaged Rust-sidecar lifecycle handling and Bun test isolation.
 
-          Validation completed before publishing: TypeScript type check, 190 Bun tests, Rust tests, production bundle, Rust release build, source archive layout, and local HTTP smoke checks.
+          Packaged start and remote commands now keep the sidecar alive until shutdown, one-shot commands do not spawn it, and startup failures cannot orphan it. Codex and Copilot test mocks now expose the runtime exports required by later server imports.
 
-          Known limits: Zed source credentials still require explicit re-import after source-token expiry; provider-policy questions remain contextual; live provider E2E requires user-owned credentials and was not run.
+          Validation completed before publishing: 196 Bun tests, Rust release build, main and packaged Bun bundles, source archive checks, and compiled-runtime smoke tests for listeners, sidecar authentication, graceful shutdown, one-shot behavior, and forced-startup cleanup.
 
-          Source package checksums are in `SHA256SUMS.txt`; Windows updater and WinGet packages include adjacent `.sha256` files.
+          Source package checksums are in SHA256SUMS.txt; Windows updater and WinGet packages include adjacent .sha256 files.
           EOF
 
       - name: Create or update GitHub Release
