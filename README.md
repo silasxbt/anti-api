@@ -19,11 +19,19 @@
 
 > **Scope and authorization**: Anti-API is an independent, unofficial interoperability project. Some integrations use provider CLI, web, or internal endpoints and may break without notice. Compatibility does not imply provider affiliation or endorsement. Use only accounts and services you own or are explicitly authorized to administer, subject to each provider's current terms. Do not disable security updates or provider controls to preserve compatibility.
 
-## What's New (v3.2.1)
+## What's New (v3.2.2)
+
+- **Docker release fix** - Corrected the Dockerfile health-check instruction so multi-architecture GHCR images build successfully with Docker Buildx.
+- **Packaged runtime fixes from v3.2.1** - Includes the sidecar lifecycle and deterministic Bun test-suite fixes described below.
+
+<details>
+<summary>v3.2.1</summary>
 
 - **Packaged sidecar lifecycle** - Compiled `start` and `remote` commands now keep the Rust proxy alive for the full server lifetime, while one-shot commands never start it. Signals, startup exceptions, and direct CLI exits all clean up the child process.
 - **Deterministic Bun test suite** - Shared Codex and Copilot module mocks expose the complete runtime surface used by later server imports, preventing test-file order from producing false missing-export failures.
 - **Release validation** - Verified 196 Bun tests, Rust release compilation, both Bun entrypoint bundles, and a compiled-runtime smoke test covering both loopback listeners, sidecar authentication, graceful shutdown, one-shot behavior, and forced-startup cleanup.
+
+</details>
 
 <details>
 <summary>v3.2.0</summary>
@@ -488,11 +496,19 @@ MIT
 
 > **范围与授权说明**：Anti-API 是独立、非官方的互操作项目。部分集成使用提供商的 CLI、网页或内部端点，可能随时失效。兼容性不代表提供商隶属或背书。仅可使用本人拥有或被明确授权管理的账号与服务，并须遵守各提供商现行条款；不得为维持兼容而停用安全更新或提供商控制。
 
-## 更新内容 (v3.2.1)
+## 更新内容 (v3.2.2)
+
+- **Docker 发布修复** - 修正 Dockerfile 健康检查指令，确保 Docker Buildx 可以成功构建并发布多架构 GHCR 镜像。
+- **包含 v3.2.1 打包运行时修复** - 包含下面列出的 sidecar 生命周期与 Bun 测试稳定性修复。
+
+<details>
+<summary>v3.2.1</summary>
 
 - **打包版 sidecar 生命周期** - 编译后的 `start` 与 `remote` 命令会在服务器整个生命周期内保留 Rust proxy；单次命令不会启动 sidecar。信号退出、启动异常以及 CLI 直接退出都会清理子进程。
 - **稳定的 Bun 测试套件** - Codex 与 Copilot 的共享模块 mock 现在提供后续 server 导入所需的完整运行时导出，避免测试文件顺序造成虚假的缺失导出错误。
 - **发布验证** - 已通过 196 个 Bun 测试、Rust release 编译、两个 Bun 入口构建，以及编译运行时冒烟测试；覆盖双回环监听、sidecar 鉴权、优雅关闭、单次命令和强制启动失败清理。
+
+</details>
 
 <details>
 <summary>v3.2.0</summary>

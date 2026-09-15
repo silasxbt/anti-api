@@ -36,7 +36,7 @@ jobs:
           cat > RELEASE_NOTES.md <<EOF
           ## Anti-API v${{ steps.package.outputs.version }}
 
-          This patch fixes packaged Rust-sidecar lifecycle handling and Bun test isolation.
+          This patch fixes the Docker health-check syntax required for multi-architecture GHCR builds and includes the packaged Rust-sidecar lifecycle and Bun test-isolation fixes from v3.2.1.
 
           Packaged start and remote commands now keep the sidecar alive until shutdown, one-shot commands do not spawn it, and startup failures cannot orphan it. Codex and Copilot test mocks now expose the runtime exports required by later server imports.
 

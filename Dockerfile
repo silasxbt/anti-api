@@ -37,6 +37,6 @@ RUN mkdir -p /app/data
 EXPOSE 8964 1455-1465 51121-51131
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD-SHELL test -n "$ANTI_API_CONTROL_TOKEN" && curl -fsS -H "x-api-key: $ANTI_API_CONTROL_TOKEN" http://127.0.0.1:8964/auth/status >/dev/null || exit 1
+    CMD test -n "$ANTI_API_CONTROL_TOKEN" && curl -fsS -H "x-api-key: $ANTI_API_CONTROL_TOKEN" http://127.0.0.1:8964/auth/status >/dev/null || exit 1
 
 CMD ["bun", "run", "src/main.ts", "start"]

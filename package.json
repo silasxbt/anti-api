@@ -1,6 +1,6 @@
 {
   "name": "anti-api",
-  "version": "3.2.1",
+  "version": "3.2.2",
   "description": "Independent local protocol-compatibility and routing proxy for OpenAI- and Anthropic-style clients",
   "type": "module",
   "scripts": {
