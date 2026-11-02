@@ -5,6 +5,7 @@ import {
     claudeToAntigravity,
     getAntigravityModelName,
     getToolSignatureKey,
+    parseApiResponse,
     thoughtSignatureCache,
 } from "~/services/antigravity/chat"
 
@@ -172,10 +173,32 @@ test("buildAntigravityParts injects thoughtSignature from block or cache", async
         {
             type: "tool_use",
             id: "call_claude_no_sig",
-            name: "read_file",
+            name: "random_unique_tool_name_test",
             input: { path: "foo.txt" },
         },
     ], new Map(), { model: "claude-sonnet-4-5" })
 
     expect(partsClaude[0].thoughtSignature).toBeUndefined()
 })
+
+test("parseApiResponse handles MAX_TOKENS without content gracefully", () => {
+    const raw = JSON.stringify([{
+        response: {
+            candidates: [{
+                finishReason: "MAX_TOKENS",
+                content: { parts: [] }
+            }],
+            usageMetadata: {
+                promptTokenCount: 100,
+                thoughtsTokenCount: 65536,
+                candidatesTokenCount: 0
+            }
+        }
+    }])
+
+    const res = parseApiResponse(raw)
+    expect(res.stopReason).toBe("max_tokens")
+    expect(res.contentBlocks).toEqual([{ type: "text", text: "" }])
+    expect(res.usage.outputTokens).toBe(65536)
+})
+

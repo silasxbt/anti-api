@@ -844,7 +844,7 @@ function mapGoogleFinishReason(reason?: string, hasToolUse = false): string {
     return "end_turn"
 }
 
-function parseApiResponse(rawResponse: string, sessionKey?: string, model?: string): ChatResponse {
+export function parseApiResponse(rawResponse: string, sessionKey?: string, model?: string): ChatResponse {
     let chunks: any[] = []
     const trimmed = rawResponse.trim()
     if (trimmed.startsWith("[")) chunks = JSON.parse(trimmed)
@@ -921,6 +921,8 @@ function parseApiResponse(rawResponse: string, sessionKey?: string, model?: stri
     if (contentBlocks.length === 0 && !hasToolUse) {
         if (stopReason === "content_filter") {
             contentBlocks.push({ type: "text", text: "Response filtered by upstream content policy." })
+        } else if (stopReason === "max_tokens") {
+            contentBlocks.push({ type: "text", text: "" })
         } else {
             throw new UpstreamError(
                 "antigravity",
@@ -1810,6 +1812,9 @@ export async function* createChatCompletionStreamWithOptions(
             if (stopReason === "content_filter") {
                 yield buildContentBlockStart(blockIndex, "text")
                 yield buildTextDelta(blockIndex, "Response filtered by upstream content policy.")
+                yield buildContentBlockStop(blockIndex)
+            } else if (stopReason === "max_tokens") {
+                yield buildContentBlockStart(blockIndex, "text")
                 yield buildContentBlockStop(blockIndex)
             } else {
                 throw new UpstreamError(
