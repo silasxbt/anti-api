@@ -11,6 +11,9 @@ test("mapModel applies reasoning effort to tiered models", () => {
     expect(mapModel("gemini-4-argon", "high")).toBe("gemini-4-argon-high")
     expect(mapModel("gemini-3.8-flash", "low")).toBe("gemini-3.8-flash-low")
     expect(mapModel("claude-opus-5-5", "high")).toBe("claude-opus-5-5-high")
+    expect(mapModel("claude-3-7-sonnet", "high")).toBe("claude-sonnet-5-5-high")
+    expect(mapModel("claude-3-5-sonnet", "medium")).toBe("claude-sonnet-4-5-thinking")
+    expect(mapModel("claude-3-5-sonnet")).toBe("claude-sonnet-4-5")
 })
 
 test("mapModel returns original model for unknown models", () => {

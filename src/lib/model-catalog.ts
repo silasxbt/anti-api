@@ -108,6 +108,27 @@ export function parseModelId(id: string): ParsedModel | null {
         }
     }
 
+    // Claude (Opus / Sonnet), standard Anthropic format e.g. claude-3-7-sonnet, claude-3.5-sonnet, claude-3-opus
+    m = lower.match(/^claude-(\d{1,2}(?:[-.]\d{1,2})?)-(opus|sonnet)(?:-(thinking|high|medium|low|extra-low|tiered|agent|\d{8}|latest))?$/)
+    if (m) {
+        const variantRaw = m[3] || ""
+        const variant = /^\d{8}$|^latest$/.test(variantRaw) ? "" : variantRaw
+        return {
+            id,
+            family: `claude-${m[2]}` as ModelFamily,
+            version: toVersion(m[1]),
+            variant,
+        }
+    }
+    if (lower.startsWith("claude-3-opus") || lower.startsWith("claude-3.0-opus")) {
+        return {
+            id,
+            family: "claude-opus",
+            version: [3],
+            variant: "",
+        }
+    }
+
     // Gemini (Flash, Flash Lite, Pro)
     m = lower.match(/^gemini-(\d{1,2}(?:\.\d{1,2})?)-(flash-lite|flash|pro)(?:-(high|medium|low|extra-low|thinking|tiered|agent))?$/)
     if (m) {

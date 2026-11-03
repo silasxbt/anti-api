@@ -49,12 +49,12 @@ const EFFORT_RULES: EffortRule[] = [
     effortRule(["gemini-3-1-pro", "gemini-3-1-pro-preview"], "gemini-3.1-pro-high", { low: "gemini-3.1-pro-low" }),
     effortRule(["gemini-3-pro"], "gemini-3-pro-high", { low: "gemini-3-pro-low" }),
     thinkingRule(["gemini-2-5-flash"], "gemini-2.5-flash", "gemini-2.5-flash-thinking"),
-    tieredRule(["claude-opus-5-5"], "claude-opus-5-5"),
-    tieredRule(["claude-sonnet-5-5"], "claude-sonnet-5-5"),
+    tieredRule(["claude-opus-5-5", "claude-3-opus", "claude-3-opus-20240229", "claude-opus"], "claude-opus-5-5"),
+    tieredRule(["claude-sonnet-5-5", "claude-3-7-sonnet", "claude-3-7-sonnet-20250219", "claude-3-7-sonnet-latest", "claude-sonnet"], "claude-sonnet-5-5"),
     constantRule(["claude-opus-4-6"], "claude-opus-4-6-thinking"),
     constantRule(["claude-sonnet-4-6"], "claude-sonnet-4-6"),
     constantRule(["claude-opus-4-5"], "claude-opus-4-5-thinking"),
-    thinkingRule(["claude-sonnet-4-5"], "claude-sonnet-4-5", "claude-sonnet-4-5-thinking"),
+    thinkingRule(["claude-sonnet-4-5", "claude-3-5-sonnet", "claude-3-5-sonnet-20241022", "claude-3-5-sonnet-latest", "claude-3-5-haiku"], "claude-sonnet-4-5", "claude-sonnet-4-5-thinking"),
 ]
 
 const EFFORT_RULE_BY_MODEL = new Map<string, EffortRule>(

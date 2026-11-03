@@ -49,18 +49,32 @@ mock.module("~/services/auth/store", () => ({
         getAccount: (provider: Provider, id: string) => {
             return accountsByProvider[provider].find(account => account.id === id) || null
         },
+        saveAccount: (account: any) => {
+            if (account?.provider && (accountsByProvider as any)[account.provider]) {
+                const list = (accountsByProvider as any)[account.provider]
+                const existingIdx = list.findIndex((a: any) => a.id === account.id)
+                if (existingIdx >= 0) list[existingIdx] = account
+                else list.push(account)
+            }
+        },
     },
 }))
 
-mock.module("~/services/antigravity/account-manager", () => ({
-    accountManager: {
-        load: () => { },
-        clearAllRateLimits: () => { },
-        hasAccount: () => true,
-    },
-}))
+mock.module("~/services/antigravity/account-manager", () => {
+    const knownAccounts = new Set<string>()
+    return {
+        accountManager: {
+            load: () => { },
+            clearAllRateLimits: () => { },
+            hasAccount: (id?: string) => !id || knownAccounts.has(id) || true,
+            addAccount: (acc: any) => { if (acc?.id) knownAccounts.add(acc.id) },
+        },
+    }
+})
 
+const realQuotaAggregator = await import("../src/services/quota-aggregator")
 mock.module("~/services/quota-aggregator", () => ({
+    ...realQuotaAggregator,
     getAggregatedQuota: async () => null,
 }))
 

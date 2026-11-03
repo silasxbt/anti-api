@@ -86,7 +86,7 @@ test("Gemini models with specific tool choice use ANY mode with allowed function
     })
 })
 
-test("Claude models attach tools and use VALIDATED function calling mode", async () => {
+test("Claude models attach tools and use AUTO function calling mode", async () => {
     const tools = [{
         name: "search",
         description: "Search web",
@@ -101,7 +101,17 @@ test("Claude models attach tools and use VALIDATED function calling mode", async
 
     expect(request.request.tools).toBeDefined()
     expect(request.request.tools[0].functionDeclarations[0].name).toBe("search")
-    expect(request.request.toolConfig).toEqual({ functionCallingConfig: { mode: "VALIDATED" } })
+    expect(request.request.toolConfig).toEqual({ functionCallingConfig: { mode: "AUTO" } })
+})
+
+test("Claude models without tools omit toolConfig", async () => {
+    const request = await claudeToAntigravity(
+        "claude-sonnet-4-5",
+        [{ role: "user", content: "hello" }]
+    )
+
+    expect(request.request.tools).toBeUndefined()
+    expect(request.request.toolConfig).toBeUndefined()
 })
 
 test("Gemini models without tools omit toolConfig", async () => {
@@ -168,7 +178,7 @@ test("buildAntigravityParts injects thoughtSignature from block or cache", async
 
     expect(partsFallbackGemini[0].thoughtSignature).toBe("skip_thought_signature_validator")
 
-    // 5. Missing signature for Claude models does not inject fallback
+    // 5. Missing signature for Claude models also injects fallback
     const partsClaude = await buildAntigravityParts([
         {
             type: "tool_use",
@@ -178,7 +188,7 @@ test("buildAntigravityParts injects thoughtSignature from block or cache", async
         },
     ], new Map(), { model: "claude-sonnet-4-5" })
 
-    expect(partsClaude[0].thoughtSignature).toBeUndefined()
+    expect(partsClaude[0].thoughtSignature).toBe("skip_thought_signature_validator")
 })
 
 test("parseApiResponse handles MAX_TOKENS without content gracefully", () => {

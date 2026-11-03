@@ -128,9 +128,9 @@ const MODEL_MAPPING: Record<string, string> = Object.fromEntries([
     ...identity("gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low"),
 
     // Claude 5.5
-    ...aliasesTo("claude-opus-5-5-medium", "claude-opus-5-5", "claude-opus-5.5", "claude-opus-5-5-thinking", "claude-opus"),
+    ...aliasesTo("claude-opus-5-5-medium", "claude-opus-5-5", "claude-opus-5.5", "claude-opus-5-5-thinking", "claude-opus", "claude-3-opus", "claude-3.0-opus", "claude-3-opus-latest", "claude-3-opus-20240229", "claude-opus-3"),
     ...identity("claude-opus-5-5-low", "claude-opus-5-5-medium", "claude-opus-5-5-high"),
-    ...aliasesTo("claude-sonnet-5-5-medium", "claude-sonnet-5-5", "claude-sonnet-5.5", "claude-sonnet-5-5-thinking", "claude-sonnet"),
+    ...aliasesTo("claude-sonnet-5-5-medium", "claude-sonnet-5-5", "claude-sonnet-5.5", "claude-sonnet-5-5-thinking", "claude-sonnet", "claude-3-7-sonnet", "claude-3.7-sonnet", "claude-3-7-sonnet-latest", "claude-3-7-sonnet-20250219", "claude-sonnet-3-7", "claude-sonnet-3.7"),
     ...identity("claude-sonnet-5-5-low", "claude-sonnet-5-5-medium", "claude-sonnet-5-5-high"),
 
     // GPT-OSS
@@ -143,7 +143,7 @@ const MODEL_MAPPING: Record<string, string> = Object.fromEntries([
     ...aliasesTo("claude-sonnet-4-6", "claude-sonnet-4.6"),
     ...aliasesTo("claude-opus-4-5-thinking", "claude-opus-4-5", "claude-opus-4.5"),
     ...identity("claude-opus-4-5-thinking", "claude-sonnet-4-5"),
-    ...aliasesTo("claude-sonnet-4-5", "claude-sonnet-4.5", "claude-sonnet-4-5-20251001"),
+    ...aliasesTo("claude-sonnet-4-5", "claude-sonnet-4.5", "claude-sonnet-4-5-20251001", "claude-3-5-sonnet", "claude-3.5-sonnet", "claude-3-5-sonnet-latest", "claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20240620", "claude-sonnet-3-5", "claude-sonnet-3.5", "claude-3-5-haiku", "claude-3.5-haiku"),
     ...identity("claude-sonnet-4-5-thinking"),
     ...aliasesTo("gemini-pro-agent", "gemini-3.1-pro", "gemini-3.1-pro-preview", "gemini-3.1-pro-high"),
     ...identity(
@@ -626,10 +626,10 @@ export async function buildAntigravityParts(
                 || thoughtSignatureCache.get(getToolSignatureKey(toolName, block.input))
                 || thoughtSignatureCache.get(`latest:${toolName}`)
 
-            // For Gemini/Argon models, Google strictly requires a thought_signature in functionCall parts.
-            // If the client or cache dropped the signature (e.g. restart, new session, or standard OpenAI client),
+            // For Antigravity models, Google strictly requires a thought_signature in functionCall parts.
+            // If the client or cache dropped the signature (e.g. restart, new session, or standard OpenAI/VS Code client),
             // use Google's official bypass sentinel to prevent a 400 rejection.
-            if (!signature && isGeminiModel(options.model)) {
+            if (!signature) {
                 signature = "skip_thought_signature_validator"
             }
 
@@ -730,10 +730,9 @@ You are pair programming with a USER to solve their coding task. The task may re
     }
 }
 
-function buildFunctionCallingConfig(toolChoice?: ChatRequest["toolChoice"], isClaude = false): any {
-    const defaultMode = isClaude ? "VALIDATED" : "AUTO"
+function buildFunctionCallingConfig(toolChoice?: ChatRequest["toolChoice"]): any {
     if (!toolChoice) {
-        return { mode: defaultMode }
+        return { mode: "AUTO" }
     }
 
     switch (toolChoice.type) {
@@ -748,7 +747,7 @@ function buildFunctionCallingConfig(toolChoice?: ChatRequest["toolChoice"], isCl
             }
         case "auto":
         default:
-            return { mode: defaultMode }
+            return { mode: "AUTO" }
     }
 }
 
@@ -766,13 +765,7 @@ export function buildGenerationConfig(model: string, maxTokens?: number): Record
     const modelLimit = isGemini31Model(model) ? 65536 : 64000
     const requested = Number.isFinite(maxTokens) ? Math.floor(maxTokens as number) : modelLimit
     const maxOutputTokens = Math.max(1, Math.min(requested, modelLimit))
-    if (isGemini31Model(model)) {
-        return { maxOutputTokens }
-    }
-    return {
-        maxOutputTokens,
-        stopSequences: ["\n\nHuman:", "[DONE]"],
-    }
+    return { maxOutputTokens }
 }
 
 export async function claudeToAntigravity(
@@ -803,13 +796,8 @@ export async function claudeToAntigravity(
         generationConfig: buildGenerationConfig(model, maxTokens),
     }
 
-    // Gemini 3.1 uses the native safety policy. Sending the legacy OFF enum
-    // causes INVALID_ARGUMENT on current Antigravity endpoints.
-    if (!isGemini31Model(model)) innerRequest.safetySettings = buildSafetySettings()
-
-    const isClaude = model.includes("claude")
     if (tools && tools.length > 0) {
-        innerRequest.toolConfig = { functionCallingConfig: buildFunctionCallingConfig(toolChoice, isClaude) }
+        innerRequest.toolConfig = { functionCallingConfig: buildFunctionCallingConfig(toolChoice) }
         innerRequest.tools = tools.map(tool => ({
             functionDeclarations: [{
                 name: tool.name,
@@ -817,8 +805,6 @@ export async function claudeToAntigravity(
                 parameters: normalizeToolParameters(tool.input_schema)
             }]
         }))
-    } else if (isClaude) {
-        innerRequest.toolConfig = { functionCallingConfig: buildFunctionCallingConfig(toolChoice, true) }
     }
 
 

@@ -71,6 +71,12 @@ test("resolveAccountRoutingEntries filters out accounts not supporting the reque
     updateCachedAntigravityModelsForAccount(acc1.id, ["claude-opus-5-5-medium"])
     updateCachedAntigravityModelsForAccount(acc2.id, ["claude-opus-4-6-thinking"])
 
+    const { setDynamicAntigravityModels } = await import("~/services/routing/models")
+    setDynamicAntigravityModels([
+        { id: "claude-opus-5-5-medium", label: "Opus 5.5 Medium" },
+        { id: "claude-opus-4-6-thinking", label: "Opus 4.6 Thinking" },
+    ])
+
     const config = {
         version: 2,
         updatedAt: new Date().toISOString(),

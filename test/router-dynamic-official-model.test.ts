@@ -52,6 +52,7 @@ mock.module("~/services/auth/store", () => ({
         markRateLimited: () => 1_000,
         markSuccess: () => { },
         listAccounts: () => [],
+        saveAccount: () => { },
     },
 }))
 
