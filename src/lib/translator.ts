@@ -10,8 +10,9 @@ export interface ClaudeMessage {
 }
 
 export interface ClaudeContentBlock {
-    type: "text" | "tool_use" | "tool_result" | "image" | "audio" | "document"
+    type: "text" | "tool_use" | "tool_result" | "image" | "audio" | "document" | "thinking"
     text?: string
+    thinking?: string
     id?: string
     name?: string
     input?: any
@@ -96,7 +97,7 @@ export function buildMessageStart(model: string): string {
  */
 export function buildContentBlockStart(
     index: number,
-    type: "text" | "tool_use",
+    type: "text" | "tool_use" | "thinking",
     toolInfo?: { id: string; name: string; thoughtSignature?: string }
 ): string {
     let contentBlock: any = { type }
@@ -110,6 +111,8 @@ export function buildContentBlockStart(
                 ? { thought_signature: toolInfo.thoughtSignature, thoughtSignature: toolInfo.thoughtSignature }
                 : {}),
         }
+    } else if (type === "thinking") {
+        contentBlock = { type: "thinking", thinking: "" }
     } else {
         contentBlock = { type: "text", text: "" }
     }
@@ -120,6 +123,18 @@ export function buildContentBlockStart(
         content_block: contentBlock,
     }
     return `event: content_block_start\ndata: ${JSON.stringify(event)}\n\n`
+}
+
+/**
+ * 构建 content_block_delta 事件 (思考内容)
+ */
+export function buildThinkingDelta(index: number, thinking: string): string {
+    const event = {
+        type: "content_block_delta",
+        index,
+        delta: { type: "thinking_delta", thinking },
+    }
+    return `event: content_block_delta\ndata: ${JSON.stringify(event)}\n\n`
 }
 
 /**

@@ -16,6 +16,7 @@ import {
     buildMessageStart,
     buildContentBlockStart,
     buildTextDelta,
+    buildThinkingDelta,
     buildInputJsonDelta,
     buildContentBlockStop,
     buildMessageDelta,
@@ -263,8 +264,9 @@ export interface ChatRequest {
 }
 
 export interface ContentBlock {
-    type: "text" | "tool_use"
+    type: "text" | "tool_use" | "thinking"
     text?: string
+    thinking?: string
     id?: string
     name?: string
     input?: any
@@ -891,6 +893,16 @@ export function parseApiResponse(rawResponse: string, sessionKey?: string, model
         for (const part of parts) {
             const partSig = part.thoughtSignature || part.thought_signature || part.functionCall?.thoughtSignature || part.functionCall?.thought_signature
             if (partSig) latestThoughtSignature = partSig
+
+            const isThought = Boolean(part.thought) || (typeof part.thought === "string" && part.thought.length > 0)
+            const thoughtText = typeof part.thought === "string" ? part.thought : (isThought ? (part.text || "") : "")
+
+            if (isThought && thoughtText) {
+                const last = contentBlocks[contentBlocks.length - 1]
+                if (last?.type === "thinking") last.thinking = (last.thinking || "") + thoughtText
+                else contentBlocks.push({ type: "thinking", thinking: thoughtText })
+                continue
+            }
 
             if (part.text) {
                 const last = contentBlocks[contentBlocks.length - 1]
@@ -1726,6 +1738,7 @@ export async function* createChatCompletionStreamWithOptions(
         let streamInputTokens = 0
         let streamCacheReadTokens = 0
         let textBlockStarted = false
+        let thinkingBlockStarted = false
         let latestThoughtSignature: string | undefined
 
         yield buildMessageStart(request.model)
@@ -1761,7 +1774,29 @@ export async function* createChatCompletionStreamWithOptions(
                 const partSig = part.thoughtSignature || part.thought_signature || part.functionCall?.thoughtSignature || part.functionCall?.thought_signature
                 if (partSig) latestThoughtSignature = partSig
 
+                const isThought = Boolean(part.thought) || (typeof part.thought === "string" && part.thought.length > 0)
+                const thoughtText = typeof part.thought === "string" ? part.thought : (isThought ? (part.text || "") : "")
+
+                if (isThought && thoughtText) {
+                    if (textBlockStarted) {
+                        yield buildContentBlockStop(blockIndex)
+                        blockIndex++
+                        textBlockStarted = false
+                    }
+                    if (!thinkingBlockStarted) {
+                        yield buildContentBlockStart(blockIndex, "thinking")
+                        thinkingBlockStarted = true
+                    }
+                    yield buildThinkingDelta(blockIndex, thoughtText)
+                    continue
+                }
+
                 if (part.text) {
+                    if (thinkingBlockStarted) {
+                        yield buildContentBlockStop(blockIndex)
+                        blockIndex++
+                        thinkingBlockStarted = false
+                    }
                     if (!textBlockStarted) {
                         yield buildContentBlockStart(blockIndex, "text")
                         textBlockStarted = true
@@ -1769,6 +1804,11 @@ export async function* createChatCompletionStreamWithOptions(
                     yield buildTextDelta(blockIndex, part.text)
                 }
                 if (part.functionCall) {
+                    if (thinkingBlockStarted) {
+                        yield buildContentBlockStop(blockIndex)
+                        blockIndex++
+                        thinkingBlockStarted = false
+                    }
                     if (textBlockStarted) {
                         yield buildContentBlockStop(blockIndex)
                         blockIndex++
@@ -1815,6 +1855,9 @@ export async function* createChatCompletionStreamWithOptions(
             }
         }
 
+        if (thinkingBlockStarted) {
+            yield buildContentBlockStop(blockIndex)
+        }
         if (textBlockStarted) {
             yield buildContentBlockStop(blockIndex)
         }
