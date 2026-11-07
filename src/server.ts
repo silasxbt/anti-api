@@ -9,6 +9,7 @@ import consola from "consola"
 
 import { messageRoutes } from "./routes/messages/route"
 import { openaiRoutes } from "./routes/openai/route"
+import { audioRoutes } from "./routes/audio/route"
 import { authRouter } from "./routes/auth/route"
 import { remoteRouter } from "./routes/remote/route"
 import { routingRouter, syncProviderModels } from "./routes/routing/route"
@@ -323,6 +324,8 @@ server.post("/usage/reset", (c) => {
 
 // OpenAI 兼容端点
 server.route("/v1/chat/completions", openaiRoutes)
+server.route("/v1/audio", audioRoutes)
+server.route("/audio", audioRoutes)
 
 // Anthropic兼容端点
 server.route("/v1/messages", messageRoutes)
@@ -367,6 +370,14 @@ function computeModelsCatalog() {
         seen.add(model.id)
         return true
     })
+
+    if (activeProviderSet.has("antigravity")) {
+        models.push({
+            id: "gemini-transcribe",
+            name: "Gemini Transcribe",
+            owned_by: "antigravity",
+        })
+    }
 
     // Filter: separateThinkingModels (if false, drop any explicit thinking variants)
     if (!separateThinking) {
@@ -842,6 +853,10 @@ export function createPublicServer(token: string | null = getPublicGatewayToken(
         "/v1/messages",
         "/v1beta/messages",
         "/messages",
+        "/v1/audio/transcriptions",
+        "/v1/audio/translations",
+        "/audio/transcriptions",
+        "/audio/translations",
         "/v1/models",
         "/v1beta/models",
         "/models",
@@ -860,6 +875,8 @@ export function createPublicServer(token: string | null = getPublicGatewayToken(
     }
 
     app.route("/v1/chat/completions", openaiRoutes)
+    app.route("/v1/audio", audioRoutes)
+    app.route("/audio", audioRoutes)
     app.route("/v1/messages", messageRoutes)
     app.route("/v1beta/messages", messageRoutes)
     app.route("/messages", messageRoutes)

@@ -37,7 +37,52 @@ export interface OpenAIImageUrlContentPart {
     }
 }
 
-export type OpenAIContentPart = OpenAITextContentPart | OpenAIImageUrlContentPart
+export interface OpenAIAudioUrlContentPart {
+    type: "audio_url"
+    audio_url: {
+        url: string
+    }
+}
+
+export interface OpenAIInputAudioContentPart {
+    type: "input_audio"
+    input_audio: {
+        data: string
+        format: "wav" | "mp3" | string
+    }
+}
+
+export interface OpenAIAudioBlockContentPart {
+    type: "audio"
+    source?: {
+        type: "base64" | "url"
+        media_type?: string
+        data?: string
+        url?: string
+    }
+    input_audio?: {
+        data: string
+        format?: string
+    }
+}
+
+export interface OpenAIDocumentContentPart {
+    type: "document"
+    source?: {
+        type: "base64" | "url"
+        media_type?: string
+        data?: string
+        url?: string
+    }
+}
+
+export type OpenAIContentPart =
+    | OpenAITextContentPart
+    | OpenAIImageUrlContentPart
+    | OpenAIAudioUrlContentPart
+    | OpenAIInputAudioContentPart
+    | OpenAIAudioBlockContentPart
+    | OpenAIDocumentContentPart
 
 export interface OpenAITool {
     type: "function"

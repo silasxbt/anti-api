@@ -10,7 +10,7 @@ export interface ClaudeMessage {
 }
 
 export interface ClaudeContentBlock {
-    type: "text" | "tool_use" | "tool_result" | "image"
+    type: "text" | "tool_use" | "tool_result" | "image" | "audio" | "document"
     text?: string
     id?: string
     name?: string

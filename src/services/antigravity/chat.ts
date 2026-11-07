@@ -26,7 +26,7 @@ import { RequestValidationError, UpstreamError } from "~/lib/error"
 import { cleanJsonSchemaForGemini } from "~/lib/json-schema-cleaner"
 import { formatSuccessLine, setRequestLogContext } from "~/lib/logger"
 import { getAntigravityUserAgent } from "~/lib/antigravity-client"
-import { fetchRemoteImageAsBase64 } from "~/lib/remote-image"
+import { fetchRemoteImageAsBase64, fetchRemoteAudioAsBase64 } from "~/lib/remote-image"
 import { createImageInputBudget, decodedBase64ImageBytes, type ImageInputBudget } from "~/lib/image-input"
 import { safeErrorMessage } from "~/lib/redaction"
 import { resolveAntigravityAlias, parseModelId, compareVersions } from "~/lib/model-catalog"
@@ -168,6 +168,7 @@ const MODEL_MAPPING: Record<string, string> = Object.fromEntries([
         "gemini-2.5-flash",
         "gemini-2.5-flash-thinking",
     ),
+    ...aliasesTo("gemini-flash", "gemini-transcribe", "whisper-1", "whisper"),
 ])
 
 export function getAntigravityModelName(userModel: string): string {
@@ -610,6 +611,29 @@ export async function buildAntigravityParts(
                 inlineData: {
                     mimeType: image.media_type,
                     data: image.data,
+                },
+            })
+            continue
+        }
+
+        if (block.source?.type === "base64" && (block.type === "audio" || (block.type === "document" && block.source.media_type.startsWith("audio/")))) {
+            parts.push({
+                inlineData: {
+                    mimeType: block.source.media_type,
+                    data: block.source.data,
+                },
+            })
+            continue
+        }
+
+        if (block.type === "audio" && block.source?.type === "url") {
+            const audio = await fetchRemoteAudioAsBase64(block.source.url, {
+                signal: options.signal,
+            })
+            parts.push({
+                inlineData: {
+                    mimeType: audio.media_type,
+                    data: audio.data,
                 },
             })
             continue

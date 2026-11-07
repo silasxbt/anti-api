@@ -54,9 +54,31 @@ export interface AnthropicToolUseBlock {
     input: Record<string, unknown>
 }
 
+export interface AnthropicAudioBlock {
+    type: "audio"
+    source: {
+        type: "base64" | "url"
+        media_type: string
+        data?: string
+        url?: string
+    }
+}
+
+export interface AnthropicDocumentBlock {
+    type: "document"
+    source: {
+        type: "base64" | "url"
+        media_type: string
+        data?: string
+        url?: string
+    }
+}
+
 export type AnthropicContentBlock =
     | AnthropicTextBlock
     | AnthropicImageBlock
+    | AnthropicAudioBlock
+    | AnthropicDocumentBlock
     | AnthropicToolResultBlock
     | AnthropicToolUseBlock
 

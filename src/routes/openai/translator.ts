@@ -167,6 +167,30 @@ function parseDataImageUrl(url: string): ClaudeContentBlock["source"] | null {
     }
 }
 
+function parseDataAudioUrl(url: string): ClaudeContentBlock["source"] | null {
+    const separator = url.indexOf(",")
+    if (separator === -1) return null
+    const header = url.slice(0, separator)
+    const match = header.match(/^data:(audio\/[A-Za-z0-9.+-]+);base64$/i)
+    if (!match) return null
+
+    const rawData = url.slice(separator + 1)
+    if (!rawData) {
+        throw new RequestValidationError("audio data URI must include base64 audio data")
+    }
+    const data = rawData.replace(/[\t\n\f\r ]/g, "")
+    if (!data) {
+        throw new RequestValidationError("audio data URI must include base64 audio data")
+    }
+    validateBase64ImageData(data)
+
+    return {
+        type: "base64",
+        media_type: match[1].toLowerCase(),
+        data,
+    }
+}
+
 function parseToolCallArguments(value: unknown, index: number): Record<string, unknown> {
     const raw = value === undefined || value === null || value === "" ? "{}" : value
     if (typeof raw !== "string") {
@@ -206,6 +230,11 @@ function translateContentPart(part: OpenAIContentPart, index: number): ClaudeCon
             throw new RequestValidationError(`image_url part at index ${index} must include image_url.url`)
         }
 
+        const inlineAudio = parseDataAudioUrl(url)
+        if (inlineAudio) {
+            return { type: "audio", source: inlineAudio }
+        }
+
         const inlineSource = parseDataImageUrl(url)
         if (inlineSource) {
             return { type: "image", source: inlineSource }
@@ -221,6 +250,115 @@ function translateContentPart(part: OpenAIContentPart, index: number): ClaudeCon
             throw new RequestValidationError(`image_url part at index ${index} must use http(s) or a base64 data URI`)
         }
         return { type: "image", source: { type: "url", url: parsed.toString() } }
+    }
+
+    if (part.type === "audio_url") {
+        if (!isRecord(part.audio_url) || typeof part.audio_url.url !== "string") {
+            throw new RequestValidationError(`audio_url part at index ${index} must include audio_url.url`)
+        }
+        const url = part.audio_url.url.trim()
+        if (!url) {
+            throw new RequestValidationError(`audio_url part at index ${index} must include audio_url.url`)
+        }
+
+        const inlineSource = parseDataAudioUrl(url)
+        if (inlineSource) {
+            return { type: "audio", source: inlineSource }
+        }
+
+        let parsed: URL
+        try {
+            parsed = new URL(url)
+        } catch {
+            throw new RequestValidationError(`audio_url part at index ${index} must be a data URI or an http(s) URL`)
+        }
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+            throw new RequestValidationError(`audio_url part at index ${index} must use http(s) or a base64 data URI`)
+        }
+        return { type: "audio", source: { type: "url", url: parsed.toString() } }
+    }
+
+    if (part.type === "input_audio") {
+        if (!isRecord(part.input_audio) || typeof part.input_audio.data !== "string") {
+            throw new RequestValidationError(`input_audio part at index ${index} must include input_audio.data`)
+        }
+        const format = (typeof part.input_audio.format === "string" ? part.input_audio.format : "wav").toLowerCase()
+        const mediaType = format === "mp3" ? "audio/mp3" : format === "wav" ? "audio/wav" : `audio/${format}`
+        const rawData = part.input_audio.data
+        const data = rawData.replace(/[\t\n\f\r ]/g, "")
+        if (!data) {
+            throw new RequestValidationError(`input_audio part at index ${index} must include base64 audio data`)
+        }
+        validateBase64ImageData(data)
+        return {
+            type: "audio",
+            source: {
+                type: "base64",
+                media_type: mediaType,
+                data,
+            },
+        }
+    }
+
+    if (part.type === "audio") {
+        const source = (part as any).source
+        if (isRecord(source)) {
+            if (source.type === "base64" && typeof source.data === "string") {
+                const mediaType = typeof source.media_type === "string" ? source.media_type.toLowerCase() : "audio/wav"
+                const data = source.data.replace(/[\t\n\f\r ]/g, "")
+                validateBase64ImageData(data)
+                return {
+                    type: "audio",
+                    source: {
+                        type: "base64",
+                        media_type: mediaType,
+                        data,
+                    },
+                }
+            }
+            if (source.type === "url" && typeof source.url === "string") {
+                return {
+                    type: "audio",
+                    source: {
+                        type: "url",
+                        url: source.url,
+                    },
+                }
+            }
+        }
+        if (isRecord((part as any).input_audio)) {
+            const ia = (part as any).input_audio
+            const format = (typeof ia.format === "string" ? ia.format : "wav").toLowerCase()
+            const mediaType = format === "mp3" ? "audio/mp3" : format === "wav" ? "audio/wav" : `audio/${format}`
+            const data = (ia.data || "").replace(/[\t\n\f\r ]/g, "")
+            validateBase64ImageData(data)
+            return {
+                type: "audio",
+                source: {
+                    type: "base64",
+                    media_type: mediaType,
+                    data,
+                },
+            }
+        }
+    }
+
+    if (part.type === "document") {
+        const source = (part as any).source
+        if (isRecord(source) && typeof source.media_type === "string" && source.media_type.toLowerCase().startsWith("audio/")) {
+            if (source.type === "base64" && typeof source.data === "string") {
+                const data = source.data.replace(/[\t\n\f\r ]/g, "")
+                validateBase64ImageData(data)
+                return {
+                    type: "audio",
+                    source: {
+                        type: "base64",
+                        media_type: source.media_type.toLowerCase(),
+                        data,
+                    },
+                }
+            }
+        }
     }
 
     throw new RequestValidationError(`Unsupported OpenAI content part type at index ${index}`)
