@@ -383,7 +383,7 @@ function isTransientTransportError(error: unknown): boolean {
 function shouldFallbackOnUpstream(entry: RoutingEntry | AccountRoutingEntry, error: UpstreamError): boolean {
     if ((error as any).streamingStarted) return false
     if (error.status === 429) {
-        return isQuotaExhausted(error) || (error as any).retryable === true
+        return true
     }
     if (entry.provider === "codex" && isCodexUnsupportedModelError(error)) {
         return true
@@ -401,7 +401,7 @@ function shouldAdvanceCursorOnError(entry: RoutingEntry | AccountRoutingEntry, e
     if (error.status === 401 || error.status === 403) return true
     if (error.status === 404) return true
     if (error.status >= 500) return true
-    if (error.status === 429 && isQuotaExhausted(error)) return true
+    if (error.status === 429) return true
     return false
 }
 
@@ -422,9 +422,12 @@ function isQuotaExhausted(error: UpstreamError): boolean {
             const details = err?.details
             if (Array.isArray(details)) {
                 for (const detail of details) {
-                    if (detail?.reason === "QUOTA_EXHAUSTED") return true
+                    if (detail?.reason === "QUOTA_EXHAUSTED" || detail?.reason === "RESOURCE_EXHAUSTED") return true
                 }
             }
+            const status = String(err?.status || "")
+            if (status === "RESOURCE_EXHAUSTED") return true
+            if (errMessage.toLowerCase().includes("resource exhausted") || errMessage.toLowerCase().includes("resource_exhausted")) return true
         } catch {
             // ignore parse errors
         }
@@ -433,6 +436,7 @@ function isQuotaExhausted(error: UpstreamError): boolean {
     const lower = body.toLowerCase()
     if (lower.includes("usage_limit_reached") || lower.includes("usage limit")) return true
     if (lower.includes("quota_exhausted")) return true
+    if (lower.includes("resource_exhausted") || lower.includes("resource exhausted")) return true
     if (lower.includes("quota") && lower.includes("reset")) return true
     return false
 }

@@ -45,7 +45,7 @@ const MAX_RETRY_ATTEMPTS = 1  // v2.0.1 恢复：简化重试，避免级联 429
 const MAX_NON_QUOTA_429_RETRIES = 2  // Non-quota 429 retries before switching accounts
 const MAX_NON_QUOTA_429_WAIT_MS = 4000  // Upper bound for non-quota 429 wait time
 const NON_QUOTA_429_COOLDOWN_MS = 8000  // Cooldown before retrying a rate-limited account
-const FETCH_TIMEOUT_MS = 30000  // 防止上游请求长期卡住
+const FETCH_TIMEOUT_MS = 180000  // 180s: allow long-context TTFT prefill on reasoning models (e.g. Argon)
 
 function isQuotaExhaustedErrorText(errorText: string): boolean {
     const body = (errorText || "").trim()
@@ -57,13 +57,17 @@ function isQuotaExhaustedErrorText(errorText: string): boolean {
             const details = json?.error?.details
             if (Array.isArray(details)) {
                 for (const detail of details) {
-                    if (detail?.reason === "QUOTA_EXHAUSTED") return true
+                    if (detail?.reason === "QUOTA_EXHAUSTED" || detail?.reason === "RESOURCE_EXHAUSTED") return true
                 }
             }
+            const status = json?.error?.status
+            if (status === "RESOURCE_EXHAUSTED") return true
+
             const message = json?.error?.message
             if (typeof message === "string") {
                 const lower = message.toLowerCase()
                 if (lower.includes("quota") && lower.includes("reset")) return true
+                if (lower.includes("resource exhausted") || lower.includes("resource_exhausted")) return true
             }
         } catch {
             // ignore parse errors
@@ -72,6 +76,7 @@ function isQuotaExhaustedErrorText(errorText: string): boolean {
 
     const lower = body.toLowerCase()
     if (lower.includes("quota_exhausted")) return true
+    if (lower.includes("resource_exhausted") || lower.includes("resource exhausted")) return true
     if (lower.includes("quota") && lower.includes("reset")) return true
     return false
 }
