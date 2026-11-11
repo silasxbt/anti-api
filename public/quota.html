@@ -918,6 +918,15 @@
                         class="w-full bg-[#16161a] border border-[#2f253f] focus:border-cyan-500 focus:outline-none rounded-xl px-3.5 py-2.5 text-xs text-gray-100 font-mono placeholder-gray-600 transition-colors" />
                     <p class="text-[11px] text-gray-500 mt-1">Cloud AI Companion project ID (Antigravity only).</p>
                 </div>
+
+                <div id="acc-modal-plan-group">
+                    <label class="block font-semibold text-gray-300 mb-1.5">📋 Subscription Plan</label>
+                    <select id="acc-modal-plan-select"
+                        class="w-full bg-[#16161a] border border-[#2f253f] focus:border-cyan-500 focus:outline-none rounded-xl px-3.5 py-2.5 text-xs text-gray-100 transition-colors">
+                        <option value="">Auto (provider default)</option>
+                    </select>
+                    <p class="text-[11px] text-gray-500 mt-1">Quota budget calibration: accounts on the same plan pool one per-1% budget (per-account median, best-of across the group).</p>
+                </div>
             </div>
 
             <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-3 border-t border-[#2f253f]">
@@ -2926,6 +2935,19 @@
             }
         }
 
+        function fmtQuotaTokens(n) {
+            n = Number(n || 0);
+            if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1) + 'M';
+            if (n >= 1_000) return (n / 1_000).toFixed(n >= 100_000 ? 0 : 1) + 'k';
+            return String(Math.round(n));
+        }
+
+        // Mirror of backend src/lib/account-plans (plan enums) for the options modal.
+        const ACCOUNT_PLAN_OPTIONS = {
+            antigravity: ['free', 'plus', 'free_pro', 'pro', 'ultra'],
+            copilot: ['free', 'student', 'pro', 'pro_plus', 'max', 'business', 'enterprise'],
+        };
+
         function formatResetTime(resetTime) {
             const now = new Date();
             const reset = new Date(resetTime);
@@ -3116,6 +3138,20 @@
                 }
             }
 
+            const planGroup = document.getElementById('acc-modal-plan-group');
+            const planSelect = document.getElementById('acc-modal-plan-select');
+            if (planGroup && planSelect) {
+                const planOpts = ACCOUNT_PLAN_OPTIONS[provider] || [];
+                planSelect.innerHTML = '<option value="">Auto (provider default)</option>' +
+                    planOpts.map(o => `<option value="${o}">${o}</option>`).join('');
+                planSelect.value = '';
+                if (planOpts.length > 0) {
+                    planGroup.classList.remove('hidden');
+                } else {
+                    planGroup.classList.add('hidden');
+                }
+            }
+
             // Fetch fresh details from backend
             fetch(`${API_BASE}/accounts/${encodeURIComponent(accountId)}/options?provider=${encodeURIComponent(provider)}`)
                 .then(res => res.json())
@@ -3128,6 +3164,7 @@
                         if (acc.projectId && projectInput) {
                             projectInput.value = acc.projectId;
                         }
+                        if (planSelect) planSelect.value = acc.plan || '';
                     }
                 })
                 .catch(() => {});
@@ -3190,6 +3227,8 @@
             const proxy = document.getElementById('acc-modal-proxy-input').value;
             const projectInput = document.getElementById('acc-modal-project-input');
             const projectId = projectInput ? projectInput.value : undefined;
+            const planSelect = document.getElementById('acc-modal-plan-select');
+            const plan = planSelect ? planSelect.value : undefined;
 
             spinner.classList.remove('hidden');
             saveBtn.disabled = true;
@@ -3202,7 +3241,8 @@
                         provider: currentModalAccount.provider,
                         label,
                         proxy,
-                        projectId
+                        projectId,
+                        plan
                     })
                 });
                 const data = await res.json();
@@ -3339,8 +3379,8 @@
                                 <span>${bar.resetTime ? formatResetTime(bar.resetTime) : '—'}</span>
                                 ${provider !== 'zed' ? `
                                     ${typeof bar.estimatedValueUsd === 'number' && bar.estimatedValueUsd > 0 ? `
-                                        <span class="font-mono text-gray-400" title="Quota: ~$${Number(bar.estimatedValueUsd).toFixed(2)} remaining / ~$${Number(bar.estimatedTotalValueUsd || (bar.valuePerPercentUsd ? bar.valuePerPercentUsd * 100 : 0)).toFixed(2)} total (~$${Number(bar.valuePerPercentUsd || 0).toFixed(2)} per 1%)">
-                                            ~$${Number(bar.estimatedValueUsd).toFixed(2)} / $${Number(bar.estimatedTotalValueUsd || (bar.valuePerPercentUsd ? bar.valuePerPercentUsd * 100 : 0)).toFixed(2)}
+                                        <span class="font-mono ${bar.planShared ? 'text-cyan-500' : 'text-gray-400'}" title="Quota: ~$${Number(bar.estimatedValueUsd).toFixed(2)} remaining / ~$${Number(bar.estimatedTotalValueUsd || (bar.valuePerPercentUsd ? bar.valuePerPercentUsd * 100 : 0)).toFixed(2)} total (~$${Number(bar.valuePerPercentUsd || 0).toFixed(2)} per 1%)${bar.effectiveTokensPerPercent ? ` | ~${fmtQuotaTokens(bar.effectiveTokensPerPercent)} eff. tokens per 1%` : ''}${bar.planShared ? ` | plan-pooled budget across ${bar.planAccounts || 2} same-plan account(s)` : ''}">
+                                            ~$${Number(bar.estimatedValueUsd).toFixed(2)} / $${Number(bar.estimatedTotalValueUsd || (bar.valuePerPercentUsd ? bar.valuePerPercentUsd * 100 : 0)).toFixed(2)}${bar.estimatedTokensRemaining ? ` ≈${fmtQuotaTokens(bar.estimatedTokensRemaining)}t` : ''}${bar.planShared ? ' ★' : ''}
                                         </span>
                                     ` : `
                                         <span class="text-gray-600 italic tracking-tight" title="Observing your local usage to calibrate quota dollar value">not enough data</span>

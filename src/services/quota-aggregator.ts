@@ -14,7 +14,7 @@ import {
 } from "~/services/antigravity/quota-fetch"
 import { refreshCodexAccessToken, refreshCodexAccountIfNeeded } from "~/services/codex/oauth"
 import { accountManager } from "~/services/antigravity/account-manager"
-import type { ProviderAccount } from "~/services/auth/types"
+import type { AuthProvider, ProviderAccount } from "~/services/auth/types"
 import { UpstreamError } from "~/lib/error"
 import { getDataDir } from "~/lib/data-dir"
 import { fetchZedAccountOverview } from "~/services/zed/chat"
@@ -22,6 +22,7 @@ import { safeErrorMessage } from "~/lib/redaction"
 import { setDynamicAntigravityModelsForAccount } from "~/services/routing/models"
 import {
     enrichBarsWithValueEstimates,
+    registerAccountPlanResolver,
     registerQuotaRefreshTrigger,
     syncIntelligentQuotaCache,
 } from "~/services/routing/intelligent-scorer"
@@ -32,6 +33,8 @@ export type AccountBar = {
     key: string
     label: string
     percentage: number
+    /** Full-precision upstream remaining fraction (0..1) when the provider exposes it. */
+    rawFraction?: number
     resetTime?: string
     disabled?: boolean
     estimatedValueUsd?: number
@@ -194,15 +197,15 @@ function defaultBarsForProvider(provider: QuotaProvider): AccountBar[] {
             return buildAntigravityBars({})
         case "codex":
             return [
-                { key: "session", label: "5h", percentage: 0 },
-                { key: "week", label: "week", percentage: 0 },
+                { key: "session", label: "5h", percentage: 0, rawFraction: 0 },
+                { key: "week", label: "week", percentage: 0, rawFraction: 0 },
             ]
         case "copilot":
-            return [{ key: "premium", label: "premium", percentage: 0 }]
+            return [{ key: "premium", label: "premium", percentage: 0, rawFraction: 0 }]
         case "zed":
-            return [{ key: "hosted", label: "hosted", percentage: 0 }]
+            return [{ key: "hosted", label: "hosted", percentage: 0, rawFraction: 0 }]
         case "kiro":
-            return [{ key: "access", label: "access", percentage: 100 }]
+            return [{ key: "access", label: "access", percentage: 100, rawFraction: 1 }]
     }
 }
 
@@ -319,10 +322,41 @@ export async function refreshAccountQuotaInBackground(
     return null
 }
 
+/**
+ * Same-plan quota budget pooling resolver: exposes the per-account subscription plan (set from
+ * the dashboard options) to the intelligent scorer, so accounts sharing one plan share one
+ * pooled per-1% quota budget. Snapshot of the auth store, refreshed at most once per minute.
+ * Returns undefined when no explicit plan is set (provider default then applies).
+ */
+const accountPlanSnapshot = new Map<string, string | null>()
+let accountPlanSnapshotAt = 0
+
+function accountPlanResolver(provider: string, accountId: string): string | undefined {
+    const now = Date.now()
+    if (accountPlanSnapshotAt === 0 || now - accountPlanSnapshotAt > 60_000) {
+        accountPlanSnapshot.clear()
+        for (const prov of ["antigravity", "codex", "copilot", "zed", "kiro", "grok"] as AuthProvider[]) {
+            try {
+                for (const a of authStore.listAccounts(prov)) {
+                    accountPlanSnapshot.set(`${prov}:${a.id}`, a.plan ?? null)
+                }
+            } catch {
+                // provider unavailable
+            }
+        }
+        accountPlanSnapshotAt = now
+    }
+    const cleanId = accountId.trim().startsWith(`${provider}:`)
+        ? accountId.trim().slice(provider.length + 1)
+        : accountId.trim()
+    return accountPlanSnapshot.get(`${provider}:${cleanId}`) ?? undefined
+}
+
 if (process.env.NODE_ENV !== "test") {
     registerQuotaRefreshTrigger((provider, accountId) => {
         void refreshAccountQuotaInBackground(provider, accountId)
     })
+    registerAccountPlanResolver(accountPlanResolver)
 }
 
 async function fetchAntigravityQuotas(accounts: ProviderAccount[]): Promise<AccountQuotaView[]> {
@@ -560,6 +594,7 @@ export function buildAntigravityBars(
                 key,
                 label,
                 percentage,
+                rawFraction: Math.max(0, Math.min(1, fraction)),
                 resetTime: bucket.resetTime || undefined,
                 ...(bucket.disabled !== undefined ? { disabled: bucket.disabled } : {}),
             }
@@ -594,34 +629,42 @@ export function buildAntigravityBars(
     const isClaudeWeekly = claudeGptRaw.resetTime ? (Date.parse(claudeGptRaw.resetTime) - now > 12 * 3600 * 1000) : true
     const hasArgonModels = argonIds.length > 0
 
+    const geminiFrac = geminiRaw.rawFraction ?? geminiRaw.percentage / 100
+    const claudeGptFrac = claudeGptRaw.rawFraction ?? claudeGptRaw.percentage / 100
+    const argonFrac = argonRaw.rawFraction ?? argonRaw.percentage / 100
     const geminiWeekly: AccountBar = {
         key: "gemini_week",
         label: "weekly gemini",
         percentage: isGeminiWeekly ? geminiRaw.percentage : 100,
+        rawFraction: isGeminiWeekly ? geminiFrac : 1,
         resetTime: isGeminiWeekly ? geminiRaw.resetTime : undefined,
     }
     const gemini5h: AccountBar = {
         key: "gemini_5h",
         label: "5hr gemini",
         percentage: isGeminiWeekly ? 0 : geminiRaw.percentage,
+        rawFraction: isGeminiWeekly ? 0 : geminiFrac,
         resetTime: isGeminiWeekly ? undefined : geminiRaw.resetTime,
     }
     const claudeGptWeekly: AccountBar = {
         key: "claude_gpt_week",
         label: "weekly claude gpt",
         percentage: isClaudeWeekly ? claudeGptRaw.percentage : 100,
+        rawFraction: isClaudeWeekly ? claudeGptFrac : 1,
         resetTime: isClaudeWeekly ? claudeGptRaw.resetTime : undefined,
     }
     const claudeGpt5h: AccountBar = {
         key: "claude_gpt_5h",
         label: "5hr claude gpt",
         percentage: !isClaudeWeekly ? claudeGptRaw.percentage : (claudeGptRaw.percentage <= 0 ? 0 : 100),
+        rawFraction: !isClaudeWeekly ? claudeGptFrac : (claudeGptFrac <= 0 ? 0 : 1),
         resetTime: !isClaudeWeekly ? claudeGptRaw.resetTime : undefined,
     }
     const argonWeekly: AccountBar = {
         key: "argon_week",
         label: "weekly argon",
         percentage: hasArgonModels ? argonRaw.percentage : 0,
+        rawFraction: hasArgonModels ? argonFrac : 0,
         resetTime: hasArgonModels ? argonRaw.resetTime : undefined,
     }
 
@@ -648,10 +691,11 @@ function buildMergedBar(
         return { key, label, percentage: 100 }
     }
 
-    const percentages = entries.map(item => Math.round((item?.remainingFraction ?? 0) * 100))
-    const percentage = Math.min(...percentages)
+    const fractions = entries.map(item => Math.max(0, Math.min(1, item?.remainingFraction ?? 0)))
+    const minFraction = Math.min(...fractions)
+    const percentage = Math.max(0, Math.min(100, Math.round(minFraction * 100)))
     const resetTime = earliestResetTime(entries.map(item => item?.resetTime).filter(Boolean) as string[])
-    return { key, label, percentage, resetTime }
+    return { key, label, percentage, rawFraction: minFraction, resetTime }
 }
 
 function earliestResetTime(times: string[]): string | undefined {
@@ -743,12 +787,14 @@ async function fetchCodexUsage(account: ProviderAccount): Promise<AccountBar[]> 
             key: "session",
             label: "5h",
             percentage: 100 - (primary.used_percent || 0),
+            rawFraction: Math.max(0, Math.min(1, (100 - (primary.used_percent || 0)) / 100)),
             resetTime: primary.reset_at ? new Date(primary.reset_at * 1000).toISOString() : undefined,
         },
         {
             key: "week",
             label: "week",
             percentage: 100 - (secondary.used_percent || 0),
+            rawFraction: Math.max(0, Math.min(1, (100 - (secondary.used_percent || 0)) / 100)),
             resetTime: secondary.reset_at ? new Date(secondary.reset_at * 1000).toISOString() : undefined,
         },
     ]
@@ -791,6 +837,7 @@ function buildZedHostedBar(data: Awaited<ReturnType<typeof fetchZedAccountOvervi
         key: "hosted",
         label: "hosted",
         percentage: entitledPlans.has(plan) ? 100 : 0,
+        rawFraction: entitledPlans.has(plan) ? 1 : 0,
         resetTime: data.plan?.subscription_period?.ended_at || undefined,
     }
 }
@@ -819,24 +866,27 @@ async function fetchCopilotPremium(account: ProviderAccount): Promise<AccountBar
 
     const data = response.data as any
     const premium = data.quota_snapshots?.premium_interactions
-    const percent = derivePercent(premium)
+    const precisePct = derivePrecisePercent(premium)
     const reset = data.quota_reset_date_utc || data.quota_reset_date || data.limited_user_reset_date
 
     return {
         key: "premium",
         label: "premium",
-        percentage: percent,
+        percentage: Math.max(0, Math.min(100, Math.round(precisePct))),
+        rawFraction: precisePct / 100,
         resetTime: reset || undefined,
     }
 }
 
-function derivePercent(snapshot: any): number {
+function derivePrecisePercent(snapshot: any): number {
     if (!snapshot) return 0
     if (snapshot.unlimited === true) return 100
-    if (typeof snapshot.percent_remaining === "number") return Math.round(snapshot.percent_remaining)
+    if (typeof snapshot.percent_remaining === "number") {
+        return Math.max(0, Math.min(100, snapshot.percent_remaining))
+    }
     if (typeof snapshot.remaining === "number" && typeof snapshot.entitlement === "number") {
         if (snapshot.entitlement <= 0) return 0
-        return Math.round((snapshot.remaining / snapshot.entitlement) * 100)
+        return Math.max(0, Math.min(100, (snapshot.remaining / snapshot.entitlement) * 100))
     }
     return 0
 }

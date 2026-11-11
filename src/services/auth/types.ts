@@ -24,6 +24,8 @@ export interface ProviderAccount {
     refreshToken?: string
     expiresAt?: number
     projectId?: string
+    /** User-configured subscription plan for quota budget calibration (see lib/account-plans). */
+    plan?: string
     organizationId?: string
     serverUrl?: string
     authSource?: AuthSource

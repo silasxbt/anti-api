@@ -33,16 +33,28 @@ import { join } from "path"
 import { getDataDir } from "~/lib/data-dir"
 import { quotaPoolForModel, type QuotaPool } from "~/lib/model-catalog"
 import { computeEffectiveTokenLoad, estimateRequestCostUsd } from "~/services/usage-tracker"
+import { resolvePlan } from "~/lib/account-plans"
+import type { AuthProvider } from "~/services/auth/types"
 
 export interface QuotaBarSnapshot {
     key: string
     label: string
     percentage: number
+    /** Full-precision upstream remainingFraction (0..1) when available, to avoid 1% quantization loss. */
+    rawFraction?: number
     resetTime?: string
     disabled?: boolean
     estimatedValueUsd?: number
     estimatedTotalValueUsd?: number
     valuePerPercentUsd?: number
+    /** Effective tokens per 1% of pool (plan-pooled when available). */
+    effectiveTokensPerPercent?: number
+    /** Estimated remaining effective tokens for this bar. */
+    estimatedTokensRemaining?: number
+    /** True when the per-1% value was taken from a same-plan pooled estimate. */
+    planShared?: boolean
+    /** Number of same-plan accounts behind the pooled estimate. */
+    planAccounts?: number
 }
 
 export interface AccountQuotaSnapshot {
@@ -75,6 +87,10 @@ export interface IntelligentScoreBreakdown {
     insufficientQuotaForRequest: boolean
     exhausted: boolean
     unknownQuota: boolean
+    /** True when the per-1% budget used for this score came from a same-plan pooled estimate. */
+    planShared?: boolean
+    /** Number of same-plan accounts contributing to the pooled estimate. */
+    planAccounts?: number
 }
 
 export interface QuotaValueEstimate {
@@ -222,6 +238,20 @@ export const PROACTIVE_REFRESH_COOLDOWN_MS = 60_000
 export const PROACTIVE_REFRESH_NEAR_RESET_HOURS = 0.25 // 15 minutes
 export const PROACTIVE_REFRESH_DEPLETION_THRESHOLD = 0.08 // 8% live quota depletion since last sync
 
+/**
+ * Calibration precision & contamination guard:
+ * `remainingFraction` upstream has ~1e-7 precision, so a genuine drop can be detected far
+ * below the legacy 2% rounding threshold. We accept calibration samples from any drop >=
+ * MIN_CALIBRATION_DROP_PCT (0.05% = 5e-4 fraction, a comfortable margin over quantization
+ * noise) as long as our own locally-tracked cost explains it. When the observed $/1% falls
+ * below CONTAMINATION_REJECT_RATIO of the account's trusted prior, the drop was mostly
+ * external (non-gateway) usage: the sample is rejected so the budget estimate is never
+ * dragged down by usage we cannot account for.
+ */
+export const MIN_CALIBRATION_DROP_PCT = 0.05
+export const CONTAMINATION_REJECT_RATIO = 0.8
+export const CONTAMINATION_GUARD_MIN_SAMPLES = 3
+
 // ============================================================================
 // In-Memory State (Quota Snapshots, Value Estimators, Session Bindings, Load)
 // ============================================================================
@@ -264,6 +294,8 @@ interface PoolValueCalibrationState {
     recentEstimates: number[]
     /** History of recent observed tokens per 1% drop. */
     recentTokenEstimates?: number[]
+    /** Samples rejected by the external-usage contamination guard. */
+    externalSkewRejects?: number
 }
 
 const poolCalibrations = new Map<string, PoolValueCalibrationState>()
@@ -273,6 +305,17 @@ const lastRefreshTriggeredAt = new Map<string, number>()
 
 export function registerQuotaRefreshTrigger(callback: QuotaRefreshCallback | null): void {
     quotaRefreshTrigger = callback
+}
+
+/**
+ * Resolves the user-configured subscription plan for an account (explicit plan, or
+ * null/undefined to fall back to the provider default). Registered by quota-aggregator.
+ */
+export type AccountPlanResolver = (provider: string, accountId: string) => string | null | undefined
+let accountPlanResolver: AccountPlanResolver | null = null
+
+export function registerAccountPlanResolver(resolver: AccountPlanResolver | null): void {
+    accountPlanResolver = resolver
 }
 
 function makeAccountKey(provider: string, accountId: string): string {
@@ -324,6 +367,7 @@ function loadDiskCalibrationsIfNeeded(): void {
                     calibrationSamples: typeof entry.calibrationSamples === "number" ? entry.calibrationSamples : recentEstimates.length,
                     recentEstimates,
                     recentTokenEstimates,
+                    externalSkewRejects: typeof entry.externalSkewRejects === "number" ? entry.externalSkewRejects : 0,
                 })
             }
         }
@@ -372,10 +416,93 @@ function getOrCreatePoolCalibration(
             calibrationSamples: 0,
             recentEstimates: [],
             recentTokenEstimates: [],
+            externalSkewRejects: 0,
         }
         poolCalibrations.set(calKey, state)
     }
     return state
+}
+
+/**
+ * Precise bar percentage (0..100) using the full-precision upstream `remainingFraction` when
+ * available, instead of the integer-rounded `percentage` which loses ~1% quantization resolution.
+ */
+function preciseBarPct(bar: QuotaBarSnapshot): number {
+    if (typeof bar.rawFraction === "number" && Number.isFinite(bar.rawFraction)) {
+        return Math.max(0, Math.min(100, bar.rawFraction * 100))
+    }
+    return Math.max(0, Math.min(100, typeof bar.percentage === "number" ? bar.percentage : 0))
+}
+
+export interface PlanPooledBarEstimate {
+    valuePerPercentUsd?: number
+    effectiveTokensPerPercent?: number
+    /** Number of same-plan accounts that contributed a valid per-account median. */
+    planAccounts: number
+    /** True when more than one same-plan account shares the budget. */
+    planShared: boolean
+}
+
+/**
+ * Same-plan quota budget pooling.
+ *
+ * Accounts on the same provider + subscription plan share identical real pool limits, so the
+ * fleet reports identical budgets: each account first reduces its own observed samples to a
+ * robust per-account MEDIAN ($/1% and effective tokens/1%), then the group budget is the MAX
+ * of those medians across accounts with the same plan. The cleanest account (least external
+ * contamination) dominates, so usage outside the gateway on one account can no longer drag
+ * the whole fleet's estimate down.
+ */
+export function getPlanPooledBarEstimate(
+    provider: string,
+    accountId: string,
+    poolBarKey: string
+): PlanPooledBarEstimate | null {
+    if (!accountPlanResolver) return null
+    loadDiskCalibrationsIfNeeded()
+
+    let plan: string
+    try {
+        plan = resolvePlan(provider as AuthProvider, accountPlanResolver(provider, accountId) ?? undefined)
+    } catch {
+        return null
+    }
+    if (!plan) return null
+
+    const prefix = `${provider}:`
+    const suffix = `:${poolBarKey}`
+    let bestVpp: number | undefined
+    let bestTpp: number | undefined
+    let accounts = 0
+
+    for (const [calKey, cal] of poolCalibrations) {
+        if (!calKey.startsWith(prefix) || !calKey.endsWith(suffix)) continue
+        const groupAccountId = calKey.slice(prefix.length, calKey.length - suffix.length)
+        if (!groupAccountId) continue
+        let groupPlan: string
+        try {
+            groupPlan = resolvePlan(provider as AuthProvider, accountPlanResolver(provider, groupAccountId) ?? undefined)
+        } catch {
+            continue
+        }
+        if (groupPlan !== plan) continue
+
+        const vpp = typeof cal.valuePerPercentUsd === "number" && cal.valuePerPercentUsd > 0
+            ? cal.valuePerPercentUsd
+            : computeMedian(cal.recentEstimates)
+        if (typeof vpp !== "number" || vpp <= 0) continue
+
+        const tpp = typeof cal.effectiveTokensPerPercent === "number" && cal.effectiveTokensPerPercent > 0
+            ? cal.effectiveTokensPerPercent
+            : computeMedian(cal.recentTokenEstimates || [])
+
+        accounts++
+        bestVpp = Math.max(bestVpp ?? 0, vpp)
+        if (typeof tpp === "number" && tpp > 0) bestTpp = Math.max(bestTpp ?? 0, tpp)
+    }
+
+    if (accounts === 0) return null
+    return { valuePerPercentUsd: bestVpp, effectiveTokensPerPercent: bestTpp, planAccounts: accounts, planShared: accounts > 1 }
 }
 
 function primaryBarKeyForModel(provider: string, model?: string): string {
@@ -434,24 +561,37 @@ export function enrichBarsWithValueEstimates(
     return bars.map(bar => {
         if (!bar || typeof bar.percentage !== "number") return bar
         const cal = getOrCreatePoolCalibration(provider, accountId, bar.key, bar.percentage, bar.resetTime)
-        if (typeof cal.valuePerPercentUsd !== "number" || cal.valuePerPercentUsd <= 0) {
+        const pooled = getPlanPooledBarEstimate(provider, accountId, bar.key)
+        const effVpp = pooled?.valuePerPercentUsd ?? cal.valuePerPercentUsd
+        const effTpp = pooled?.effectiveTokensPerPercent ?? cal.effectiveTokensPerPercent
+        const planShared = Boolean(pooled?.planShared)
+        const planAccounts = pooled?.planAccounts
+        if (typeof effVpp !== "number" || effVpp <= 0) {
             return {
                 ...bar,
                 estimatedValueUsd: undefined,
                 estimatedTotalValueUsd: undefined,
                 valuePerPercentUsd: undefined,
+                effectiveTokensPerPercent: undefined,
+                estimatedTokensRemaining: undefined,
+                planShared,
+                planAccounts,
             }
         }
-        const valueDepletionPct = (cal.costUsdSinceSync / Math.max(0.05, cal.valuePerPercentUsd))
+        const valueDepletionPct = (cal.costUsdSinceSync / Math.max(0.05, effVpp))
         const effectivePct = Math.max(0, Math.min(100, bar.percentage - valueDepletionPct))
-        const estimatedValueUsd = Math.round(effectivePct * cal.valuePerPercentUsd * 100) / 100
-        const estimatedTotalValueUsd = Math.round(100 * cal.valuePerPercentUsd * 100) / 100
-        const valuePerPercentUsd = Math.round(cal.valuePerPercentUsd * 100) / 100
+        const estimatedValueUsd = Math.round(effectivePct * effVpp * 100) / 100
+        const estimatedTotalValueUsd = Math.round(100 * effVpp * 100) / 100
+        const valuePerPercentUsd = Math.round(effVpp * 100) / 100
         return {
             ...bar,
             estimatedValueUsd,
             estimatedTotalValueUsd,
             valuePerPercentUsd,
+            effectiveTokensPerPercent: typeof effTpp === "number" && effTpp > 0 ? Math.round(effTpp) : undefined,
+            estimatedTokensRemaining: typeof effTpp === "number" && effTpp > 0 ? Math.round(effectivePct * effTpp) : undefined,
+            planShared,
+            planAccounts,
         }
     })
 }
@@ -475,7 +615,7 @@ export function syncIntelligentQuotaCache(
     // Update Percentage-to-Value calibration for each bar
     for (const bar of safeBars) {
         if (!bar || typeof bar.percentage !== "number" || !Number.isFinite(bar.percentage)) continue
-        const newPct = Math.max(0, Math.min(100, bar.percentage))
+        const newPct = preciseBarPct(bar)
         const calKey = makePoolCalibrationKey(provider, accountId, bar.key)
         const existingCal = poolCalibrations.get(calKey)
 
@@ -490,24 +630,43 @@ export function syncIntelligentQuotaCache(
 
         if (newPct < prevPct && !resetChanged) {
             const deltaPct = prevPct - newPct
-            // Require at least a 2.0% drop AND a noticeable local cost to avoid noise and outside usage skew
-            if (deltaPct >= 2.0 && existingCal.costUsdSinceSync > 0.05) {
+            if (deltaPct < MIN_CALIBRATION_DROP_PCT) {
+                // Sub-threshold drift (quantization noise or minor external usage): keep
+                // accumulating our local cost, just refine the precise anchor percentage.
+                existingCal.lastSyncedPercentage = newPct
+                existingCal.lastSyncedResetTime = bar.resetTime ?? existingCal.lastSyncedResetTime
+            } else {
+                // Significant drop: attribute it to us only when our locally-tracked cost is material.
                 const observedUsdPerPct = existingCal.costUsdSinceSync / deltaPct
                 const observedTokensPerPct = existingCal.effectiveTokensSinceSync / deltaPct
 
-                if (Number.isFinite(observedUsdPerPct) && observedUsdPerPct > 0) {
-                    existingCal.recentEstimates = [...(existingCal.recentEstimates || []), observedUsdPerPct].slice(-5)
-                    existingCal.recentTokenEstimates = [...(existingCal.recentTokenEstimates || []), observedTokensPerPct].slice(-5)
-                    existingCal.valuePerPercentUsd = computeMedian(existingCal.recentEstimates)
-                    existingCal.effectiveTokensPerPercent = computeMedian(existingCal.recentTokenEstimates)
-                    existingCal.calibrationSamples = existingCal.recentEstimates.length
-                    calibrationUpdated = true
+                if (existingCal.costUsdSinceSync > 0.05 && Number.isFinite(observedUsdPerPct) && observedUsdPerPct > 0) {
+                    // Contamination guard: external usage during the drop window inflates the
+                    // observed Δ% and collapses $/1% below the trusted prior. Reject the sample
+                    // (never let uncontrollable usage lower the plan budget estimate).
+                    const prior = existingCal.valuePerPercentUsd
+                    const contaminated =
+                        typeof prior === "number" && prior > 0 &&
+                        existingCal.calibrationSamples >= CONTAMINATION_GUARD_MIN_SAMPLES &&
+                        observedUsdPerPct < prior * CONTAMINATION_REJECT_RATIO
+                    if (contaminated) {
+                        existingCal.externalSkewRejects = (existingCal.externalSkewRejects ?? 0) + 1
+                        calibrationUpdated = true
+                    } else {
+                        existingCal.recentEstimates = [...(existingCal.recentEstimates || []), observedUsdPerPct].slice(-5)
+                        existingCal.recentTokenEstimates = [...(existingCal.recentTokenEstimates || []), observedTokensPerPct].slice(-5)
+                        existingCal.valuePerPercentUsd = computeMedian(existingCal.recentEstimates)
+                        existingCal.effectiveTokensPerPercent = computeMedian(existingCal.recentTokenEstimates)
+                        existingCal.calibrationSamples = existingCal.recentEstimates.length
+                        calibrationUpdated = true
+                    }
                 }
+                // The drop (ours + any external share) is spent: restart the since-sync accumulators.
+                existingCal.costUsdSinceSync = 0
+                existingCal.effectiveTokensSinceSync = 0
+                existingCal.lastSyncedPercentage = newPct
+                existingCal.lastSyncedResetTime = bar.resetTime
             }
-            existingCal.costUsdSinceSync = 0
-            existingCal.effectiveTokensSinceSync = 0
-            existingCal.lastSyncedPercentage = newPct
-            existingCal.lastSyncedResetTime = bar.resetTime
         } else if (newPct > prevPct || resetChanged) {
             // Quota reset occurred
             existingCal.costUsdSinceSync = 0
@@ -774,9 +933,7 @@ function evaluateBarWindow(bar: QuotaBarSnapshot, windowHours: number, now: numb
         }
     }
 
-    let rawPct = typeof bar.percentage === "number" && Number.isFinite(bar.percentage)
-        ? Math.max(0, Math.min(100, bar.percentage))
-        : 100
+    let rawPct = preciseBarPct(bar)
 
     let remainingHours: number | null = null
     let timerActive = false
@@ -928,14 +1085,17 @@ export function getAccountQuotaValueEstimate(
     const score = scoreAccountCandidate({ provider, accountId, model, now })
     const poolKey = primaryBarKeyForModel(provider, model)
     const cal = getOrCreatePoolCalibration(provider, accountId, poolKey)
+    const pooled = getPlanPooledBarEstimate(provider, accountId, poolKey)
+    const effVpp = pooled?.valuePerPercentUsd ?? cal.valuePerPercentUsd
+    const effTpp = pooled?.effectiveTokensPerPercent ?? cal.effectiveTokensPerPercent
     return {
         provider,
         accountId,
         poolKey,
         effectiveQuotaPercentage: Math.round(score.effectiveQuotaFraction * 1000) / 10,
-        valuePerPercentUsd: typeof cal.valuePerPercentUsd === "number" ? Math.round(cal.valuePerPercentUsd * 1000) / 1000 : 0,
+        valuePerPercentUsd: typeof effVpp === "number" ? Math.round(effVpp * 1000) / 1000 : 0,
         estimatedRemainingValueUsd: typeof score.estimatedRemainingValueUsd === "number" ? Math.round(score.estimatedRemainingValueUsd * 100) / 100 : 0,
-        effectiveTokensPerPercent: typeof cal.effectiveTokensPerPercent === "number" ? Math.round(cal.effectiveTokensPerPercent) : 0,
+        effectiveTokensPerPercent: typeof effTpp === "number" ? Math.round(effTpp) : 0,
         estimatedRemainingEffectiveTokens: typeof score.estimatedRemainingEffectiveTokens === "number" ? Math.round(score.estimatedRemainingEffectiveTokens) : 0,
         costUsdSinceSync: Math.round(cal.costUsdSinceSync * 10000) / 10000,
         calibrationSamples: cal.calibrationSamples,
@@ -965,6 +1125,9 @@ export function scoreAccountCandidate(params: ScoreCandidateParams): Intelligent
         primary?.bar.percentage ?? 100,
         primary?.bar.resetTime
     )
+    const pooled = getPlanPooledBarEstimate(params.provider, params.accountId, poolBarKey)
+    const effVpp = pooled?.valuePerPercentUsd ?? cal.valuePerPercentUsd
+    const effTpp = pooled?.effectiveTokensPerPercent ?? cal.effectiveTokensPerPercent
 
     let unknownQuota = false
     let rawQuotaFraction = 0.85
@@ -977,7 +1140,7 @@ export function scoreAccountCandidate(params: ScoreCandidateParams): Intelligent
 
     // Cache-aware live quota depletion estimate since the last upstream quota sync:
     // Uses calibrated valuePerPercentUsd when token/cost usage was recorded, plus a small per-dispatch baseline.
-    const unitValue = typeof cal.valuePerPercentUsd === "number" && cal.valuePerPercentUsd > 0 ? cal.valuePerPercentUsd : 0.50
+    const unitValue = typeof effVpp === "number" && effVpp > 0 ? effVpp : 0.50
     const valueDepletion = cal.costUsdSinceSync / (100 * unitValue)
     const dispatchDepletion = load.dispatchesSinceQuotaSync * LIVE_QUOTA_DEPLETION_PER_DISPATCH
     const liveDepletion = Math.min(MAX_LIVE_QUOTA_DEPLETION, valueDepletion + dispatchDepletion)
@@ -1088,8 +1251,8 @@ export function scoreAccountCandidate(params: ScoreCandidateParams): Intelligent
 
     // Estimate remaining dollar value and effective token capacity from calibrated Percentage-to-Value
     const effectiveQuotaPercent = exhausted ? 0 : rawQuotaFraction * 100
-    const estimatedRemainingValueUsd = typeof cal.valuePerPercentUsd === "number" ? effectiveQuotaPercent * cal.valuePerPercentUsd : 0
-    const estimatedRemainingEffectiveTokens = typeof cal.effectiveTokensPerPercent === "number" ? effectiveQuotaPercent * cal.effectiveTokensPerPercent : 0
+    const estimatedRemainingValueUsd = typeof effVpp === "number" ? effectiveQuotaPercent * effVpp : 0
+    const estimatedRemainingEffectiveTokens = typeof effTpp === "number" ? effectiveQuotaPercent * effTpp : 0
 
     // Estimate how much value the incoming request will consume on THIS candidate account
     // (accounting for whether the prompt cache is warm on this account: 85% cached @ 0.1x vs 100% uncached @ 1.0x)
@@ -1123,7 +1286,7 @@ export function scoreAccountCandidate(params: ScoreCandidateParams): Intelligent
     let lowQuotaReservePenalty = 0
     let insufficientQuotaForRequest = false
     if (!exhausted && !unknownQuota && rawQuotaFraction <= NEAR_EXHAUSTION_QUOTA_FRACTION) {
-        if (typeof cal.valuePerPercentUsd === "number" && cal.valuePerPercentUsd > 0) {
+        if (typeof effVpp === "number" && effVpp > 0) {
             const requiredValueUsd = Math.max(0.06, estimatedRequestCostUsd * REQUEST_FIT_SAFETY_MARGIN)
             if (estimatedRemainingValueUsd < requiredValueUsd) {
                 insufficientQuotaForRequest = true
@@ -1179,13 +1342,15 @@ export function scoreAccountCandidate(params: ScoreCandidateParams): Intelligent
         liveLoadPenalty,
         concurrencyPenalty,
         failurePenalty,
-        valuePerPercentUsd: cal.valuePerPercentUsd ?? 0,
+        valuePerPercentUsd: effVpp ?? 0,
         estimatedRemainingValueUsd,
         estimatedRemainingEffectiveTokens,
         estimatedRequestCostUsd,
         insufficientQuotaForRequest,
         exhausted,
         unknownQuota,
+        planShared: pooled?.planShared ?? false,
+        planAccounts: pooled?.planAccounts ?? 0,
     }
 }
 

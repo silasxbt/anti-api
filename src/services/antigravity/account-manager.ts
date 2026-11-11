@@ -154,6 +154,7 @@ export interface Account {
     projectId: string | null
     proxy?: string
     label?: string
+    plan?: string
     // 限流状态
     rateLimitedUntil: number | null
     consecutiveFailures: number
@@ -205,6 +206,7 @@ class AccountManager {
             projectId: account.projectId || undefined,
             proxy: account.proxy || undefined,
             label: account.label || account.email,
+            plan: account.plan,
         })
     }
 
@@ -224,6 +226,7 @@ class AccountManager {
                 projectId: stored.projectId || null,
                 proxy: stored.proxy || undefined,
                 label: stored.label || undefined,
+                plan: stored.plan,
                 rateLimitedUntil: null,
                 consecutiveFailures: 0,
             })
@@ -295,6 +298,7 @@ class AccountManager {
                 projectId: acc.projectId,
                 proxy: acc.proxy,
                 label: acc.label,
+                plan: acc.plan,
             }))
             writePrivateFile(this.dataFile, JSON.stringify({ accounts }, null, 2))
         } catch (e) {
@@ -388,7 +392,7 @@ class AccountManager {
      */
     updateAccountOptions(
         accountId: string,
-        options: { proxy?: string; label?: string; projectId?: string }
+        options: { proxy?: string; label?: string; projectId?: string; plan?: string }
     ): boolean {
         this.ensureLoaded()
         const account = this.accounts.get(accountId)
@@ -396,6 +400,7 @@ class AccountManager {
         if (options.proxy !== undefined) account.proxy = options.proxy.trim() || undefined
         if (options.label !== undefined) account.label = options.label.trim() || undefined
         if (options.projectId !== undefined) account.projectId = options.projectId.trim() || null
+        if (options.plan !== undefined) account.plan = options.plan.trim().toLowerCase() || undefined
         this.save()
         this.syncAccountToAuthStore(account)
         return true

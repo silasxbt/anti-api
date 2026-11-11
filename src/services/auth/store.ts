@@ -21,6 +21,7 @@ interface StoredAuthFile {
     refresh_token?: string
     expires_at?: number
     project_id?: string
+    plan?: string
     organization_id?: string
     server_url?: string
     metadata?: Record<string, unknown>
@@ -110,6 +111,7 @@ function loadAccountFromFile(path: string): ProviderAccount | null {
             refreshToken: raw.refresh_token || raw.refreshToken,
             expiresAt: raw.expires_at || raw.expiresAt,
             projectId: raw.project_id || raw.projectId,
+            plan: raw.plan,
             organizationId: raw.organization_id || raw.organizationId,
             serverUrl: raw.server_url || raw.serverUrl,
             authSource: (raw.auth_source || raw.authSource) as ProviderAccount["authSource"],
@@ -142,6 +144,7 @@ function writeAccountFile(account: ProviderAccount): void {
         refresh_token: account.refreshToken,
         expires_at: account.expiresAt,
         project_id: account.projectId,
+        plan: account.plan,
         organization_id: account.organizationId,
         server_url: account.serverUrl,
         metadata: account.metadata,
@@ -210,13 +213,14 @@ export const authStore = {
     updateAccountOptions(
         provider: AuthProvider,
         id: string,
-        options: { proxy?: string; label?: string; projectId?: string }
+        options: { proxy?: string; label?: string; projectId?: string; plan?: string }
     ): ProviderAccount | null {
         const account = this.getAccount(provider, id)
         if (!account) return null
         if (options.proxy !== undefined) account.proxy = options.proxy.trim() || undefined
         if (options.label !== undefined) account.label = options.label.trim() || undefined
         if (options.projectId !== undefined) account.projectId = options.projectId.trim() || undefined
+        if (options.plan !== undefined) account.plan = options.plan.trim().toLowerCase() || undefined
         this.saveAccount(account)
         return account
     },

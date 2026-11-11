@@ -28,6 +28,7 @@ import { loadSettings, saveSettings } from "./services/settings"
 import { pingAccount } from "./services/ping"
 import { summarizeUpstreamError, UpstreamError } from "./lib/error"
 import { authStore } from "./services/auth/store"
+import { ACCOUNT_PLAN_OPTIONS } from "./lib/account-plans"
 import { AUTH_PROVIDERS, PROVIDER_DISPLAY_NAMES, type AuthProvider } from "./services/auth/types"
 import { safeErrorMessage } from "./lib/redaction"
 
@@ -646,6 +647,7 @@ server.get("/accounts/:id/options", (c) => {
                 label: agAcc.label || "",
                 proxy: agAcc.proxy || "",
                 projectId: agAcc.projectId || "",
+                plan: agAcc.plan || "",
             }
         })
     }
@@ -666,6 +668,7 @@ server.get("/accounts/:id/options", (c) => {
                     label: acc.label || "",
                     proxy: acc.proxy || "",
                     projectId: acc.projectId || "",
+                    plan: acc.plan || "",
                 }
             })
         }
@@ -721,7 +724,7 @@ server.get("/accounts/:id/export", (c) => {
 // 更新账号选项 (Egress Proxy, Label, Project ID)
 const handleUpdateAccountOptions = async (c: any) => {
     const accountId = c.req.param("id")
-    let body: { proxy?: string; label?: string; projectId?: string; provider?: string } = {}
+    let body: { proxy?: string; label?: string; projectId?: string; provider?: string; plan?: string } = {}
     try {
         body = await c.req.json()
     } catch {
@@ -729,12 +732,23 @@ const handleUpdateAccountOptions = async (c: any) => {
     }
 
     const { proxy, label, projectId, provider } = body
+    const plan = body.plan !== undefined ? String(body.plan ?? "").trim().toLowerCase() : undefined
+    // Validate against the known plan enums ("" clears the plan => provider default applies).
+    if (plan !== undefined && plan !== "") {
+        const allowedPlans = new Set<string>([
+            ...ACCOUNT_PLAN_OPTIONS.antigravity,
+            ...ACCOUNT_PLAN_OPTIONS.copilot,
+        ])
+        if (!allowedPlans.has(plan)) {
+            return c.json({ success: false, error: `Unknown plan "${plan}". Allowed: ${[...allowedPlans].join(", ")}` }, 400)
+        }
+    }
     let updated = false
     let targetProvider = provider as AuthProvider | undefined
 
     if (!targetProvider || targetProvider === "antigravity") {
         if (accountManager.hasAccount(accountId)) {
-            updated = accountManager.updateAccountOptions(accountId, { proxy, label, projectId })
+            updated = accountManager.updateAccountOptions(accountId, { proxy, label, projectId, plan })
             targetProvider = "antigravity"
         }
     }
@@ -742,7 +756,7 @@ const handleUpdateAccountOptions = async (c: any) => {
     if (!updated || targetProvider) {
         const providersToTry = targetProvider ? [targetProvider] : PROVIDERS
         for (const prov of providersToTry) {
-            const res = authStore.updateAccountOptions(prov, accountId, { proxy, label, projectId })
+            const res = authStore.updateAccountOptions(prov, accountId, { proxy, label, projectId, plan })
             if (res) {
                 updated = true
                 targetProvider = prov
@@ -762,6 +776,7 @@ const handleUpdateAccountOptions = async (c: any) => {
         proxy: proxy !== undefined ? (proxy.trim() || null) : undefined,
         label: label !== undefined ? (label.trim() || null) : undefined,
         projectId: projectId !== undefined ? (projectId.trim() || null) : undefined,
+        plan: plan !== undefined ? (plan || null) : undefined,
     })
 }
 
