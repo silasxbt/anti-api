@@ -90,7 +90,9 @@ export async function handleChatCompletion(c: Context): Promise<Response> {
                 model: anthropicModel,
                 messages,
                 tools,
-                maxTokens: payload.max_tokens || 4096,
+                // Pass undefined through: each upstream service falls back to the model's
+                // native output limit (e.g. buildGenerationConfig in antigravity chat.ts).
+                maxTokens: payload.max_tokens,
                 reasoningEffort,
                 signal: c.req.raw.signal,
             })
@@ -203,7 +205,9 @@ async function handleStreamCompletion(
                 model: anthropicModel,
                 messages,
                 tools,
-                maxTokens: payload.max_tokens || 4096,
+                // Pass undefined through: each upstream service falls back to the model's
+                // native output limit (e.g. buildGenerationConfig in antigravity chat.ts).
+                maxTokens: payload.max_tokens,
                 reasoningEffort,
                 signal: requestSignal,
             })
