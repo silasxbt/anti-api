@@ -13,6 +13,7 @@ export type ModelFamily =
     | "claude-opus"
     | "claude-sonnet"
     | "gemini-argon"
+    | "gemini-hydrogen"
     | "gemini-pro"
     | "gemini-flash"
     | "gemini-flash-lite"
@@ -34,6 +35,7 @@ const FAMILIES: ModelFamily[] = [
     "claude-opus",
     "claude-sonnet",
     "gemini-argon",
+    "gemini-hydrogen",
     "gemini-pro",
     "gemini-flash",
     "gemini-flash-lite",
@@ -44,7 +46,8 @@ const FAMILIES: ModelFamily[] = [
 const VARIANT_PREFERENCE: Record<ModelFamily, string[]> = {
     "claude-opus": ["thinking", "high", "medium", "low", ""],
     "claude-sonnet": ["", "medium", "high", "low", "thinking"],
-    "gemini-argon": ["high", "thinking", "medium", "", "low"],
+    "gemini-argon": ["xhigh", "high", "thinking", "medium", "", "low"],
+    "gemini-hydrogen": ["xhigh", "high", "thinking", "medium", "", "low"],
     "gemini-pro": ["high", "agent", "", "low"],
     "gemini-flash": ["medium", "", "high", "low"],
     "gemini-flash-lite": ["", "low"],
@@ -69,7 +72,7 @@ export function parseModelId(id: string): ParsedModel | null {
     if (!lower || lower.endsWith("-disabled")) return null
 
     // Gemini Argon (e.g. gemini-4-argon, gemini-argon, argon)
-    let m = lower.match(/^gemini-(?:(\d{1,2}(?:\.\d{1,2})?)-)?argon(?:-(high|medium|low|thinking))?$/)
+    let m = lower.match(/^gemini-(?:(\d{1,2}(?:\.\d{1,2})?)-)?argon(?:-(xhigh|high|medium|low|thinking))?$/)
     if (m) {
         return {
             id,
@@ -84,6 +87,18 @@ export function parseModelId(id: string): ParsedModel | null {
             family: "gemini-argon",
             version: [4],
             variant: "",
+        }
+    }
+
+    // Gemini Hydrogen (e.g. gemini-4-hydrogen, gemini-4-hydrogen-xhigh).
+    // Upstream exposes it only as thinking-level variants, never a bare ID.
+    m = lower.match(/^gemini-(?:(\d{1,2}(?:\.\d{1,2})?)-)?hydrogen(?:-(xhigh|high|medium|low|thinking))?$/)
+    if (m) {
+        return {
+            id,
+            family: "gemini-hydrogen",
+            version: m[1] ? toVersion(m[1]) : [4],
+            variant: m[2] || "",
         }
     }
 
@@ -157,6 +172,10 @@ const FAMILY_QUOTA_POOL: Record<ModelFamily, QuotaPool> = {
     "claude-sonnet": "claude_gpt",
     "gpt-oss": "claude_gpt",
     "gemini-argon": "argon",
+    // Hydrogen currently shares the Gemini buckets upstream (no dedicated group in
+    // retrieveUserQuotaSummary yet). If Google ever splits it into its own bucket,
+    // move it to its own pool and handle it like argon in buildAntigravityBars.
+    "gemini-hydrogen": "gemini",
     "gemini-pro": "gemini",
     "gemini-flash": "gemini",
     "gemini-flash-lite": "gemini",

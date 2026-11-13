@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from "bun:test"
-import { buildCatalog } from "~/lib/model-catalog"
+import { buildCatalog, parseModelId, quotaPoolForModel } from "~/lib/model-catalog"
 import { getModelEnumValue, MODEL_ENUM } from "~/proto/encoder"
 import { clearAllDynamicAntigravityModelsByAccount, clearDynamicAntigravityModels, getProviderModels, setDynamicAntigravityModels } from "~/services/routing/models"
 
@@ -76,6 +76,45 @@ test("getProviderModels antigravity respects includeAllVariants flag", () => {
         expect(baseIds).not.toContain(alias)
         expect(allIds).not.toContain(alias)
     }
+})
+
+test("Gemini 4 Hydrogen parses as its own family and stays hidden behind the clean alias", () => {
+    clearAllDynamicAntigravityModelsByAccount()
+    setDynamicAntigravityModels(
+        ["gemini-4-hydrogen-xhigh", "gemini-4-hydrogen-high", "gemini-4-hydrogen-medium", "gemini-4-hydrogen-low"]
+            .map(id => ({ id, label: id }))
+    )
+
+    const parsed = parseModelId("gemini-4-hydrogen-xhigh")
+    expect(parsed?.family).toBe("gemini-hydrogen")
+    expect(parsed?.version).toEqual([4])
+    expect(parsed?.variant).toBe("xhigh")
+    expect(parseModelId("gemini-4-hydrogen")?.variant).toBe("")
+    expect(parseModelId("gemini-4-hydrogen-medium")?.variant).toBe("medium")
+
+    const catalog = buildCatalog([
+        "gemini-4-hydrogen-xhigh",
+        "gemini-4-hydrogen-high",
+        "gemini-4-hydrogen-medium",
+        "gemini-4-hydrogen-low",
+    ])
+    // Upstream only ships the thinking-level variants: the catalog must synthesize the clean base ID.
+    expect(catalog.base.map(m => m.id)).toEqual(["gemini-4-hydrogen"])
+    expect(catalog.base[0].name).toBe("Gemini 4 Hydrogen")
+    // The default alias resolves to the top thinking level (xhigh).
+    expect(catalog.aliases.get("gemini-4-hydrogen")).toBe("gemini-4-hydrogen-xhigh")
+    expect(catalog.aliases.get("gemini-hydrogen")).toBe("gemini-4-hydrogen-xhigh")
+    expect(quotaPoolForModel("gemini-4-hydrogen-xhigh")).toBe("gemini")
+    expect(quotaPoolForModel("gemini-4-hydrogen")).toBe("gemini")
+
+    const baseOnly = getProviderModels("antigravity", { includeAllVariants: false }).map(m => m.id)
+    expect(baseOnly).toContain("gemini-4-hydrogen")
+    for (const suffix of ["-xhigh", "-high", "-medium", "-low"]) {
+        expect(baseOnly).not.toContain(`gemini-4-hydrogen${suffix}`)
+    }
+
+    const allModels = getProviderModels("antigravity", { includeAllVariants: true }).map(m => m.id)
+    expect(allModels).toContain("gemini-4-hydrogen-xhigh")
 })
 
 afterAll(() => {

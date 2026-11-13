@@ -183,9 +183,9 @@ function getCatalogAntigravityModels(): ProviderModelOption[] {
     return [...catalog.base, ...catalog.variants].map(m => ({ id: m.id, label: m.name }))
 }
 
-/** True for explicit effort/thinking variants such as `-high`, `-low`, `-medium` and `-thinking`. */
+/** True for explicit effort/thinking variants such as `-xhigh`, `-high`, `-low`, `-medium` and `-thinking`. */
 export function isVariantModelId(id: string): boolean {
-    return /-(high|low|medium|thinking)$/.test(id)
+    return /-(xhigh|high|low|medium|thinking)$/.test(id)
 }
 
 /** Every known Antigravity model (catalog + discovered + static), with no per-family filtering. */
