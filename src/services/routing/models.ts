@@ -113,6 +113,31 @@ function hasContextMetadata(model: ProviderModelOption): boolean {
     return typeof model.maxInputTokens === "number" && model.maxInputTokens > 0
 }
 
+/**
+ * Upstream often reports token limits only on effort/thinking variants
+ * (e.g. `model-xhigh`) while the catalog synthesizes the base entry. Propagate
+ * the largest limits seen among variant siblings onto metadata-free entries of
+ * the same family so exposed base models carry the real context window.
+ */
+function attachFamilyContextLimits(models: ProviderModelOption[]): ProviderModelOption[] {
+    const limitsByBase = new Map<string, { maxInputTokens?: number; maxOutputTokens?: number }>()
+    for (const model of models) {
+        if (!hasContextMetadata(model)) continue
+        const baseId = model.id.replace(/-(xhigh|high|low|medium|thinking)$/, "")
+        if (baseId === model.id) continue
+        const current = limitsByBase.get(baseId)
+        const maxInput = Math.max(current?.maxInputTokens ?? 0, model.maxInputTokens!)
+        const maxOutput = Math.max(current?.maxOutputTokens ?? 0, model.maxOutputTokens ?? 0)
+        limitsByBase.set(baseId, { maxInputTokens: maxInput, maxOutputTokens: maxOutput })
+    }
+    return models.map(model => {
+        if (hasContextMetadata(model)) return model
+        const limits = limitsByBase.get(model.id)
+        if (!limits) return model
+        return { ...model, ...limits }
+    })
+}
+
 function flattenDynamicModelsByAccount(bucket: Map<string, ProviderModelOption[]>): ProviderModelOption[] {
     return Array.from(bucket.values()).flat()
 }
@@ -214,7 +239,7 @@ export function isVariantModelId(id: string): boolean {
 export function getAllAntigravityModels(): ProviderModelOption[] {
     const store = getStore("antigravity")
     const dynamic = mergeModelOptions(flattenDynamicModelsByAccount(store.byAccount), store.global)
-    return mergeModelOptions(getCatalogAntigravityModels(), dynamic)
+    return attachFamilyContextLimits(mergeModelOptions(getCatalogAntigravityModels(), dynamic))
 }
 
 export const setDynamicCopilotModels = (models: ProviderModelOption[]) => setDynamicProviderModels("copilot", models)

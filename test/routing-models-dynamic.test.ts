@@ -116,3 +116,21 @@ test("antigravity catalog entries inherit discovered upstream context limits", (
     // The catalog display label must win over the raw discovered label.
     expect(hydrogen?.label).toBe("Gemini 4 Hydrogen")
 })
+
+test("base models inherit context limits from variant siblings only exposed upstream", () => {
+    // Upstream reality: only suffixed variants carry maxTokens; the catalog
+    // synthesizes the base entry without any metadata.
+    setDynamicAntigravityModels([
+        { id: "gemini-4-hydrogen-xhigh", label: "Antigravity - gemini-4-hydrogen-xhigh", maxInputTokens: 1048576, maxOutputTokens: 262144 },
+        { id: "gemini-4-hydrogen-high", label: "Antigravity - gemini-4-hydrogen-high", maxInputTokens: 1048576, maxOutputTokens: 262144 },
+        { id: "gemini-4-hydrogen-medium", label: "Antigravity - gemini-4-hydrogen-medium", maxInputTokens: 1048576, maxOutputTokens: 262144 },
+    ])
+
+    const models = getProviderModels("antigravity", { includeAllVariants: true })
+    const hydrogen = models.find(model => model.id === "gemini-4-hydrogen")
+    const medium = models.find(model => model.id === "gemini-4-hydrogen-medium")
+
+    expect(hydrogen?.maxInputTokens).toBe(1048576)
+    expect(hydrogen?.maxOutputTokens).toBe(262144)
+    expect(medium?.maxInputTokens).toBe(1048576)
+})
