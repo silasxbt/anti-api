@@ -266,9 +266,11 @@ export async function syncProviderModels(
             const active = await accountManager.getAccountById(account.id)
             if (!active) return []
             const remote = await fetchAntigravityModels(active.accessToken, active.projectId, active.proxy)
-            return Object.keys(remote.models || {}).map((id) => ({
+            return Object.entries(remote.models || {}).map(([id, info]) => ({
                 id,
                 label: `Antigravity - ${id}`,
+                ...(typeof info.maxTokens === "number" && info.maxTokens > 0 ? { maxInputTokens: info.maxTokens } : {}),
+                ...(typeof info.maxOutputTokens === "number" && info.maxOutputTokens > 0 ? { maxOutputTokens: info.maxOutputTokens } : {}),
             }))
         }, perAccountTimeoutMs),
         triggerProviderSync("zed", "Zed", zedAccounts, now, async (account) => {

@@ -43,6 +43,26 @@ test("dynamic copilot model options are sanitized and deduplicated", () => {
     expect(matches[0].label).toBe("Copilot - GPT-5.2")
 })
 
+test("discovered model context limits are carried through and sanitized", () => {
+    setDynamicCopilotModels([
+        { id: "gpt-5.5", label: "Copilot - GPT-5.5", maxInputTokens: 1048576.0, maxOutputTokens: 262144 },
+        { id: "gpt-5-mini", label: "Copilot - GPT-5-mini", maxInputTokens: 0, maxOutputTokens: -5 },
+        { id: "gpt-5-tiny", label: "Copilot - GPT-5-tiny", maxInputTokens: NaN, maxOutputTokens: "1000" as unknown as number },
+    ])
+
+    const models = getProviderModels("copilot")
+    const full = models.find(model => model.id === "gpt-5.5")
+    const zeroed = models.find(model => model.id === "gpt-5-mini")
+    const junk = models.find(model => model.id === "gpt-5-tiny")
+
+    expect(full?.maxInputTokens).toBe(1048576)
+    expect(full?.maxOutputTokens).toBe(262144)
+    expect(zeroed?.maxInputTokens).toBeUndefined()
+    expect(zeroed?.maxOutputTokens).toBeUndefined()
+    expect(junk?.maxInputTokens).toBeUndefined()
+    expect(junk?.maxOutputTokens).toBeUndefined()
+})
+
 test("codex models are not hardcoded when dynamic list is empty", () => {
     clearDynamicCodexModels()
     const models = getProviderModels("codex")

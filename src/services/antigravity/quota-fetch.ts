@@ -10,6 +10,8 @@ const CLOUD_CODE_BASE_URLS = [
 export type AntigravityModelInfo = {
     remainingFraction?: number
     resetTime?: string
+    maxTokens?: number
+    maxOutputTokens?: number
 }
 
 export type AntigravityQuotaBucket = {
@@ -90,14 +92,27 @@ export async function fetchAntigravityModels(
             })
 
             if (response.status >= 200 && response.status < 300) {
-                const data = response.data as { models?: Record<string, { quotaInfo?: AntigravityModelInfo }> }
+                const data = response.data as {
+                    models?: Record<string, {
+                        quotaInfo?: { remainingFraction?: number; resetTime?: string }
+                        maxTokens?: number
+                        maxOutputTokens?: number
+                    }>
+                }
 
                 const models: Record<string, AntigravityModelInfo> = {}
                 for (const [name, info] of Object.entries(data.models || {})) {
-                    models[name] = {
+                    const entry: AntigravityModelInfo = {
                         remainingFraction: info.quotaInfo?.remainingFraction ?? 0,
                         resetTime: info.quotaInfo?.resetTime,
                     }
+                    if (typeof info.maxTokens === "number" && Number.isFinite(info.maxTokens) && info.maxTokens > 0) {
+                        entry.maxTokens = Math.floor(info.maxTokens)
+                    }
+                    if (typeof info.maxOutputTokens === "number" && Number.isFinite(info.maxOutputTokens) && info.maxOutputTokens > 0) {
+                        entry.maxOutputTokens = Math.floor(info.maxOutputTokens)
+                    }
+                    models[name] = entry
                 }
 
                 return {

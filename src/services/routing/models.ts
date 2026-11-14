@@ -22,6 +22,8 @@ export async function ensureProviderModelsSynced(): Promise<void> {
 export interface ProviderModelOption {
     id: string
     label: string
+    maxInputTokens?: number
+    maxOutputTokens?: number
 }
 
 // No hardcoded model lists: every provider's models are discovered online per account (see syncProviderModels).
@@ -71,7 +73,13 @@ function sanitizeModelOptions(
         const id = model?.id?.trim()
         if (!id || deduped.has(id)) continue
 
-        const entry = { id, label: model?.label?.trim() || `${prefix} - ${id}` }
+        const entry: ProviderModelOption = { id, label: model?.label?.trim() || `${prefix} - ${id}` }
+        if (typeof model?.maxInputTokens === "number" && Number.isFinite(model.maxInputTokens) && model.maxInputTokens > 0) {
+            entry.maxInputTokens = Math.floor(model.maxInputTokens)
+        }
+        if (typeof model?.maxOutputTokens === "number" && Number.isFinite(model.maxOutputTokens) && model.maxOutputTokens > 0) {
+            entry.maxOutputTokens = Math.floor(model.maxOutputTokens)
+        }
         if (filter && !filter(entry)) continue
         deduped.set(id, entry)
     }

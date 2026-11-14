@@ -59,6 +59,10 @@ interface ModelListEntry {
     id: string
     name: string
     owned_by: string
+    max_input_tokens?: number
+    max_output_tokens?: number
+    context_window?: number
+    context_length?: number
 }
 
 initLogCapture()
@@ -362,6 +366,10 @@ function computeModelsCatalog() {
             id: model.id,
             name: model.label,
             owned_by: provider,
+            ...(model.maxInputTokens
+                ? { max_input_tokens: model.maxInputTokens, context_window: model.maxInputTokens, context_length: model.maxInputTokens }
+                : {}),
+            ...(model.maxOutputTokens ? { max_output_tokens: model.maxOutputTokens } : {}),
         }))
     )
 
@@ -411,6 +419,12 @@ const modelsHandler = async (c: any) => {
             created: Date.now(),     // OpenAI format (unix timestamp)
             owned_by: m.owned_by,
             display_name: m.name,
+            ...(m.max_input_tokens ? {
+                max_input_tokens: m.max_input_tokens,
+                context_window: m.context_window,
+                context_length: m.context_length,
+            } : {}),
+            ...(m.max_output_tokens ? { max_output_tokens: m.max_output_tokens } : {}),
         })),
         has_more: false,
         first_id: models[0]?.id,
