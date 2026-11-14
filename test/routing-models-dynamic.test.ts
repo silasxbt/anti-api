@@ -1,10 +1,11 @@
 import { afterEach, expect, test } from "bun:test"
-import { clearDynamicCodexModels, clearDynamicCopilotModels, clearDynamicKiroModels, getProviderModels, setDynamicCodexModels, setDynamicCopilotModels, setDynamicKiroModels } from "~/services/routing/models"
+import { clearDynamicCodexModels, clearDynamicCopilotModels, clearDynamicKiroModels, clearDynamicAntigravityModels, getProviderModels, setDynamicAntigravityModels, setDynamicCodexModels, setDynamicCopilotModels, setDynamicKiroModels } from "~/services/routing/models"
 
 afterEach(() => {
     clearDynamicCopilotModels()
     clearDynamicCodexModels()
     clearDynamicKiroModels()
+    clearDynamicAntigravityModels()
 })
 
 test("copilot models are not hardcoded when dynamic list is empty", () => {
@@ -99,4 +100,19 @@ test("kiro models merge dynamic models before static fallback", () => {
 
     expect(custom?.label).toBe("Kiro - Custom")
     expect(auto?.label).toBe("Kiro - Dynamic Auto")
+})
+
+test("antigravity catalog entries inherit discovered upstream context limits", () => {
+    setDynamicAntigravityModels([
+        { id: "gemini-4-hydrogen-xhigh", label: "Antigravity - gemini-4-hydrogen-xhigh", maxInputTokens: 1048576, maxOutputTokens: 262144 },
+        { id: "gemini-4-hydrogen", label: "Antigravity - gemini-4-hydrogen", maxInputTokens: 1048576, maxOutputTokens: 262144 },
+    ])
+
+    const models = getProviderModels("antigravity", { includeAllVariants: true })
+    const hydrogen = models.find(model => model.id === "gemini-4-hydrogen")
+
+    expect(hydrogen?.maxInputTokens).toBe(1048576)
+    expect(hydrogen?.maxOutputTokens).toBe(262144)
+    // The catalog display label must win over the raw discovered label.
+    expect(hydrogen?.label).toBe("Gemini 4 Hydrogen")
 })

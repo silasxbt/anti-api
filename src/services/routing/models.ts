@@ -91,12 +91,26 @@ function mergeModelOptions(...groups: ProviderModelOption[][]): ProviderModelOpt
     const merged = new Map<string, ProviderModelOption>()
     for (const group of groups) {
         for (const model of group) {
-            if (!merged.has(model.id)) {
+            const existing = merged.get(model.id)
+            if (!existing) {
                 merged.set(model.id, model)
+            } else if (!hasContextMetadata(existing) && hasContextMetadata(model)) {
+                // Catalog/static entries never carry upstream limits: keep their
+                // display labels and attach the discovered entry's limits to them.
+                merged.set(model.id, {
+                    ...existing,
+                    label: existing.label || model.label,
+                    maxInputTokens: model.maxInputTokens,
+                    maxOutputTokens: model.maxOutputTokens,
+                })
             }
         }
     }
     return Array.from(merged.values())
+}
+
+function hasContextMetadata(model: ProviderModelOption): boolean {
+    return typeof model.maxInputTokens === "number" && model.maxInputTokens > 0
 }
 
 function flattenDynamicModelsByAccount(bucket: Map<string, ProviderModelOption[]>): ProviderModelOption[] {
@@ -283,7 +297,7 @@ export function getProviderModelsForAccount(provider: AuthProvider, accountId: s
 
             const knownIds = new Set(catalogModels.map(m => m.id))
             const leftovers = dynamic.filter(m => !knownIds.has(m.id) && (separateThinking || !isVariantModelId(m.id)))
-            return [...catalogModels, ...leftovers]
+            return [...mergeModelOptions(catalogModels, dynamic), ...leftovers]
         }
         return getProviderModels(provider)
     }
