@@ -183,7 +183,7 @@
     </style>
 </head>
 
-<body class="min-h-screen p-6">
+<body class="min-h-screen p-3 sm:p-6 overflow-x-hidden">
     <script>
         // Immediately detect iframe before DOM renders
         if (window.self !== window.top) {
@@ -194,22 +194,22 @@
     <div class="max-w-7xl mx-auto main-container">
         <!-- Header -->
         <div class="mb-6 remote-header">
-            <h1 class="text-3xl font-bold text-gray-300" data-i18n="remote.title">Remote</h1>
-            <p class="text-gray-500 text-sm font-bold mt-1" data-i18n="remote.subtitle">Connect a protocol-compatible inference gateway through a third-party tunnel</p>
+            <h1 class="text-2xl sm:text-3xl font-bold text-gray-300" data-i18n="remote.title">Remote</h1>
+            <p class="text-gray-500 text-xs sm:text-sm font-bold mt-1" data-i18n="remote.subtitle">Connect a protocol-compatible inference gateway through a third-party tunnel</p>
             <p class="text-amber-500/80 text-xs mt-3" data-i18n="remote.securityNotice">ngrok is a third-party tunnel service. On the public internet, expose only a token-protected inference gateway. Never expose this dashboard or any control-plane endpoint.</p>
         </div>
 
         <!-- ngrok Card - Simplified -->
         <div class="card-3d" data-type="ngrok">
-            <div class="card-inner rounded-xl p-6" id="ngrok-card">
+            <div class="card-inner rounded-xl p-4 sm:p-6" id="ngrok-card">
                 <!-- Token Input Row -->
-                <div class="flex items-center gap-3 mb-2">
+                <div class="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3 mb-2">
                     <input type="password" id="ngrok-authtoken" placeholder="Enter a new ngrok authtoken"
                         data-i18n-placeholder="remote.tokenPlaceholder" autocomplete="new-password" spellcheck="false"
-                        class="flex-1 px-4 py-2.5 rounded-lg text-white text-sm"
+                        class="flex-1 px-4 py-2.5 rounded-lg text-white text-sm w-full"
                         style="background: rgba(255,255,255,0.08); border: 1px solid rgba(55, 65, 81, 0.5);">
                     <a href="https://dashboard.ngrok.com/get-started/your-authtoken" target="_blank" rel="noopener noreferrer"
-                        class="text-cyan-400 text-sm font-medium hover:text-cyan-300 whitespace-nowrap">
+                        class="text-cyan-400 text-sm font-medium hover:text-cyan-300 whitespace-nowrap self-end sm:self-auto">
                         <span data-i18n="remote.getToken">Get Token</span> →
                     </a>
                 </div>
@@ -246,7 +246,7 @@
     <div id="toast-container" class="fixed bottom-8 right-8 z-50"></div>
 
     <script>
-        const API_BASE = 'http://localhost:8964';
+        const API_BASE = window.location.origin;
         const LANGUAGE_STORAGE_KEY = 'anti-api-language';
         function detectPreferredLanguage() {
             const candidates = [];
@@ -305,6 +305,29 @@
                 'remote.copied': 'URL 已复制到剪贴板',
                 'remote.copyFailed': '复制失败',
                 'remote.clickToCopy': '点击复制 URL：',
+            },
+            it: {
+                'remote.title': 'Remoto',
+                'remote.subtitle': 'Collega un gateway di inferenza compatibile con il protocollo tramite un tunnel di terze parti',
+                'remote.securityNotice': 'ngrok è un servizio tunnel di terze parti. Esponi solo il gateway di inferenza protetto da token, mai questa dashboard o il pannello di controllo.',
+                'remote.tokenPlaceholder': 'Inserisci un nuovo authtoken ngrok',
+                'remote.tokenConfigured': 'Token salvato configurato ({masked}). Lascia il campo vuoto per riutilizzarlo.',
+                'remote.tokenNotConfigured': 'Nessun token salvato configurato.',
+                'remote.clearToken': 'Cancella il token salvato all\'avvio',
+                'remote.getToken': 'Ottieni Token',
+                'remote.start': 'Avvia',
+                'remote.stop': 'Arresta',
+                'remote.notConnected': 'Non connesso',
+                'remote.starting': 'Avvio in corso...',
+                'remote.connected': 'Connesso',
+                'remote.started': 'ngrok avviato con successo',
+                'remote.startingWait': 'Avvio in corso, in attesa dell\'URL...',
+                'remote.failedToStart': 'Avvio non riuscito',
+                'remote.stopped': 'ngrok arrestato',
+                'remote.noUrl': 'Nessun URL da copiare',
+                'remote.copied': 'URL copiato negli appunti',
+                'remote.copyFailed': 'Copia non riuscita',
+                'remote.clickToCopy': 'Fai clic per copiare l\'URL:',
             }
         };
 

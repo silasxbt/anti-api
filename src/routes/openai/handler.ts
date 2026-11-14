@@ -1,3 +1,4 @@
+import { getCacheReadTokens } from "~/lib/translator"
 /**
  * OpenAI /v1/chat/completions 端点处理器
  */
@@ -71,12 +72,13 @@ export async function handleChatCompletion(c: Context): Promise<Response> {
 
         await rateLimiter.wait()
 
-        const anthropicModel = mapModel(payload.model)
+        const reasoningEffort = extractReasoningEffort(payload)
+        const anthropicModel = mapModel(payload.model, reasoningEffort)
         const messages = translateMessages(payload.messages)
         // Validate image count and inline byte budgets before routing to any provider.
         createImageInputBudget(messages)
         const tools = translateTools(payload.tools)
-        const reasoningEffort = extractReasoningEffort(payload)
+
 
         if (payload.stream) {
             return handleStreamCompletion(c, payload, anthropicModel, messages, tools, reasoningEffort)
@@ -88,7 +90,9 @@ export async function handleChatCompletion(c: Context): Promise<Response> {
                 model: anthropicModel,
                 messages,
                 tools,
-                maxTokens: payload.max_tokens || 4096,
+                // Pass undefined through: each upstream service falls back to the model's
+                // native output limit (e.g. buildGenerationConfig in antigravity chat.ts).
+                maxTokens: payload.max_tokens,
                 reasoningEffort,
                 signal: c.req.raw.signal,
             })
@@ -101,27 +105,40 @@ export async function handleChatCompletion(c: Context): Promise<Response> {
         }
 
         let textContent = ""
+        let reasoningContent = ""
         const toolCalls: any[] = []
 
         for (const block of result.contentBlocks) {
             if (block.type === "text") {
                 textContent += block.text || ""
+            } else if (block.type === "thinking") {
+                reasoningContent += block.thinking || block.text || ""
             } else if (block.type === "tool_use") {
-                toolCalls.push({ id: block.id, name: block.name, input: block.input })
+                toolCalls.push({
+                    id: block.id,
+                    name: block.name,
+                    input: block.input,
+                    thought_signature: (block as any).thought_signature || (block as any).thoughtSignature,
+                })
             }
         }
 
         const message: any = { role: "assistant", content: toolCalls.length > 0 ? null : textContent }
+        if (reasoningContent) {
+            message.reasoning_content = reasoningContent
+        }
         if (toolCalls.length > 0) {
             message.tool_calls = toolCalls.map((tc) => ({
                 id: tc.id,
                 type: "function",
                 function: { name: tc.name, arguments: JSON.stringify(tc.input) },
+                ...(tc.thought_signature ? { thought_signature: tc.thought_signature } : {}),
             }))
         }
 
         // Token counts for response (Usage recording is handled in chat.ts with actual native model ID)
-        const inputTokens = result.usage?.inputTokens || 0
+        const cacheReadTokens = getCacheReadTokens(result.usage)
+        const inputTokens = (result.usage?.inputTokens || 0) + cacheReadTokens
         const outputTokens = result.usage?.outputTokens || 0
 
         return c.json({
@@ -134,6 +151,7 @@ export async function handleChatCompletion(c: Context): Promise<Response> {
                 prompt_tokens: inputTokens,
                 completion_tokens: outputTokens,
                 total_tokens: inputTokens + outputTokens,
+                prompt_tokens_details: { cached_tokens: cacheReadTokens },
             },
         })
     } catch (error) {
@@ -187,7 +205,9 @@ async function handleStreamCompletion(
                 model: anthropicModel,
                 messages,
                 tools,
-                maxTokens: payload.max_tokens || 4096,
+                // Pass undefined through: each upstream service falls back to the model's
+                // native output limit (e.g. buildGenerationConfig in antigravity chat.ts).
+                maxTokens: payload.max_tokens,
                 reasoningEffort,
                 signal: requestSignal,
             })
@@ -196,6 +216,7 @@ async function handleStreamCompletion(
             let accumulatedToolCalls: any[] = []
             let currentToolCall: any = null
             let streamInputTokens = 0
+            let streamCacheReadTokens = 0
             let streamOutputTokens = 0
 
             for await (const event of chatStream) {
@@ -231,6 +252,9 @@ async function handleStreamCompletion(
                                 if (parsed.message?.usage?.input_tokens) {
                                     streamInputTokens = parsed.message.usage.input_tokens
                                 }
+                                if (parsed.message?.usage?.cache_read_input_tokens) {
+                                    streamCacheReadTokens = parsed.message.usage.cache_read_input_tokens
+                                }
                                 break
 
                             case "content_block_start":
@@ -240,6 +264,7 @@ async function handleStreamCompletion(
                                         name: parsed.content_block.name,
                                         input: {},
                                         arguments: "",
+                                        thought_signature: parsed.content_block.thought_signature || parsed.content_block.thoughtSignature,
                                     }
                                 }
                                 break
@@ -247,6 +272,8 @@ async function handleStreamCompletion(
                             case "content_block_delta":
                                 if (parsed.delta?.type === "text_delta" && parsed.delta?.text) {
                                     if (!await writeData(buildStreamChunk(chatId, payload.model, parsed.delta.text))) return
+                                } else if (parsed.delta?.type === "thinking_delta" && parsed.delta?.thinking) {
+                                    if (!await writeData(buildStreamChunk(chatId, payload.model, undefined, undefined, undefined, undefined, parsed.delta.thinking))) return
                                 } else if (parsed.delta?.type === "input_json_delta" && currentToolCall) {
                                     currentToolCall.arguments += parsed.delta.partial_json || ""
                                 }
@@ -273,6 +300,12 @@ async function handleStreamCompletion(
                                 if (parsed.usage?.output_tokens) {
                                     streamOutputTokens = parsed.usage.output_tokens
                                 }
+                                if (parsed.usage?.input_tokens) {
+                                    streamInputTokens = parsed.usage.input_tokens
+                                }
+                                if (parsed.usage?.cache_read_input_tokens) {
+                                    streamCacheReadTokens = parsed.usage.cache_read_input_tokens
+                                }
                                 if (accumulatedToolCalls.length > 0) {
                                     if (!await writeData(buildStreamChunk(chatId, payload.model, undefined, undefined, "tool_use", accumulatedToolCalls))) return
                                 }
@@ -284,6 +317,23 @@ async function handleStreamCompletion(
 
 
             // Note: Usage recording is handled in chat.ts with the actual native model ID
+
+            if (!cancelled && payload.stream_options?.include_usage) {
+                const promptTokens = streamInputTokens + streamCacheReadTokens
+                await writeData(JSON.stringify({
+                    id: chatId,
+                    object: "chat.completion.chunk",
+                    created: Math.floor(Date.now() / 1000),
+                    model: payload.model,
+                    choices: [],
+                    usage: {
+                        prompt_tokens: promptTokens,
+                        completion_tokens: streamOutputTokens,
+                        total_tokens: promptTokens + streamOutputTokens,
+                        prompt_tokens_details: { cached_tokens: streamCacheReadTokens },
+                    },
+                }))
+            }
 
             if (!cancelled) {
                 await writeData("[DONE]")

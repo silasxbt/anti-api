@@ -11,6 +11,7 @@ import consola from "consola"
 
 import { createRoutedCompletion, createRoutedCompletionStream, RoutingError } from "~/services/routing/router"
 import type { ClaudeMessage, ClaudeTool } from "~/lib/translator"
+import { generateMessageId, getCacheReadTokens } from "~/lib/translator"
 import { rateLimiter } from "~/lib/rate-limiter"
 import { validateAnthropicRequest } from "~/lib/validation"
 import { forwardError, RequestValidationError, UpstreamError } from "~/lib/error"
@@ -57,13 +58,6 @@ function collectToolResultIds(messages: ClaudeMessage[]): string[] {
         }
     }
     return ids
-}
-
-/**
- * 生成响应ID
- */
-function generateMessageId(): string {
-    return `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`
 }
 
 /**
@@ -155,6 +149,8 @@ export async function handleCompletion(c: Context): Promise<Response> {
             usage: {
                 input_tokens: result.usage?.inputTokens || 0,
                 output_tokens: result.usage?.outputTokens || 0,
+                cache_read_input_tokens: getCacheReadTokens(result.usage),
+                cache_creation_input_tokens: 0,
             },
         }
 

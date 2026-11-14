@@ -7,6 +7,7 @@ export interface OpenAIChatCompletionRequest {
     messages: OpenAIMessage[]
     stream?: boolean
     max_tokens?: number
+    stream_options?: { include_usage?: boolean }
     temperature?: number
     top_p?: number
     tools?: OpenAITool[]
@@ -36,7 +37,52 @@ export interface OpenAIImageUrlContentPart {
     }
 }
 
-export type OpenAIContentPart = OpenAITextContentPart | OpenAIImageUrlContentPart
+export interface OpenAIAudioUrlContentPart {
+    type: "audio_url"
+    audio_url: {
+        url: string
+    }
+}
+
+export interface OpenAIInputAudioContentPart {
+    type: "input_audio"
+    input_audio: {
+        data: string
+        format: "wav" | "mp3" | string
+    }
+}
+
+export interface OpenAIAudioBlockContentPart {
+    type: "audio"
+    source?: {
+        type: "base64" | "url"
+        media_type?: string
+        data?: string
+        url?: string
+    }
+    input_audio?: {
+        data: string
+        format?: string
+    }
+}
+
+export interface OpenAIDocumentContentPart {
+    type: "document"
+    source?: {
+        type: "base64" | "url"
+        media_type?: string
+        data?: string
+        url?: string
+    }
+}
+
+export type OpenAIContentPart =
+    | OpenAITextContentPart
+    | OpenAIImageUrlContentPart
+    | OpenAIAudioUrlContentPart
+    | OpenAIInputAudioContentPart
+    | OpenAIAudioBlockContentPart
+    | OpenAIDocumentContentPart
 
 export interface OpenAITool {
     type: "function"
@@ -68,13 +114,14 @@ export interface OpenAIChatCompletionResponse {
 export interface OpenAIChoice {
     index: number
     message: OpenAIMessage
-    finish_reason: "stop" | "length" | "tool_calls" | null
+    finish_reason: "stop" | "length" | "tool_calls" | "content_filter" | null
 }
 
 export interface OpenAIUsage {
     prompt_tokens: number
     completion_tokens: number
     total_tokens: number
+    prompt_tokens_details?: { cached_tokens: number }
 }
 
 export interface OpenAIStreamChunk {
@@ -88,5 +135,5 @@ export interface OpenAIStreamChunk {
 export interface OpenAIStreamChoice {
     index: number
     delta: Partial<OpenAIMessage>
-    finish_reason: "stop" | "length" | "tool_calls" | null
+    finish_reason: "stop" | "length" | "tool_calls" | "content_filter" | null
 }

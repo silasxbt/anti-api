@@ -52,12 +52,17 @@ test("routing config saves and loads flows", async () => {
     restoreEnv(prevHome, prevProfile)
 })
 
-test("routing models include antigravity defaults", async () => {
+test("routing models expose antigravity models discovered online (no hardcoded defaults)", async () => {
     const { dir, prevHome, prevProfile } = withTempHome()
     const { getProviderModels } = await import(`../src/services/routing/models.ts?${Date.now()}`)
 
+    const { setDynamicAntigravityModels, clearDynamicAntigravityModels } = await import(`../src/services/routing/models.ts?${Date.now()}`)
+    clearDynamicAntigravityModels()
+    expect(getProviderModels("antigravity").length).toBe(0)
+    setDynamicAntigravityModels([{ id: "claude-opus-5-5-high", label: "x" }])
     const models = getProviderModels("antigravity")
     expect(models.length).toBeGreaterThan(0)
+    clearDynamicAntigravityModels()
 
     rmSync(dir, { recursive: true, force: true })
     restoreEnv(prevHome, prevProfile)

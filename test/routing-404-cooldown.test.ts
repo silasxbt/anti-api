@@ -13,17 +13,26 @@ let rateLimitMarkCalls = 0
 let upstreamStatus = 404
 let upstreamBody = "not found"
 
+const realConfig = await import("~/services/routing/config")
 mock.module("~/services/routing/config", () => ({
+    ...realConfig,
     loadRoutingConfig: () => currentConfig,
+    isSeparateThinkingModelsEnabled: () => false,
+    isHiddenCodexModel: () => false,
+    CODEX_HIDDEN_MODELS: new Set(),
 }))
 
+const realChat = await import("~/services/antigravity/chat")
 mock.module("~/services/antigravity/chat", () => ({
+    ...realChat,
     createChatCompletionWithOptions: async () => {
         throw new UpstreamError("antigravity", upstreamStatus, upstreamBody)
     },
     createChatCompletionStreamWithOptions: async function* () {
         throw new UpstreamError("antigravity", upstreamStatus, upstreamBody)
     },
+    isAntigravityModelSupportedForAccount: () => true,
+    markAntigravityModelUnsupported: () => { },
 }))
 
 mock.module("~/services/antigravity/account-manager", () => ({
@@ -55,6 +64,7 @@ mock.module("~/services/codex/chat", () => ({
 
 mock.module("~/services/copilot/chat", () => ({
     createCopilotCompletion: async () => ({ contentBlocks: [], stopReason: "end_turn", usage: {} }),
+    getCopilotReasoningEfforts: () => [],
 }))
 
 mock.module("~/services/auth/store", () => ({
@@ -64,6 +74,7 @@ mock.module("~/services/auth/store", () => ({
         markRateLimited: () => 1_000,
         markSuccess: () => { },
         listAccounts: () => [],
+        saveAccount: () => { },
     },
 }))
 
@@ -71,7 +82,9 @@ async function getRouter() {
     return await import(`../src/services/routing/router.ts?${Date.now()}-${Math.random()}`)
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+    const { setDynamicAntigravityModels } = await import("~/services/routing/models")
+    setDynamicAntigravityModels([{ id: "claude-opus-4-6-thinking", label: "Opus 4.6 Thinking" }])
     rateLimitMarkCalls = 0
     upstreamStatus = 404
     upstreamBody = "not found"

@@ -12,11 +12,16 @@ import consola from "consola"
 import { authStore } from "~/services/auth/store"
 import { parseRetryDelay } from "~/lib/retry"
 import { MIN_REQUEST_INTERVAL_MS } from "~/lib/constants"
-import { fetchAntigravityModels, pickResetTime } from "./quota-fetch"
-import { UpstreamError } from "~/lib/error"
 import { getDataDir } from "~/lib/data-dir"
 import { tightenPrivateFile, writePrivateFile } from "~/lib/private-file"
 import { safeErrorMessage } from "~/lib/redaction"
+import { isCacheAwareRoutingEnabled } from "~/services/settings"
+import { computeEffectiveTokenLoad } from "~/services/usage-tracker"
+import {
+    rankAccountCandidates,
+    recordIntelligentDispatch,
+    recordIntelligentTokenUsage,
+} from "~/services/routing/intelligent-scorer"
 
 type RateLimitReason =
     | "quota_exhausted"
@@ -147,14 +152,24 @@ export interface Account {
     refreshToken: string
     expiresAt: number
     projectId: string | null
+    proxy?: string
+    label?: string
+    plan?: string
     // 限流状态
     rateLimitedUntil: number | null
     consecutiveFailures: number
 }
 
+export interface ActiveAccountCredentials {
+    accessToken: string
+    projectId: string
+    email: string
+    accountId: string
+    proxy?: string
+}
+
 class AccountManager {
     private accounts: Map<string, Account> = new Map()
-    private currentIndex = 0
     private dataFile: string
     private loaded = false
     // 🆕 60秒账号锁定：记录最近使用的账号（匹配 proj-1 的 last_used_account）
@@ -166,6 +181,9 @@ class AccountManager {
     private inFlightStartedAt = new Map<string, number>()
     private accountLocks = new Map<string, Promise<void>>()
     private lastCallByAccount = new Map<string, number>()
+    // 🆕 Cache-Aware Session Routing
+    private sessionAccountMap = new Map<string, { accountId: string; lastSeen: number }>()
+    private accountEstimatedTokens = new Map<string, number>()
 
     constructor() {
         this.dataFile = path.join(getDataDir(), "accounts.json")
@@ -175,6 +193,21 @@ class AccountManager {
         if (!this.loaded) {
             this.load()
         }
+    }
+
+    private syncAccountToAuthStore(account: Account): void {
+        authStore.saveAccount({
+            id: account.id,
+            provider: "antigravity",
+            email: account.email,
+            accessToken: account.accessToken,
+            refreshToken: account.refreshToken,
+            expiresAt: account.expiresAt,
+            projectId: account.projectId || undefined,
+            proxy: account.proxy || undefined,
+            label: account.label || account.email,
+            plan: account.plan,
+        })
     }
 
     private hydrateFromAuthStore(accountId?: string): void {
@@ -191,6 +224,9 @@ class AccountManager {
                 refreshToken: stored.refreshToken || "",
                 expiresAt: stored.expiresAt || 0,
                 projectId: stored.projectId || null,
+                proxy: stored.proxy || undefined,
+                label: stored.label || undefined,
+                plan: stored.plan,
                 rateLimitedUntil: null,
                 consecutiveFailures: 0,
             })
@@ -207,21 +243,15 @@ class AccountManager {
                 const data = JSON.parse(fs.readFileSync(this.dataFile, "utf-8"))
                 if (Array.isArray(data.accounts)) {
                     for (const acc of data.accounts) {
-                        this.accounts.set(acc.id, {
+                        const account: Account = {
                             ...acc,
+                            proxy: acc.proxy || undefined,
+                            label: acc.label || undefined,
                             rateLimitedUntil: null,
                             consecutiveFailures: 0,
-                        })
-                        authStore.saveAccount({
-                            id: acc.id,
-                            provider: "antigravity",
-                            email: acc.email,
-                            accessToken: acc.accessToken,
-                            refreshToken: acc.refreshToken,
-                            expiresAt: acc.expiresAt,
-                            projectId: acc.projectId || undefined,
-                            label: acc.email,
-                        })
+                        }
+                        this.accounts.set(acc.id, account)
+                        this.syncAccountToAuthStore(account)
                     }
                 }
             }
@@ -266,6 +296,9 @@ class AccountManager {
                 refreshToken: acc.refreshToken,
                 expiresAt: acc.expiresAt,
                 projectId: acc.projectId,
+                proxy: acc.proxy,
+                label: acc.label,
+                plan: acc.plan,
             }))
             writePrivateFile(this.dataFile, JSON.stringify({ accounts }, null, 2))
         } catch (e) {
@@ -277,63 +310,45 @@ class AccountManager {
      * 添加账号
      */
     addAccount(account: Omit<Account, "rateLimitedUntil" | "consecutiveFailures">): void {
-        this.accounts.set(account.id, {
+        const stored: Account = {
             ...account,
             rateLimitedUntil: null,
             consecutiveFailures: 0,
-        })
+        }
+        this.accounts.set(account.id, stored)
         // 🆕 添加到队列末尾
         if (!this.accountQueue.includes(account.id)) {
             this.accountQueue.push(account.id)
         }
         this.save()
-        authStore.saveAccount({
-            id: account.id,
-            provider: "antigravity",
-            email: account.email,
-            accessToken: account.accessToken,
-            refreshToken: account.refreshToken,
-            expiresAt: account.expiresAt,
-            projectId: account.projectId || undefined,
-            label: account.email,
-        })
+        this.syncAccountToAuthStore(stored)
+    }
+
+    private deleteAccountById(id: string): boolean {
+        if (!this.accounts.has(id)) return false
+        this.accounts.delete(id)
+        const idx = this.accountQueue.indexOf(id)
+        if (idx !== -1) this.accountQueue.splice(idx, 1)
+        this.inFlightAccounts.delete(id)
+        this.inFlightStartedAt.delete(id)
+        this.accountLocks.delete(id)
+        this.lastCallByAccount.delete(id)
+        this.save()
+        authStore.deleteAccount("antigravity", id)
+        return true
     }
 
     /**
      * 删除账号
      */
     removeAccount(accountIdOrEmail: string): boolean {
-        // 🆕 从队列中移除的辅助函数
-        const removeFromQueue = (id: string) => {
-            const idx = this.accountQueue.indexOf(id)
-            if (idx !== -1) this.accountQueue.splice(idx, 1)
-        }
-
-        // 先尝试按 ID 删除
-        if (this.accounts.has(accountIdOrEmail)) {
-            this.accounts.delete(accountIdOrEmail)
-            removeFromQueue(accountIdOrEmail)
-            this.inFlightAccounts.delete(accountIdOrEmail)
-            this.inFlightStartedAt.delete(accountIdOrEmail)
-            this.accountLocks.delete(accountIdOrEmail)
-            this.lastCallByAccount.delete(accountIdOrEmail)
-            this.save()
-            authStore.deleteAccount("antigravity", accountIdOrEmail)
+        if (this.deleteAccountById(accountIdOrEmail)) {
             return true
         }
 
-        // 再尝试按邮箱删除
         for (const [id, acc] of this.accounts) {
             if (acc.email === accountIdOrEmail) {
-                this.accounts.delete(id)
-                removeFromQueue(id)
-                this.inFlightAccounts.delete(id)
-                this.inFlightStartedAt.delete(id)
-                this.accountLocks.delete(id)
-                this.lastCallByAccount.delete(id)
-                this.save()
-                authStore.deleteAccount("antigravity", id)
-                return true
+                return this.deleteAccountById(id)
             }
         }
 
@@ -354,6 +369,41 @@ class AccountManager {
     hasAccount(accountId: string): boolean {
         this.ensureLoaded()
         return this.accounts.has(accountId)
+    }
+
+    /**
+     * 获取账号详情
+     */
+    getAccount(accountId: string): Account | undefined {
+        this.ensureLoaded()
+        return this.accounts.get(accountId)
+    }
+
+    /**
+     * 获取所有账号列表
+     */
+    getAllAccounts(): Account[] {
+        this.ensureLoaded()
+        return Array.from(this.accounts.values())
+    }
+
+    /**
+     * 更新账号选项（egress proxy, label, projectId）
+     */
+    updateAccountOptions(
+        accountId: string,
+        options: { proxy?: string; label?: string; projectId?: string; plan?: string }
+    ): boolean {
+        this.ensureLoaded()
+        const account = this.accounts.get(accountId)
+        if (!account) return false
+        if (options.proxy !== undefined) account.proxy = options.proxy.trim() || undefined
+        if (options.label !== undefined) account.label = options.label.trim() || undefined
+        if (options.projectId !== undefined) account.projectId = options.projectId.trim() || null
+        if (options.plan !== undefined) account.plan = options.plan.trim().toLowerCase() || undefined
+        this.save()
+        this.syncAccountToAuthStore(account)
+        return true
     }
 
     /**
@@ -430,6 +480,48 @@ class AccountManager {
     }
 
     /**
+     * 记录账号的 Token 消耗估算（用于负载均衡与 Intelligent/Cache-Aware 路由）
+     */
+    recordAccountUsage(
+        accountId: string,
+        uncachedInputOrTotalTokens: number,
+        outputTokens?: number,
+        cacheReadTokens: number = 0,
+        modelName?: string
+    ): void {
+        if (!accountId) return
+        if (typeof outputTokens === "number") {
+            const effective = computeEffectiveTokenLoad(
+                uncachedInputOrTotalTokens,
+                outputTokens,
+                cacheReadTokens,
+                modelName
+            )
+            if (effective <= 0) return
+            const current = this.accountEstimatedTokens.get(accountId) || 0
+            this.accountEstimatedTokens.set(accountId, current + Math.round(effective))
+            recordIntelligentTokenUsage("antigravity", accountId, {
+                uncachedInputTokens: uncachedInputOrTotalTokens,
+                outputTokens,
+                cacheReadTokens,
+                model: modelName,
+            })
+            return
+        }
+        if (!uncachedInputOrTotalTokens || uncachedInputOrTotalTokens <= 0) return
+        const current = this.accountEstimatedTokens.get(accountId) || 0
+        this.accountEstimatedTokens.set(accountId, current + uncachedInputOrTotalTokens)
+        recordIntelligentTokenUsage("antigravity", accountId, uncachedInputOrTotalTokens)
+    }
+
+    /**
+     * 获取账号的累计 Token 消耗估算
+     */
+    getAccountUsage(accountId: string): number {
+        return this.accountEstimatedTokens.get(accountId) || 0
+    }
+
+    /**
      * 获取所有账号邮箱
      */
     getEmails(): string[] {
@@ -456,7 +548,7 @@ class AccountManager {
         statusCode: number,
         errorText: string,
         retryAfterHeader?: string,
-        modelId?: string,
+        _modelId?: string,
         options?: { maxDurationMs?: number }
     ): Promise<{ reason: RateLimitReason; durationMs: number } | null> {
         const account = this.accounts.get(accountId)
@@ -472,12 +564,9 @@ class AccountManager {
         // 🆕 proj-1 风格：不在每次 429 时检查配额（避免额外 API 调用消耗速率限制）
         // 如果没有明确的 retry delay，直接假设是速率限制并应用短暂退避
         if (retryDelayMs !== null) {
-            // API 返回了明确的重试延迟
             durationMs = Math.max(retryDelayMs + 500, 2000)
             rateLimitedUntil = Date.now() + durationMs
         } else if (statusCode === 429) {
-            // 没有明确延迟的 429 = 假设是速率限制，应用短暂退避
-            // 不调用 fetchAntigravityModels 避免消耗速率限制
             durationMs = 10000 // 10 秒短暂退避（增加以避免快速重试）
             rateLimitedUntil = Date.now() + durationMs
         }
@@ -579,16 +668,60 @@ class AccountManager {
         return minWait
     }
 
+    private async prepareAccountCredentials(
+        account: Account,
+        options: { failOnRefreshError?: boolean; sessionKey?: string; modelName?: string; recordIntelligent?: boolean } = {}
+    ): Promise<ActiveAccountCredentials | null> {
+        const now = Date.now()
+        if (account.expiresAt > 0 && now > account.expiresAt - 5 * 60 * 1000) {
+            try {
+                const tokens = await refreshAccessToken(account.refreshToken, account.proxy)
+                account.accessToken = tokens.accessToken
+                account.expiresAt = now + tokens.expiresIn * 1000
+                if (!account.projectId) {
+                    account.projectId = await getProjectID(account.accessToken, account.proxy)
+                }
+                this.save()
+                this.syncAccountToAuthStore(account)
+            } catch (e) {
+                consola.warn(`Failed to refresh token for ${account.email}:`, safeErrorMessage(e))
+                if (options.failOnRefreshError) {
+                    account.rateLimitedUntil = now + 60000
+                    return null
+                }
+            }
+        }
+
+        this.lastUsedAccount = { accountId: account.id, timestamp: Date.now() }
+        if (options.sessionKey) {
+            this.sessionAccountMap.set(options.sessionKey, { accountId: account.id, lastSeen: now })
+        }
+        if (options.recordIntelligent) {
+            recordIntelligentDispatch("antigravity", account.id, options.sessionKey, options.modelName, now)
+        }
+
+        return {
+            accessToken: account.accessToken,
+            projectId: await this.ensureProjectId(account),
+            email: account.email,
+            accountId: account.id,
+            proxy: account.proxy,
+        }
+    }
+
     /**
      * 获取下一个可用账号
      * 🆕 粘性策略：使用队列顺序，队首优先
+     * 🆕 Intelligent (Cache + Quota + Reset-Time Aware) 路由：
+     *    结合剩余配额、重置倒计时紧迫度（指数+线性混合公式）、Prompt 缓存亲和性与实时负载均衡选择最优账号
      */
-    async getNextAvailableAccount(forceRotate: boolean = false): Promise<{
-        accessToken: string
-        projectId: string
-        email: string
-        accountId: string
-    } | null> {
+    async getNextAvailableAccount(
+        forceRotate: boolean = false,
+        sessionKey?: string,
+        isAccountEligible?: (accountId: string) => boolean,
+        modelName?: string,
+        messages?: unknown
+    ): Promise<ActiveAccountCredentials | null> {
         this.ensureLoaded()
         if (this.accounts.size === 0) {
             this.hydrateFromAuthStore()
@@ -596,119 +729,115 @@ class AccountManager {
         this.ensureQueueInitialized()
 
         const now = Date.now()
-
         if (this.accounts.size === 0) {
             return null
         }
 
+        const isEligible = (id: string) => !isAccountEligible || isAccountEligible(id)
+
+        // 🆕 Intelligent (Cache & Reset-Time Aware) 路由逻辑
+        if (isCacheAwareRoutingEnabled()) {
+            for (const [key, sess] of this.sessionAccountMap.entries()) {
+                if (now - sess.lastSeen > 2 * 3600 * 1000) {
+                    this.sessionAccountMap.delete(key)
+                }
+            }
+
+            const availableCandidates = this.accountQueue
+                .filter((id) => {
+                    if (!isEligible(id)) return false
+                    const account = this.accounts.get(id)
+                    if (!account) return false
+                    if (account.rateLimitedUntil && account.rateLimitedUntil > now) return false
+                    return true
+                })
+                .map((accountId) => ({ provider: "antigravity" as const, accountId }))
+
+            if (availableCandidates.length > 0) {
+                const ranked = rankAccountCandidates(availableCandidates, {
+                    model: modelName,
+                    sessionKey,
+                    forceRotate,
+                    isInFlight: (id) => this.inFlightAccounts.has(id),
+                    getConsecutiveFailures: (id) => this.accounts.get(id)?.consecutiveFailures || 0,
+                    getTotalTokens: (id) => this.getAccountUsage(id),
+                    messages,
+                    now,
+                })
+
+                for (const item of ranked) {
+                    const account = this.accounts.get(item.entry.accountId)
+                    if (!account) continue
+                    const prepared = await this.prepareAccountCredentials(account, {
+                        failOnRefreshError: true,
+                        sessionKey,
+                        modelName,
+                        recordIntelligent: true,
+                    })
+                    if (prepared) {
+                        return prepared
+                    }
+                }
+            }
+        }
+
         // 🆕 是否存在空闲账号（避免选中正在处理的账号）
         const hasIdleAccount = this.accountQueue.some((id) => {
+            if (!isEligible(id)) return false
             const account = this.accounts.get(id)
             if (!account) return false
             if (account.rateLimitedUntil && account.rateLimitedUntil > now) return false
             return !this.inFlightAccounts.has(id)
         })
 
-        // 🆕 粘性策略：使用队列顺序，队首账户优先
-        // 如果不是强制轮换，且队首账户可用，则使用它
-        if (!forceRotate && this.accountQueue.length > 0) {
+        // 🆕 粘性策略：使用队列顺序，队首账户优先（未开启 Cache-Aware 或无 sessionKey 时的默认逻辑）
+        if (!forceRotate && !isCacheAwareRoutingEnabled() && this.accountQueue.length > 0) {
             const firstId = this.accountQueue[0]
             const firstAccount = this.accounts.get(firstId)
-            if (firstAccount && (!firstAccount.rateLimitedUntil || firstAccount.rateLimitedUntil <= now)) {
-                if (hasIdleAccount && this.inFlightAccounts.has(firstId)) {
-                    // Prefer idle accounts when available
-                } else {
-                // 刷新 token 如果需要
-                if (firstAccount.expiresAt > 0 && now > firstAccount.expiresAt - 5 * 60 * 1000) {
-                    try {
-                        const tokens = await refreshAccessToken(firstAccount.refreshToken)
-                        firstAccount.accessToken = tokens.accessToken
-                        firstAccount.expiresAt = now + tokens.expiresIn * 1000
-                        this.save()
-                    } catch (e) {
-                        consola.warn(`Failed to refresh token for ${firstAccount.email}:`, safeErrorMessage(e))
-                    }
-                }
-                this.lastUsedAccount = { accountId: firstAccount.id, timestamp: now }
-                return {
-                    accessToken: firstAccount.accessToken,
-                    projectId: await this.ensureProjectId(firstAccount),
-                    email: firstAccount.email,
-                    accountId: firstAccount.id,
-                }
-                }
+            if (
+                firstAccount &&
+                isEligible(firstId) &&
+                (!firstAccount.rateLimitedUntil || firstAccount.rateLimitedUntil <= now) &&
+                !(hasIdleAccount && this.inFlightAccounts.has(firstId))
+            ) {
+                return this.prepareAccountCredentials(firstAccount)
             }
         }
 
         // 按队列顺序找第一个可用账户
         for (const accountId of this.accountQueue) {
+            if (!isEligible(accountId)) continue
             const account = this.accounts.get(accountId)
             if (!account) continue
 
-            // 检查是否被限流
             if (account.rateLimitedUntil && account.rateLimitedUntil > now) {
-                const waitSeconds = Math.ceil((account.rateLimitedUntil - now) / 1000)
                 continue
             }
             if (hasIdleAccount && this.inFlightAccounts.has(accountId)) {
                 continue
             }
 
-            // 检查 token 是否过期，如果过期则刷新
-            if (account.expiresAt > 0 && now > account.expiresAt - 5 * 60 * 1000) {
-                try {
-                    const tokens = await refreshAccessToken(account.refreshToken)
-                    account.accessToken = tokens.accessToken
-                    account.expiresAt = now + tokens.expiresIn * 1000
-
-                    // 刷新 projectId
-                    if (!account.projectId) {
-                        account.projectId = await getProjectID(account.accessToken)
-                    }
-
-                    this.save()
-                    authStore.saveAccount({
-                        id: account.id,
-                        provider: "antigravity",
-                        email: account.email,
-                        accessToken: account.accessToken,
-                        refreshToken: account.refreshToken,
-                        expiresAt: account.expiresAt,
-                        projectId: account.projectId || undefined,
-                        label: account.email,
-                    })
-                } catch (e) {
-                    consola.warn(`Failed to refresh token for ${account.email}:`, safeErrorMessage(e))
-                    account.rateLimitedUntil = now + 60000 // 标记为暂时不可用
-                    continue
-                }
-            }
-
-            // 🆕 更新 lastUsedAccount
-            this.lastUsedAccount = { accountId: account.id, timestamp: Date.now() }
-
-            return {
-                accessToken: account.accessToken,
-                projectId: await this.ensureProjectId(account),
-                email: account.email,
-                accountId: account.id,
+            const prepared = await this.prepareAccountCredentials(account, { failOnRefreshError: true, sessionKey })
+            if (prepared) {
+                return prepared
             }
         }
 
         // 所有账号都被限流 - 找等待时间最短的
-        const allAccounts = Array.from(this.accounts.values())
-        let bestAccount = allAccounts[0]
+        const allAccounts = Array.from(this.accounts.values()).filter(acc => isEligible(acc.id))
+        if (allAccounts.length === 0) {
+            return null
+        }
+
         let minWaitMs: number | null = null
         for (const acc of allAccounts) {
             if (!acc.rateLimitedUntil) {
-                bestAccount = acc
                 minWaitMs = 0
                 break
             }
             const waitMs = Math.max(acc.rateLimitedUntil - now, 0)
             if (minWaitMs === null || waitMs < minWaitMs) {
                 minWaitMs = waitMs
-                bestAccount = acc
             }
         }
 
@@ -717,12 +846,7 @@ class AccountManager {
             await new Promise(resolve => setTimeout(resolve, minWaitMs + RESET_TIME_BUFFER_MS))
             const refreshed = allAccounts.find(acc => !acc.rateLimitedUntil || acc.rateLimitedUntil <= Date.now())
             if (refreshed) {
-                return {
-                    accessToken: refreshed.accessToken,
-                    projectId: await this.ensureProjectId(refreshed),
-                    email: refreshed.email,
-                    accountId: refreshed.id,
-                }
+                return this.prepareAccountCredentials(refreshed, { sessionKey })
             }
         }
 
@@ -733,12 +857,7 @@ class AccountManager {
     /**
      * 按 ID 获取指定账号（并刷新 token）
      */
-    async getAccountById(accountId: string): Promise<{
-        accessToken: string
-        projectId: string
-        email: string
-        accountId: string
-    } | null> {
+    async getAccountById(accountId: string): Promise<ActiveAccountCredentials | null> {
         this.ensureLoaded()
         if (!this.accounts.has(accountId)) {
             this.hydrateFromAuthStore(accountId)
@@ -751,39 +870,7 @@ class AccountManager {
             return null
         }
 
-        if (account.expiresAt > 0 && now > account.expiresAt - 5 * 60 * 1000) {
-            try {
-                const tokens = await refreshAccessToken(account.refreshToken)
-                account.accessToken = tokens.accessToken
-                account.expiresAt = now + tokens.expiresIn * 1000
-
-                if (!account.projectId) {
-                    account.projectId = await getProjectID(account.accessToken)
-                }
-                this.save()
-                authStore.saveAccount({
-                    id: account.id,
-                    provider: "antigravity",
-                    email: account.email,
-                    accessToken: account.accessToken,
-                    refreshToken: account.refreshToken,
-                    expiresAt: account.expiresAt,
-                    projectId: account.projectId || undefined,
-                    label: account.email,
-                })
-            } catch (e) {
-                consola.warn(`Failed to refresh token for ${account.email}:`, safeErrorMessage(e))
-                account.rateLimitedUntil = now + 60000
-                return null
-            }
-        }
-
-        return {
-            accessToken: account.accessToken,
-            projectId: await this.ensureProjectId(account),
-            email: account.email,
-            accountId: account.id,
-        }
+        return this.prepareAccountCredentials(account, { failOnRefreshError: true })
     }
 
     /**
@@ -809,78 +896,8 @@ class AccountManager {
 
         account.projectId = resolved
         this.save()
-        authStore.saveAccount({
-            id: account.id,
-            provider: "antigravity",
-            email: account.email,
-            accessToken: account.accessToken,
-            refreshToken: account.refreshToken,
-            expiresAt: account.expiresAt,
-            projectId: account.projectId || undefined,
-            label: account.email,
-        })
+        this.syncAccountToAuthStore(account)
         return resolved
-    }
-
-    private async fetchQuotaResetTime(account: Account, modelId?: string): Promise<number | null> {
-        let refreshed = false
-
-        for (let attempt = 0; attempt < 2; attempt++) {
-            try {
-                const result = await fetchAntigravityModels(account.accessToken, account.projectId)
-                if (!account.projectId && result.projectId) {
-                    account.projectId = result.projectId
-                    this.save()
-                    authStore.saveAccount({
-                        id: account.id,
-                        provider: "antigravity",
-                        email: account.email,
-                        accessToken: account.accessToken,
-                        refreshToken: account.refreshToken,
-                        expiresAt: account.expiresAt,
-                        projectId: account.projectId || undefined,
-                        label: account.email,
-                    })
-                }
-
-                const resetTime = pickResetTime(result.models, modelId)
-                if (!resetTime) return null
-
-                const resetMs = Date.parse(resetTime)
-                if (!Number.isFinite(resetMs)) return null
-
-                const buffered = resetMs + RESET_TIME_BUFFER_MS
-                if (buffered <= Date.now()) return null
-                return buffered
-            } catch (error) {
-                if (!refreshed && error instanceof UpstreamError && error.status === 401 && account.refreshToken) {
-                    try {
-                        const tokens = await refreshAccessToken(account.refreshToken)
-                        account.accessToken = tokens.accessToken
-                        account.expiresAt = Date.now() + tokens.expiresIn * 1000
-                        this.save()
-                        authStore.saveAccount({
-                            id: account.id,
-                            provider: "antigravity",
-                            email: account.email,
-                            accessToken: account.accessToken,
-                            refreshToken: account.refreshToken,
-                            expiresAt: account.expiresAt,
-                            projectId: account.projectId || undefined,
-                            label: account.email,
-                        })
-                        refreshed = true
-                        continue
-                    } catch (refreshError) {
-                        consola.warn(`Failed to refresh token for ${account.email}:`, safeErrorMessage(refreshError))
-                        return null
-                    }
-                }
-                return null
-            }
-        }
-
-        return null
     }
 
     private async ensureProjectId(account: Account): Promise<string> {
@@ -888,7 +905,7 @@ class AccountManager {
             return account.projectId
         }
 
-        let resolved = await getProjectID(account.accessToken)
+        let resolved = await getProjectID(account.accessToken, account.proxy)
         if (!resolved) {
             resolved = generateMockProjectId()
             consola.warn(`Account ${account.email} missing project_id, using fallback ${resolved}`)
@@ -896,16 +913,7 @@ class AccountManager {
 
         account.projectId = resolved
         this.save()
-        authStore.saveAccount({
-            id: account.id,
-            provider: "antigravity",
-            email: account.email,
-            accessToken: account.accessToken,
-            refreshToken: account.refreshToken,
-            expiresAt: account.expiresAt,
-            projectId: account.projectId || undefined,
-            label: account.email,
-        })
+        this.syncAccountToAuthStore(account)
         return resolved
     }
 }

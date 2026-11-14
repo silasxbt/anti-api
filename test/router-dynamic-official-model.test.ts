@@ -1,7 +1,9 @@
 import { afterAll, afterEach, expect, mock, test } from "bun:test"
 import { clearDynamicCopilotModels, setDynamicCopilotModels } from "~/services/routing/models"
 
+const realConfig = await import("~/services/routing/config")
 mock.module("~/services/routing/config", () => ({
+    ...realConfig,
     loadRoutingConfig: () => ({
         version: 2,
         updatedAt: new Date().toISOString(),
@@ -10,7 +12,9 @@ mock.module("~/services/routing/config", () => ({
     }),
 }))
 
+const realChat = await import("~/services/antigravity/chat")
 mock.module("~/services/antigravity/chat", () => ({
+    ...realChat,
     createChatCompletionWithOptions: async () => ({ contentBlocks: [], stopReason: "end_turn", usage: {} }),
     createChatCompletionStreamWithOptions: async function* () {
         yield ""
@@ -36,6 +40,7 @@ mock.module("~/services/codex/chat", () => ({
 
 mock.module("~/services/copilot/chat", () => ({
     createCopilotCompletion: async () => ({ contentBlocks: [], stopReason: "end_turn", usage: {} }),
+    getCopilotReasoningEfforts: () => [],
     isCopilotInsecureTlsEnabled: () => false,
     listCopilotModelsForAccount: async () => [],
 }))
@@ -47,6 +52,7 @@ mock.module("~/services/auth/store", () => ({
         markRateLimited: () => 1_000,
         markSuccess: () => { },
         listAccounts: () => [],
+        saveAccount: () => { },
     },
 }))
 
@@ -80,6 +86,7 @@ test("official model aliases use one routing key", async () => {
 })
 
 test("streaming normalizes the dotted Copilot model before route selection", async () => {
+    setDynamicCopilotModels([{ id: "claude-sonnet-4.5", label: "Copilot - Claude Sonnet 4.5" }])
     const router = await import(`../src/services/routing/router.ts?${Date.now()}-${Math.random()}`)
     const stream = router.createRoutedCompletionStream({
         model: "claude-sonnet-4.5",

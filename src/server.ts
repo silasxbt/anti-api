@@ -9,29 +9,33 @@ import consola from "consola"
 
 import { messageRoutes } from "./routes/messages/route"
 import { openaiRoutes } from "./routes/openai/route"
+import { audioRoutes } from "./routes/audio/route"
 import { authRouter } from "./routes/auth/route"
 import { remoteRouter } from "./routes/remote/route"
-import { routingRouter } from "./routes/routing/route"
+import { routingRouter, syncProviderModels } from "./routes/routing/route"
 import { logsRouter } from "./routes/logs/route"
 import { updatesRouter } from "./routes/updates/route"
-import { AVAILABLE_MODELS } from "./lib/config"
 import { getAggregatedQuota } from "./services/quota-aggregator"
 import { initAuth, isAuthenticated } from "./services/antigravity/login"
 import { accountManager } from "./services/antigravity/account-manager"
-import { loadRoutingConfig } from "./services/routing/config"
-import { getProviderModels } from "./services/routing/models"
+import { loadRoutingConfig, saveRoutingConfig, isSeparateThinkingModelsEnabled } from "./services/routing/config"
+import { quotaPoolForModel, type QuotaPool } from "./lib/model-catalog"
+import { getProviderModels, isVariantModelId } from "./services/routing/models"
 import { importCodexAuthSources } from "./services/codex/oauth"
 import { importGrokAuthSources } from "./services/grok/oauth"
+import { importAgyAuthSources } from "./services/antigravity/agy-auth"
 import { loadSettings, saveSettings } from "./services/settings"
 import { pingAccount } from "./services/ping"
 import { summarizeUpstreamError, UpstreamError } from "./lib/error"
 import { authStore } from "./services/auth/store"
-import type { AuthProvider } from "./services/auth/types"
+import { ACCOUNT_PLAN_OPTIONS } from "./lib/account-plans"
+import { AUTH_PROVIDERS, PROVIDER_DISPLAY_NAMES, type AuthProvider } from "./services/auth/types"
 import { safeErrorMessage } from "./lib/redaction"
 
 import { formatLogTime, getRequestLogContext, runWithRequestContext } from "./lib/logger"
 import { initLogCapture, setLogCaptureEnabled } from "./lib/log-buffer"
 import { getUsage, resetUsage } from "./services/usage-tracker"
+import { getPricingStatus, refreshModelPricing } from "./services/model-pricing"
 import { getPublicDir } from "./lib/public-dir"
 
 import {
@@ -46,9 +50,10 @@ import {
 } from "./lib/public-access"
 import { isLoopbackRequest } from "./lib/local-request"
 import { resolveLogLevel } from "./lib/log-level"
+import { dispatchOAuthCallback } from "./services/antigravity/oauth"
 
 export const server = new Hono()
-const PROVIDERS: AuthProvider[] = ["antigravity", "codex", "copilot", "zed", "kiro", "grok"]
+const PROVIDERS = AUTH_PROVIDERS
 
 interface ModelListEntry {
     id: string
@@ -60,6 +65,97 @@ initLogCapture()
 setLogCaptureEnabled(loadSettings().captureLogs)
 consola.level = resolveLogLevel()
 
+// CORS is granted only to the inference API. The control plane (auth, settings, logs, ...)
+// is same-origin only so other web pages cannot drive it.
+const CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
+    "Access-Control-Allow-Headers": "*",
+}
+const INFERENCE_PATH_PREFIXES = ["/v1/", "/v1beta/", "/messages", "/models", "/embeddings", "/responses"]
+
+function isInferencePath(path: string): boolean {
+    return INFERENCE_PATH_PREFIXES.some(prefix => path === prefix.replace(/\/$/, "") || path.startsWith(prefix))
+}
+
+server.use("*", async (c, next) => {
+    if (!isInferencePath(c.req.path)) return await next()
+    if (c.req.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: { ...CORS_HEADERS, "Access-Control-Max-Age": "86400" } })
+    }
+    await next()
+    for (const [name, value] of Object.entries(CORS_HEADERS)) c.res.headers.set(name, value)
+})
+type CallbackTone = "success" | "error" | "warning"
+const CALLBACK_TONE_COLORS: Record<CallbackTone, string> = { success: "#22c55e", error: "#ef4444", warning: "#eab308" }
+
+function escapeHtml(value: string): string {
+    return value.replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]!))
+}
+
+/** Renders the small status page shown at the end of an OAuth callback. `bodyHtml` must already be escaped. */
+function renderCallbackPage(opts: { title: string; heading: string; tone: CallbackTone; bodyHtml: string; redirect?: boolean }): string {
+    const footer = opts.redirect
+        ? `<p style="font-size:0.875rem;color:#a1a1aa;">Reindirizzamento alla dashboard...</p>
+            <script>setTimeout(() => { window.location.href = '/quota'; }, 1500);</script>`
+        : `<a href="/quota" style="color:#38bdf8;text-decoration:none;">Torna alla Dashboard</a>`
+    return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${opts.title}</title></head>
+<body style="font-family:system-ui,-apple-system,sans-serif;background:#18181b;color:#f4f4f5;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
+  <div style="background:#27272a;padding:2rem;border-radius:12px;text-align:center;max-width:400px;box-shadow:0 10px 25px rgba(0,0,0,0.5);">
+    <h2 style="color:${CALLBACK_TONE_COLORS[opts.tone]};margin-top:0;">${opts.heading}</h2>
+    ${opts.bodyHtml}
+    ${footer}
+  </div>
+</body></html>`
+}
+
+const callbackError = (message: string, heading = "Errore di accesso") =>
+    renderCallbackPage({ title: "Anti-API Auth Error", heading, tone: "error", bodyHtml: `<p>${escapeHtml(message)}</p>` })
+
+// OAuth 回调端点 - 允许通过主端口/反向代理直接接收 OAuth 回调，无需额外暴露回调端口
+server.get("/oauth-callback", async (c) => {
+    const code = c.req.query("code")
+    const state = c.req.query("state")
+    const error = c.req.query("error")
+
+    if (error) return c.html(callbackError(error, "Accesso non riuscito"))
+
+    if (dispatchOAuthCallback(code, state, error)) {
+        return c.html(renderCallbackPage({
+            title: "Anti-API Auth Success",
+            heading: "✅ Accesso completato",
+            tone: "success",
+            bodyHtml: "<p>Account OAuth connesso ad Anti-API.</p>",
+            redirect: true,
+        }))
+    }
+
+    if (code) {
+        try {
+            const { loginWithAuthCode } = await import("./services/antigravity/login")
+            const host = c.req.header("host")
+            const redirectUri = host ? `http://${host}/oauth-callback` : undefined
+            const result = await loginWithAuthCode(code, redirectUri)
+            if (!result.success) return c.html(callbackError(result.error || "Scambio del codice non riuscito."))
+            return c.html(renderCallbackPage({
+                title: "Anti-API Auth Success",
+                heading: "✅ Accesso completato",
+                tone: "success",
+                bodyHtml: `<p>Account Google <strong>${escapeHtml(result.email || "")}</strong> connesso con successo ad Anti-API.</p>`,
+                redirect: true,
+            }))
+        } catch (err: any) {
+            return c.html(callbackError(err.message || "Errore sconosciuto"))
+        }
+    }
+
+    return c.html(renderCallbackPage({
+        title: "Anti-API Auth Callback",
+        heading: "Callback Ricevuto",
+        tone: "warning",
+        bodyHtml: "<p>Nessun codice fornito o sessione già completata.</p>",
+    }))
+})
 // 中间件 - 请求日志 (只记录重要请求)
 server.use(async (c, next) => {
     return await runWithRequestContext(async () => {
@@ -72,17 +168,9 @@ server.use(async (c, next) => {
             const ctx = getRequestLogContext()
             const method = c.req.method
             const path = c.req.path
-            const debugInfo = status === 400 ? ` (${method} ${path}${reason ? ` - ${reason}` : ""})` : ""
+            const debugInfo = ` (${method} ${path}${reason ? ` - ${reason}` : ""})`
             if (ctx.model && ctx.provider) {
-                const providerNames: Record<string, string> = {
-                    copilot: "GitHub Copilot",
-                    codex: "ChatGPT Codex",
-                    antigravity: "Antigravity",
-                    zed: "Zed",
-                    kiro: "Kiro",
-                    grok: "Grok",
-                }
-                const providerName = providerNames[ctx.provider] || ctx.provider
+                const providerName = PROVIDER_DISPLAY_NAMES[ctx.provider as AuthProvider] || ctx.provider
                 const accountPart = ctx.account ? ` >> ${ctx.account}` : ""
                 const routePart = ctx.routeTag ? `•${ctx.routeTag}` : ""
                 console.log(`[${formatLogTime()}] ${status}: from ${ctx.model} > ${providerName}${accountPart}${routePart}${debugInfo}`)
@@ -93,12 +181,21 @@ server.use(async (c, next) => {
         // All successful requests are silent (detailed 200 logs are handled elsewhere)
     })
 })
+
 server.use(async (c, next) => {
+    // Exempt public health checks and OAuth callback
+    const isHealthBootstrap = c.req.path === "/health" && isContainerControlPlaneEnabled() && !!extractControlPlaneBootstrapToken(c.req.raw)
+    if (c.req.path === "/oauth-callback" || (c.req.path === "/health" && !isHealthBootstrap)) {
+        return await next()
+    }
+
     if (isContainerControlPlaneEnabled()) {
         const expectedToken = getControlPlaneToken()
         const bootstrapToken = extractControlPlaneBootstrapToken(c.req.raw)
         if (expectedToken && bootstrapToken && tokenMatches(expectedToken, bootstrapToken)) {
-            c.header("Set-Cookie", `${CONTROL_PLANE_COOKIE}=${encodeURIComponent(expectedToken)}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Strict`)
+            const isHttps = c.req.header("x-forwarded-proto") === "https" || c.req.url.startsWith("https://")
+            const secureFlag = isHttps ? "; Secure" : ""
+            c.header("Set-Cookie", `${CONTROL_PLANE_COOKIE}=${encodeURIComponent(expectedToken)}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax${secureFlag}`)
             const cleanUrl = new URL(c.req.url)
             cleanUrl.searchParams.delete("control_token")
             return c.redirect(`${cleanUrl.pathname}${cleanUrl.search}`, 303)
@@ -106,6 +203,8 @@ server.use(async (c, next) => {
         if (!expectedToken || !tokenMatches(expectedToken, extractControlPlaneToken(c.req.raw))) {
             return c.json({ success: false, error: "A valid container control-plane token is required." }, expectedToken ? 401 : 503)
         }
+    } else if (process.env.ANTI_API_BEHIND_REVERSE_PROXY === "1" || process.env.ANTI_API_TRUST_PROXY === "1") {
+        // Reverse proxy mode: allow external host header
     } else if (!isLoopbackRequest(c.req.raw)) {
         return c.json({ success: false, error: "The local control plane is only available through a loopback host and origin." }, 403)
     }
@@ -114,7 +213,9 @@ server.use(async (c, next) => {
 
 // 启动时自动加载已保存的认证
 initAuth()
-accountManager.load()
+if (typeof accountManager?.load === "function") {
+    accountManager.load()
+}
 
 // Optional startup imports are explicit because they read and copy credentials from other tools.
 if (process.env.ANTI_API_IMPORT_CODEX_ON_START === "1") {
@@ -129,6 +230,14 @@ if (process.env.ANTI_API_IMPORT_GROK_ON_START === "1") {
     importGrokAuthSources().then(result => {
         if (result.accounts.length > 0) {
             consola.success(`Grok: Imported ${result.accounts.length} account(s) from ${result.sources.join(", ")}`)
+        }
+    }).catch(() => undefined)
+}
+
+if ((accountManager?.getAllAccounts?.()?.length ?? 0) === 0 || process.env.ANTI_API_IMPORT_AGY_ON_START === "1") {
+    importAgyAuthSources().then(result => {
+        if (result.success && result.imported) {
+            consola.success(`Antigravity: Imported credentials from agy (${result.email})`)
         }
     }).catch(() => undefined)
 }
@@ -199,6 +308,16 @@ server.get("/usage", (c) => {
     return c.json(getUsage())
 })
 
+server.get("/usage/pricing", (c) => {
+    return c.json(getPricingStatus())
+})
+
+// Pulls the latest per-model pricing from the online datasheet
+server.post("/usage/pricing/refresh", async (c) => {
+    const ok = await refreshModelPricing()
+    return c.json({ success: ok, ...getPricingStatus() }, ok ? 200 : 502)
+})
+
 server.post("/usage/reset", (c) => {
     resetUsage()
     return c.json({ success: true })
@@ -206,6 +325,8 @@ server.post("/usage/reset", (c) => {
 
 // OpenAI 兼容端点
 server.route("/v1/chat/completions", openaiRoutes)
+server.route("/v1/audio", audioRoutes)
+server.route("/audio", audioRoutes)
 
 // Anthropic兼容端点
 server.route("/v1/messages", messageRoutes)
@@ -216,33 +337,69 @@ server.route("/v1beta/messages", messageRoutes)
 // 无前缀版本 for GUI tools
 server.route("/messages", messageRoutes)
 
-// 模型列表处理函数 - 兼容 OpenAI 和 Anthropic 格式
-const modelsHandler = (c: any) => {
-    const now = new Date().toISOString()
+function computeModelsCatalog() {
+    const settings = loadSettings()
     const routingConfig = loadRoutingConfig()
+
     const routeModels: ModelListEntry[] = (routingConfig.flows || []).map(flow => ({
         id: flow.name,
         name: `Route: ${flow.name}`,
         owned_by: "routing",
     }))
-    const providerModels: ModelListEntry[] = PROVIDERS.flatMap((provider) =>
-        getProviderModels(provider).map(model => ({
+
+    const activeProviderSet = new Set(
+        PROVIDERS.filter(p => authStore.listAccounts(p).length > 0)
+    )
+
+    const targetProviders = (settings.onlyActiveProviders ?? true)
+        ? PROVIDERS.filter(p => activeProviderSet.has(p))
+        : PROVIDERS
+
+    const separateThinking = settings.separateThinkingModels ?? isSeparateThinkingModelsEnabled()
+
+    const providerModels: ModelListEntry[] = targetProviders.flatMap((provider) =>
+        getProviderModels(provider, { includeAllVariants: separateThinking }).map(model => ({
             id: model.id,
             name: model.label,
             owned_by: provider,
         }))
     )
+
     const seen = new Set<string>()
-    const baseModels: ModelListEntry[] = AVAILABLE_MODELS.map(model => ({
-        id: model.id,
-        name: model.name,
-        owned_by: "antigravity",
-    }))
-    const models = [...baseModels, ...providerModels, ...routeModels].filter(model => {
+    let models = [...providerModels, ...routeModels].filter(model => {
         if (seen.has(model.id)) return false
         seen.add(model.id)
         return true
     })
+
+    if (activeProviderSet.has("antigravity")) {
+        models.push({
+            id: "gemini-transcribe",
+            name: "Gemini Transcribe",
+            owned_by: "antigravity",
+        })
+    }
+
+    // Filter: separateThinkingModels (if false, drop any explicit thinking variants)
+    if (!separateThinking) {
+        models = models.filter(m => !isVariantModelId(m.id))
+    }
+
+    // Filter: disabledModels
+    if (Array.isArray(settings.disabledModels) && settings.disabledModels.length > 0) {
+        const disabledSet = new Set(settings.disabledModels)
+        models = models.filter(m => !disabledSet.has(m.id))
+    }
+
+    return { models, settings, activeProviders: Array.from(activeProviderSet) }
+}
+
+// 模型列表处理函数 - 兼容 OpenAI 和 Anthropic 格式
+const modelsHandler = async (c: any) => {
+    // Pull the real per-account model lists online (TTL-throttled) before answering
+    await syncProviderModels(Date.now(), 4000).catch(() => undefined)
+    const now = new Date().toISOString()
+    const { models } = computeModelsCatalog()
 
     return c.json({
         object: "list",
@@ -265,6 +422,76 @@ const modelsHandler = (c: any) => {
 server.get("/v1/models", modelsHandler)
 server.get("/v1beta/models", modelsHandler)
 server.get("/models", modelsHandler)  // 无前缀版本 for GUI tools
+
+// API 仪表盘模型目录与实时状态
+server.get("/api/models-catalog", async (c: any) => {
+    await syncProviderModels(Date.now(), 4000).catch(() => undefined)
+    const routingConfig = loadRoutingConfig()
+    const settings = loadSettings()
+
+    const activeProviderSet = new Set(
+        PROVIDERS.filter(p => authStore.listAccounts(p).length > 0)
+    )
+
+    // All available models across providers
+    const allProviders: ModelListEntry[] = PROVIDERS.flatMap(provider =>
+        getProviderModels(provider, { includeAllVariants: true }).map(model => ({
+            id: model.id,
+            name: model.label,
+            owned_by: provider,
+        }))
+    )
+    const allRoutes: ModelListEntry[] = (routingConfig.flows || []).map(flow => ({
+        id: flow.name,
+        name: `Route: ${flow.name}`,
+        owned_by: "routing",
+    }))
+
+    const quotaSnapshot = await getAggregatedQuota().catch(() => null)
+    // Antigravity quota pools with no remaining quota on any account
+    const exhaustedPools = new Set<QuotaPool>()
+    const antigravityAccounts = (quotaSnapshot?.accounts || []).filter(a => a.provider === "antigravity")
+    if (antigravityAccounts.length > 0) {
+        const hasAvailableForBarPrefix = (prefix: string) => {
+            return antigravityAccounts.some(acc => {
+                const bars = (acc.bars || []).filter(b => b.key.startsWith(prefix))
+                return bars.length === 0 || bars.every(b => (b.percentage ?? 0) > 0 && !b.disabled)
+            })
+        }
+        for (const pool of ["claude_gpt", "gemini", "argon"] as const) {
+            if (!hasAvailableForBarPrefix(pool)) exhaustedPools.add(pool)
+        }
+    }
+
+    const seenAll = new Set<string>()
+    const allAvailable = [...allProviders, ...allRoutes].filter(m => {
+        if (seenAll.has(m.id)) return false
+        seenAll.add(m.id)
+        return true
+    }).map(m => {
+        const isProviderActive = m.owned_by === "routing" || activeProviderSet.has(m.owned_by as AuthProvider)
+        const pool = m.owned_by === "antigravity" ? quotaPoolForModel(m.id) : null
+        const isQuotaExhausted = pool !== null && exhaustedPools.has(pool)
+        const isAvailable = isProviderActive && !isQuotaExhausted
+        const isThinking = isVariantModelId(m.id)
+        return {
+            ...m,
+            isThinking,
+            isProviderActive,
+            isAvailable,
+        }
+    })
+
+    const { models: exposedModels } = computeModelsCatalog()
+    const exposedIds = new Set(exposedModels.map(m => m.id))
+
+    return c.json({
+        allAvailable,
+        exposedIds: Array.from(exposedIds),
+        settings,
+        activeProviders: Array.from(activeProviderSet),
+    })
+})
 
 // 配额面板 - HTML Dashboard
 server.get("/quota", async (c) => {
@@ -402,6 +629,205 @@ server.delete("/accounts/:id", async (c) => {
     return c.json({ success: false, error: "Account not found" }, 404)
 })
 
+// 获取账号选项 (Egress Proxy, Label, Project ID)
+server.get("/accounts/:id/options", (c) => {
+    const accountId = c.req.param("id")
+    const providerParam = c.req.query("provider") as AuthProvider | undefined
+
+    // 优先检查 antigravity
+    const agAcc = accountManager.getAccount(accountId)
+    if (agAcc) {
+        return c.json({
+            success: true,
+            account: {
+                id: agAcc.id,
+                provider: "antigravity",
+                email: agAcc.email,
+                displayName: agAcc.label || agAcc.email,
+                label: agAcc.label || "",
+                proxy: agAcc.proxy || "",
+                projectId: agAcc.projectId || "",
+                plan: agAcc.plan || "",
+            }
+        })
+    }
+
+    // 检查 authStore
+    const providersToTry = providerParam ? [providerParam] : PROVIDERS
+    for (const prov of providersToTry) {
+        const acc = authStore.getAccount(prov, accountId)
+        if (acc) {
+            return c.json({
+                success: true,
+                account: {
+                    id: acc.id,
+                    provider: prov,
+                    email: acc.email,
+                    login: acc.login,
+                    displayName: acc.label || acc.email || acc.login || acc.id,
+                    label: acc.label || "",
+                    proxy: acc.proxy || "",
+                    projectId: acc.projectId || "",
+                    plan: acc.plan || "",
+                }
+            })
+        }
+    }
+
+    return c.json({ success: false, error: "Account not found" }, 404)
+})
+
+// 导出账号完整凭证 (JSON)
+server.get("/accounts/:id/export", (c) => {
+    const accountId = c.req.param("id")
+    const providerParam = c.req.query("provider") as AuthProvider | undefined
+
+    // 1. Antigravity 账号
+    const agAcc = accountManager.getAccount(accountId)
+    if (agAcc) {
+        return c.json({
+            success: true,
+            account: {
+                id: agAcc.id,
+                provider: "antigravity",
+                email: agAcc.email,
+                displayName: agAcc.label || agAcc.email,
+                label: agAcc.label || "",
+                proxy: agAcc.proxy || "",
+                projectId: agAcc.projectId || "",
+                accessToken: agAcc.accessToken,
+                refreshToken: agAcc.refreshToken,
+                expiresAt: agAcc.expiresAt,
+            }
+        })
+    }
+
+    // 2. AuthStore 账号
+    const providersToTry = providerParam ? [providerParam] : PROVIDERS
+    for (const prov of providersToTry) {
+        const acc = authStore.getAccount(prov, accountId)
+        if (acc) {
+            return c.json({
+                success: true,
+                account: {
+                    ...acc,
+                    provider: prov,
+                    displayName: acc.label || acc.email || acc.login || acc.id,
+                }
+            })
+        }
+    }
+
+    return c.json({ success: false, error: "Account not found" }, 404)
+})
+
+// 更新账号选项 (Egress Proxy, Label, Project ID)
+const handleUpdateAccountOptions = async (c: any) => {
+    const accountId = c.req.param("id")
+    let body: { proxy?: string; label?: string; projectId?: string; provider?: string; plan?: string } = {}
+    try {
+        body = await c.req.json()
+    } catch {
+        body = {}
+    }
+
+    const { proxy, label, projectId, provider } = body
+    const plan = body.plan !== undefined ? String(body.plan ?? "").trim().toLowerCase() : undefined
+    // Validate against the known plan enums ("" clears the plan => provider default applies).
+    if (plan !== undefined && plan !== "") {
+        const allowedPlans = new Set<string>([
+            ...ACCOUNT_PLAN_OPTIONS.antigravity,
+            ...ACCOUNT_PLAN_OPTIONS.copilot,
+        ])
+        if (!allowedPlans.has(plan)) {
+            return c.json({ success: false, error: `Unknown plan "${plan}". Allowed: ${[...allowedPlans].join(", ")}` }, 400)
+        }
+    }
+    let updated = false
+    let targetProvider = provider as AuthProvider | undefined
+
+    if (!targetProvider || targetProvider === "antigravity") {
+        if (accountManager.hasAccount(accountId)) {
+            updated = accountManager.updateAccountOptions(accountId, { proxy, label, projectId, plan })
+            targetProvider = "antigravity"
+        }
+    }
+
+    if (!updated || targetProvider) {
+        const providersToTry = targetProvider ? [targetProvider] : PROVIDERS
+        for (const prov of providersToTry) {
+            const res = authStore.updateAccountOptions(prov, accountId, { proxy, label, projectId, plan })
+            if (res) {
+                updated = true
+                targetProvider = prov
+                break
+            }
+        }
+    }
+
+    if (!updated) {
+        return c.json({ success: false, error: `Account not found: ${accountId}` }, 404)
+    }
+
+    return c.json({
+        success: true,
+        accountId,
+        provider: targetProvider,
+        proxy: proxy !== undefined ? (proxy.trim() || null) : undefined,
+        label: label !== undefined ? (label.trim() || null) : undefined,
+        projectId: projectId !== undefined ? (projectId.trim() || null) : undefined,
+        plan: plan !== undefined ? (plan || null) : undefined,
+    })
+}
+
+server.patch("/accounts/:id/options", handleUpdateAccountOptions)
+server.post("/accounts/:id/options", handleUpdateAccountOptions)
+
+// 测试 Egress Proxy 连通性
+server.post("/accounts/test-proxy", async (c) => {
+    let body: { proxy?: string } = {}
+    try {
+        body = await c.req.json()
+    } catch {
+        body = {}
+    }
+
+    const proxy = (body.proxy || "").trim()
+    if (!proxy) {
+        return c.json({ success: false, error: "Proxy URL is required" }, 400)
+    }
+
+    try {
+        const startTime = Date.now()
+        // 测试请求外网 ip 查询 API
+        const fetchInit: any = {
+            headers: { "User-Agent": "anti-api/1.0" },
+            signal: AbortSignal.timeout(10_000),
+            proxy,
+        }
+        const res = await fetch("https://api.ipify.org?format=json", fetchInit)
+        const latencyMs = Date.now() - startTime
+        if (res.ok) {
+            const data = await res.json().catch(() => ({})) as { ip?: string }
+            return c.json({
+                success: true,
+                latencyMs,
+                exitIp: data.ip || "unknown",
+                message: `Proxy connected successfully (${latencyMs}ms, Exit IP: ${data.ip || "OK"})`
+            })
+        }
+        return c.json({
+            success: false,
+            error: `Proxy returned HTTP ${res.status} ${res.statusText}`
+        }, 400)
+    } catch (e: any) {
+        return c.json({
+            success: false,
+            error: e.message || "Failed to connect through proxy"
+        }, 400)
+    }
+})
+
 // 隧道状态 - 返回公共 URL
 server.get("/tunnel/status", (c) => {
     const { state } = require("./lib/state")
@@ -442,6 +868,10 @@ export function createPublicServer(token: string | null = getPublicGatewayToken(
         "/v1/messages",
         "/v1beta/messages",
         "/messages",
+        "/v1/audio/transcriptions",
+        "/v1/audio/translations",
+        "/audio/transcriptions",
+        "/audio/translations",
         "/v1/models",
         "/v1beta/models",
         "/models",
@@ -460,6 +890,8 @@ export function createPublicServer(token: string | null = getPublicGatewayToken(
     }
 
     app.route("/v1/chat/completions", openaiRoutes)
+    app.route("/v1/audio", audioRoutes)
+    app.route("/audio", audioRoutes)
     app.route("/v1/messages", messageRoutes)
     app.route("/v1beta/messages", messageRoutes)
     app.route("/messages", messageRoutes)

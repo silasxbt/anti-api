@@ -4,18 +4,35 @@
  */
 
 import consola from "consola"
+import { existsSync, readFileSync, writeFileSync, rmSync } from "fs"
+import { join } from "path"
+import { getDataDir, ensureDataDir } from "~/lib/data-dir"
 import { getAccessToken } from "./oauth"
 import { accountManager } from "./account-manager"
 import { state } from "~/lib/state"
-import { type ClaudeMessage, type ClaudeTool } from "~/lib/translator"
-import { determineRetryStrategy, applyRetryDelay } from "~/lib/retry"
+import {
+    type ClaudeMessage,
+    type ClaudeTool,
+    buildMessageStart,
+    buildContentBlockStart,
+    buildTextDelta,
+    buildThinkingDelta,
+    buildInputJsonDelta,
+    buildContentBlockStop,
+    buildMessageDelta,
+    buildMessageStop,
+} from "~/lib/translator"
+import { determineRetryStrategy, applyRetryDelay, parseRetryDelay } from "~/lib/retry"
 import { RequestValidationError, UpstreamError } from "~/lib/error"
 import { cleanJsonSchemaForGemini } from "~/lib/json-schema-cleaner"
 import { formatSuccessLine, setRequestLogContext } from "~/lib/logger"
 import { getAntigravityUserAgent } from "~/lib/antigravity-client"
-import { fetchRemoteImageAsBase64 } from "~/lib/remote-image"
+import { fetchRemoteImageAsBase64, fetchRemoteAudioAsBase64 } from "~/lib/remote-image"
 import { createImageInputBudget, decodedBase64ImageBytes, type ImageInputBudget } from "~/lib/image-input"
 import { safeErrorMessage } from "~/lib/redaction"
+import { resolveAntigravityAlias, parseModelId, compareVersions } from "~/lib/model-catalog"
+import { getCachedAntigravityModelsForAccount } from "~/services/quota-aggregator"
+import { getDynamicAntigravityModelIdsForAccount } from "~/services/routing/models"
 
 accountManager.load()
 
@@ -29,57 +46,7 @@ const MAX_RETRY_ATTEMPTS = 1  // v2.0.1 恢复：简化重试，避免级联 429
 const MAX_NON_QUOTA_429_RETRIES = 2  // Non-quota 429 retries before switching accounts
 const MAX_NON_QUOTA_429_WAIT_MS = 4000  // Upper bound for non-quota 429 wait time
 const NON_QUOTA_429_COOLDOWN_MS = 8000  // Cooldown before retrying a rate-limited account
-const FETCH_TIMEOUT_MS = 30000  // 防止上游请求长期卡住
-
-/**
- * 从 429 错误中解析重试延迟时间（毫秒）
- * 支持格式：quotaResetDelay "42s", "2m30s", "1h", 或 Retry-After header
- */
-function parseRetryDelay(errorText: string, retryAfterHeader?: string): number | null {
-    // 1. 优先尝试从 Retry-After header 解析
-    if (retryAfterHeader) {
-        const seconds = parseInt(retryAfterHeader, 10)
-        if (!isNaN(seconds) && seconds > 0) {
-            return seconds * 1000
-        }
-    }
-
-    // 2. 尝试从 JSON 中解析 quotaResetDelay
-    const trimmed = errorText.trim()
-    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-        try {
-            const json = JSON.parse(trimmed)
-            const delay = json?.error?.details?.[0]?.metadata?.quotaResetDelay
-            if (typeof delay === "string") {
-                return parseDurationString(delay)
-            }
-        } catch {
-            // ignore parse errors
-        }
-    }
-
-    // 3. 正则匹配常见模式
-    const patterns = [
-        /try again in (\d+)m\s*(\d+)s/i,
-        /try again in (\d+)s/i,
-        /backoff for (\d+)s/i,
-        /wait (\d+)s/i,
-        /retry after (\d+) second/i,
-    ]
-
-    for (const pattern of patterns) {
-        const match = errorText.match(pattern)
-        if (match) {
-            if (match[2]) {
-                // "Xm Ys" format
-                return (parseInt(match[1]) * 60 + parseInt(match[2])) * 1000
-            }
-            return parseInt(match[1]) * 1000
-        }
-    }
-
-    return null
-}
+const FETCH_TIMEOUT_MS = 180000  // 180s: allow long-context TTFT prefill on reasoning models (e.g. Argon)
 
 function isQuotaExhaustedErrorText(errorText: string): boolean {
     const body = (errorText || "").trim()
@@ -91,13 +58,17 @@ function isQuotaExhaustedErrorText(errorText: string): boolean {
             const details = json?.error?.details
             if (Array.isArray(details)) {
                 for (const detail of details) {
-                    if (detail?.reason === "QUOTA_EXHAUSTED") return true
+                    if (detail?.reason === "QUOTA_EXHAUSTED" || detail?.reason === "RESOURCE_EXHAUSTED") return true
                 }
             }
+            const status = json?.error?.status
+            if (status === "RESOURCE_EXHAUSTED") return true
+
             const message = json?.error?.message
             if (typeof message === "string") {
                 const lower = message.toLowerCase()
                 if (lower.includes("quota") && lower.includes("reset")) return true
+                if (lower.includes("resource exhausted") || lower.includes("resource_exhausted")) return true
             }
         } catch {
             // ignore parse errors
@@ -106,30 +77,16 @@ function isQuotaExhaustedErrorText(errorText: string): boolean {
 
     const lower = body.toLowerCase()
     if (lower.includes("quota_exhausted")) return true
+    if (lower.includes("resource_exhausted") || lower.includes("resource exhausted")) return true
     if (lower.includes("quota") && lower.includes("reset")) return true
     return false
 }
 
-/**
- * 解析时长字符串，如 "42s", "2m30s", "1h30m", "500ms"
- */
-function parseDurationString(s: string): number | null {
-    const hourMatch = s.match(/(\d+)h/)
-    const minMatch = s.match(/(\d+)m(?!s)/)
-    const secMatch = s.match(/(\d+(?:\.\d+)?)s(?!$|[a-z])/i) || s.match(/(\d+(?:\.\d+)?)s$/)
-    const msMatch = s.match(/(\d+)ms/)
-
-    const hours = hourMatch ? parseInt(hourMatch[1]) : 0
-    const minutes = minMatch ? parseInt(minMatch[1]) : 0
-    const seconds = secMatch ? parseFloat(secMatch[1]) : 0
-    const ms = msMatch ? parseInt(msMatch[1]) : 0
-
-    const totalMs = (hours * 3600 + minutes * 60 + Math.ceil(seconds)) * 1000 + ms
-
-    return totalMs > 0 ? totalMs : null
-}
-
-async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: number): Promise<Response> {
+async function fetchWithTimeout(
+    url: string,
+    options: RequestInit & { proxy?: string },
+    timeoutMs: number
+): Promise<Response> {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
     const requestSignal = options.signal
@@ -142,43 +99,155 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: nu
         }
     }
     try {
-        return await fetch(url, { ...options, signal: controller.signal })
+        const fetchInit: any = { ...options, signal: controller.signal }
+        if (options.proxy) {
+            fetchInit.proxy = options.proxy
+        }
+        return await fetch(url, fetchInit)
     } finally {
         clearTimeout(timeoutId)
         requestSignal?.removeEventListener("abort", abortFromRequest)
     }
 }
 
-const MODEL_MAPPING: Record<string, string> = {
-    "claude-sonnet-4-5": "claude-sonnet-4-5",
-    "claude-sonnet-4-5-thinking": "claude-sonnet-4-5-thinking",
-    "claude-opus-4-5-thinking": "claude-opus-4-5-thinking",
-    "claude-opus-4-6": "claude-opus-4-6-thinking",
-    "claude-opus-4-6-thinking": "claude-opus-4-6-thinking",
-    "claude-sonnet-4.5": "claude-sonnet-4-5",
-    "claude-sonnet-4.5-thinking": "claude-sonnet-4-5-thinking",
-    "claude-opus-4.5-thinking": "claude-opus-4-5-thinking",
-    "claude-opus-4.6": "claude-opus-4-6-thinking",
-    "claude-opus-4.6-thinking": "claude-opus-4-6-thinking",
-    "claude-sonnet-4-5-20251001": "claude-sonnet-4-5",
-    "gemini-3-pro-high": "gemini-3-pro-high",
-    "gemini-3-pro-low": "gemini-3-pro-low",
-    "gemini-3-flash": "gemini-3-flash",
-    "gemini-3.1-pro": "gemini-3.1-pro",
-    "gemini-3.1-pro-preview": "gemini-3.1-pro-preview",
-    // Antigravity exposes the public "Pro (High)" tier as this native ID.
-    "gemini-3.1-pro-high": "gemini-pro-agent",
-    "gemini-3.1-pro-low": "gemini-3.1-pro-low",
-    "gemini-3.1-flash": "gemini-3.1-flash",
-    "gemini-3.1-flash-lite": "gemini-3.1-flash-lite",
-    "gemini-3.1-flash-lite-preview": "gemini-3.1-flash-lite-preview",
-    "gemini-3.1-flash-image": "gemini-3.1-flash-image",
-    "gemini-3.1-flash-image-preview": "gemini-3.1-flash-image-preview",
-    "gpt-oss-120b": "gpt-oss-120b-medium",
+/** Maps every alias to `target`. */
+function aliasesTo(target: string, ...aliases: string[]): Array<[string, string]> {
+    return aliases.map(alias => [alias, target])
 }
 
+/** Native IDs that map to themselves. */
+function identity(...ids: string[]): Array<[string, string]> {
+    return ids.map(id => [id, id])
+}
+
+const MODEL_MAPPING: Record<string, string> = Object.fromEntries([
+    // Gemini 4 Argon
+    ...aliasesTo("gemini-4-argon-medium", "gemini-4-argon", "gemini-argon", "argon"),
+    ...aliasesTo("gemini-4-argon-high", "gemini-4-argon-thinking", "gemini-argon-thinking"),
+    ...["high", "medium", "low"].flatMap(v => [
+        ...identity(`gemini-4-argon-${v}`),
+        ...aliasesTo(`gemini-4-argon-${v}`, `gemini-argon-${v}`),
+    ]),
+
+    // Gemini 3.8 Flash
+    ...aliasesTo("gemini-3.8-flash-medium", "gemini-3.8-flash", "gemini-flash"),
+    ...identity("gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low"),
+
+    // Claude 5.5
+    ...aliasesTo("claude-opus-5-5-medium", "claude-opus-5-5", "claude-opus-5.5", "claude-opus-5-5-thinking", "claude-opus", "claude-3-opus", "claude-3.0-opus", "claude-3-opus-latest", "claude-3-opus-20240229", "claude-opus-3"),
+    ...identity("claude-opus-5-5-low", "claude-opus-5-5-medium", "claude-opus-5-5-high"),
+    ...aliasesTo("claude-sonnet-5-5-medium", "claude-sonnet-5-5", "claude-sonnet-5.5", "claude-sonnet-5-5-thinking", "claude-sonnet", "claude-3-7-sonnet", "claude-3.7-sonnet", "claude-3-7-sonnet-latest", "claude-3-7-sonnet-20250219", "claude-sonnet-3-7", "claude-sonnet-3.7"),
+    ...identity("claude-sonnet-5-5-low", "claude-sonnet-5-5-medium", "claude-sonnet-5-5-high"),
+
+    // GPT-OSS
+    ...aliasesTo("gpt-oss-120b-medium", "gpt-oss-120b", "gpt-oss"),
+    ...identity("gpt-oss-120b-medium"),
+
+    // Legacy fallbacks (kept for compatibility)
+    ...aliasesTo("claude-opus-4-6-thinking", "claude-opus-4-6", "claude-opus-4.6"),
+    ...identity("claude-opus-4-6-thinking", "claude-sonnet-4-6"),
+    ...aliasesTo("claude-sonnet-4-6", "claude-sonnet-4.6"),
+    ...aliasesTo("claude-opus-4-5-thinking", "claude-opus-4-5", "claude-opus-4.5"),
+    ...identity("claude-opus-4-5-thinking", "claude-sonnet-4-5"),
+    ...aliasesTo("claude-sonnet-4-5", "claude-sonnet-4.5", "claude-sonnet-4-5-20251001", "claude-3-5-sonnet", "claude-3.5-sonnet", "claude-3-5-sonnet-latest", "claude-3-5-sonnet-20241022", "claude-3-5-sonnet-20240620", "claude-sonnet-3-5", "claude-sonnet-3.5", "claude-3-5-haiku", "claude-3.5-haiku"),
+    ...identity("claude-sonnet-4-5-thinking"),
+    ...aliasesTo("gemini-pro-agent", "gemini-3.1-pro", "gemini-3.1-pro-preview", "gemini-3.1-pro-high"),
+    ...identity(
+        "gemini-3.1-pro-low",
+        "gemini-3.1-flash",
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-flash-lite-preview",
+        "gemini-3.1-flash-image",
+        "gemini-3.1-flash-image-preview",
+    ),
+    ...["3.7", "3.6"].flatMap(v => [
+        ...aliasesTo(`gemini-${v}-flash-medium`, `gemini-${v}-flash`),
+        ...identity(`gemini-${v}-flash-high`, `gemini-${v}-flash-medium`, `gemini-${v}-flash-low`),
+    ]),
+    ...identity("gemini-3.5-flash-lite"),
+    ...aliasesTo("gemini-3-pro-high", "gemini-3-pro"),
+    ...identity(
+        "gemini-3-pro-high",
+        "gemini-3-pro-low",
+        "gemini-3-flash",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-thinking",
+    ),
+    ...aliasesTo("gemini-flash", "gemini-transcribe", "whisper-1", "whisper"),
+])
+
 export function getAntigravityModelName(userModel: string): string {
-    return MODEL_MAPPING[userModel] || userModel
+    return MODEL_MAPPING[userModel] || resolveAntigravityAlias(userModel) || userModel
+}
+
+const antigravityUnsupportedModels = new Map<string, Map<string, number>>()
+const ANTIGRAVITY_UNSUPPORTED_MODEL_TTL_MS = 30 * 60 * 1000
+
+function cleanupAntigravityUnsupportedCache(accountId: string): Map<string, number> {
+    const now = Date.now()
+    const existing = antigravityUnsupportedModels.get(accountId) || new Map<string, number>()
+    for (const [modelId, expiresAt] of existing.entries()) {
+        if (!expiresAt || expiresAt <= now) {
+            existing.delete(modelId)
+        }
+    }
+    if (existing.size === 0) {
+        antigravityUnsupportedModels.delete(accountId)
+        return new Map<string, number>()
+    }
+    antigravityUnsupportedModels.set(accountId, existing)
+    return existing
+}
+
+export function markAntigravityModelUnsupported(accountId: string, modelId: string): void {
+    const normalized = modelId?.trim()
+    if (!normalized) return
+    const existing = cleanupAntigravityUnsupportedCache(accountId)
+    const next = existing.size > 0 ? existing : new Map<string, number>()
+    next.set(normalized, Date.now() + ANTIGRAVITY_UNSUPPORTED_MODEL_TTL_MS)
+    antigravityUnsupportedModels.set(accountId, next)
+}
+
+export function isAntigravityModelSupportedForAccount(accountId: string, modelId: string): boolean | undefined {
+    const normalized = modelId?.trim()
+    if (!normalized) return undefined
+
+    const unsupported = cleanupAntigravityUnsupportedCache(accountId)
+    if (unsupported.has(normalized)) {
+        return false
+    }
+
+    const mapped = getAntigravityModelName(normalized)
+    if (unsupported.has(mapped)) {
+        return false
+    }
+
+    const cachedModels = getCachedAntigravityModelsForAccount(accountId) || getDynamicAntigravityModelIdsForAccount(accountId)
+    if (!cachedModels || cachedModels.length === 0) {
+        return undefined
+    }
+
+    const cleanCached = cachedModels.filter(m => !m.endsWith("-disabled"))
+    if (cleanCached.length === 0) {
+        return false
+    }
+
+    if (cleanCached.includes(normalized) || cleanCached.includes(mapped)) {
+        return true
+    }
+
+    const targetParsed = parseModelId(normalized) || parseModelId(mapped)
+    if (targetParsed) {
+        const hasFamilyMatch = cleanCached.some(m => {
+            const p = parseModelId(m)
+            if (!p) return false
+            return p.family === targetParsed.family && compareVersions(p.version, targetParsed.version) === 0
+        })
+        return hasFamilyMatch
+    }
+
+    return false
 }
 
 export interface ChatRequest {
@@ -195,8 +264,9 @@ export interface ChatRequest {
 }
 
 export interface ContentBlock {
-    type: "text" | "tool_use"
+    type: "text" | "tool_use" | "thinking"
     text?: string
+    thinking?: string
     id?: string
     name?: string
     input?: any
@@ -205,7 +275,8 @@ export interface ContentBlock {
 export interface ChatResponse {
     contentBlocks: ContentBlock[]
     stopReason: string | null
-    usage?: { inputTokens: number; outputTokens: number }
+    // inputTokens = uncached input (Anthropic semantics); cacheReadTokens = tokens served from prompt cache
+    usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number }
 }
 
 function generateStableSessionId(messages: ClaudeMessage[]): string {
@@ -219,6 +290,92 @@ function generateStableSessionId(messages: ClaudeMessage[]): string {
         return "-" + (Math.abs(hash) * 1000000000000).toString()
     }
     return "-" + Math.floor(Math.random() * 9e18).toString()
+}
+
+export function computeSessionKey(messages: ClaudeMessage[]): string {
+    for (const msg of messages) {
+        const text = extractTextContent(msg.content)?.trim()
+        if (text && text.length > 3) {
+            let hash = 5381
+            const len = Math.min(text.length, 300)
+            for (let i = 0; i < len; i++) {
+                hash = ((hash << 5) + hash) + text.charCodeAt(i)
+            }
+            return `ag_sess_${Math.abs(hash)}`
+        }
+    }
+    return `ag_sess_${Date.now()}`
+}
+
+/**
+ * 🆕 Prompt Cache Estimator:
+ * Re-uses the existing computeSessionKey to track conversational prefixes.
+ * Google Cloud Code (Antigravity) uses Gemini/Claude infrastructure with:
+ *   - Minimum threshold: 1024 tokens
+ *   - Cache TTL: 5 minutes (300_000 ms)
+ * When upstream reports 0 cached tokens, we estimate the cached prefix if within TTL and >= 1024 tokens.
+ */
+interface CacheSessionRecord {
+    lastSeen: number
+    promptTokens: number
+    model: string
+}
+
+const CACHE_MIN_TOKENS = 1024
+const CACHE_TTL_MS = 5 * 60 * 1000 // 5 minutes (TTL matching official Gemini/Anthropic caching)
+const CACHE_MAX_ENTRIES = 500 // Bound memory usage strictly
+
+const sessionCacheMap = new Map<string, CacheSessionRecord>()
+
+function cleanupExpiredCacheSessions(now: number = Date.now()): void {
+    for (const [key, record] of sessionCacheMap.entries()) {
+        if (now - record.lastSeen > CACHE_TTL_MS) {
+            sessionCacheMap.delete(key)
+        }
+    }
+}
+
+// Periodic cleanup every 2 minutes unref'd so it doesn't block process exit
+const cacheCleanupTimer = setInterval(() => {
+    cleanupExpiredCacheSessions()
+}, 2 * 60 * 1000)
+if (cacheCleanupTimer && typeof cacheCleanupTimer.unref === "function") {
+    cacheCleanupTimer.unref()
+}
+
+export function estimatePromptCache(sessionKey: string, promptTokens: number, model: string): number {
+    if (!sessionKey || promptTokens < CACHE_MIN_TOKENS) {
+        return 0
+    }
+
+    const now = Date.now()
+    cleanupExpiredCacheSessions(now)
+
+    const existing = sessionCacheMap.get(sessionKey)
+    let estimatedCached = 0
+
+    if (existing && existing.model === model && (now - existing.lastSeen) <= CACHE_TTL_MS) {
+        if (existing.promptTokens >= CACHE_MIN_TOKENS && promptTokens >= existing.promptTokens) {
+            // The previous turn's entire prompt was cached and forms the prefix of the current prompt
+            estimatedCached = existing.promptTokens
+        }
+    }
+
+    // Strict capacity enforcement (LRU eviction if at capacity)
+    if (sessionCacheMap.size >= CACHE_MAX_ENTRIES && !sessionCacheMap.has(sessionKey)) {
+        const oldestKey = sessionCacheMap.keys().next().value
+        if (oldestKey) sessionCacheMap.delete(oldestKey)
+    }
+
+    // Refresh record with current timestamp (re-insert for LRU order)
+    sessionCacheMap.delete(sessionKey)
+    sessionCacheMap.set(sessionKey, {
+        lastSeen: now,
+        promptTokens,
+        model,
+    })
+
+    return estimatedCached
 }
 
 function extractTextContent(content: any): string {
@@ -273,10 +430,151 @@ function parseFunctionCallArgs(args: unknown): any {
     return args
 }
 
+interface ThoughtSignatureEntry {
+    signature: string
+    timestamp: number
+}
+
+const THOUGHT_SIGNATURE_CACHE_MAX = 2000
+const THOUGHT_SIGNATURE_CACHE_TTL_MS = 2 * 60 * 60 * 1000 // 2 hours
+
+class ThoughtSignatureCache {
+    private cache = new Map<string, ThoughtSignatureEntry>()
+    private loaded = false
+    private saveTimeout: ReturnType<typeof setTimeout> | null = null
+
+    private getCacheFile(): string {
+        return join(getDataDir(), "thought-signatures.json")
+    }
+
+    private loadFromDisk() {
+        if (this.loaded) return
+        this.loaded = true
+        try {
+            const file = this.getCacheFile()
+            if (existsSync(file)) {
+                const data = JSON.parse(readFileSync(file, "utf-8"))
+                if (data && typeof data === "object") {
+                    const now = Date.now()
+                    for (const [key, entry] of Object.entries(data)) {
+                        if (
+                            entry &&
+                            typeof entry === "object" &&
+                            typeof (entry as any).signature === "string" &&
+                            typeof (entry as any).timestamp === "number" &&
+                            now - (entry as any).timestamp <= THOUGHT_SIGNATURE_CACHE_TTL_MS
+                        ) {
+                            this.cache.set(key, entry as ThoughtSignatureEntry)
+                        }
+                    }
+                }
+            }
+        } catch {
+            // Ignore cache read failures
+        }
+    }
+
+    private scheduleSave() {
+        if (this.saveTimeout) return
+        this.saveTimeout = setTimeout(() => {
+            this.saveTimeout = null
+            this.saveToDisk()
+        }, 1000)
+        this.saveTimeout.unref?.()
+    }
+
+    private saveToDisk() {
+        try {
+            ensureDataDir()
+            const file = this.getCacheFile()
+            const obj: Record<string, ThoughtSignatureEntry> = {}
+            const now = Date.now()
+            for (const [k, v] of this.cache.entries()) {
+                if (now - v.timestamp <= THOUGHT_SIGNATURE_CACHE_TTL_MS) {
+                    obj[k] = v
+                }
+            }
+            writeFileSync(file, JSON.stringify(obj))
+        } catch {
+            // Non-critical persistence failure
+        }
+    }
+
+    set(key: string, signature: string) {
+        if (!key || !signature) return
+        this.loadFromDisk()
+        if (this.cache.size >= THOUGHT_SIGNATURE_CACHE_MAX) {
+            const firstKey = this.cache.keys().next().value
+            if (firstKey) this.cache.delete(firstKey)
+        }
+        this.cache.set(key, { signature, timestamp: Date.now() })
+        this.scheduleSave()
+    }
+
+    get(key: string): string | undefined {
+        if (!key) return undefined
+        this.loadFromDisk()
+        const entry = this.cache.get(key)
+        if (!entry) return undefined
+        if (Date.now() - entry.timestamp > THOUGHT_SIGNATURE_CACHE_TTL_MS) {
+            this.cache.delete(key)
+            return undefined
+        }
+        return entry.signature
+    }
+
+    clear() {
+        this.cache.clear()
+        if (this.saveTimeout) {
+            clearTimeout(this.saveTimeout)
+            this.saveTimeout = null
+        }
+        try {
+            const file = this.getCacheFile()
+            if (existsSync(file)) {
+                rmSync(file, { force: true })
+            }
+        } catch {}
+    }
+}
+
+export const thoughtSignatureCache = new ThoughtSignatureCache()
+
+function sortKeysDeep(obj: any): any {
+    if (Array.isArray(obj)) return obj.map(sortKeysDeep)
+    if (obj !== null && typeof obj === "object") {
+        return Object.keys(obj)
+            .sort()
+            .reduce((acc: any, key) => {
+                acc[key] = sortKeysDeep(obj[key])
+                return acc
+            }, {})
+    }
+    return obj
+}
+
+export function getToolSignatureKey(name: string, args: unknown): string {
+    let parsed = args
+    if (typeof args === "string") {
+        try {
+            parsed = JSON.parse(args)
+        } catch {
+            parsed = args
+        }
+    }
+    const normalized = parsed != null && typeof parsed === "object" ? JSON.stringify(sortKeysDeep(parsed)) : String(parsed ?? "")
+    return `${name}:${normalized}`
+}
+
+function isGeminiModel(model?: string): boolean {
+    if (!model) return true
+    return /gemini|argon/i.test(model)
+}
+
 export async function buildAntigravityParts(
     content: ClaudeMessage["content"],
     toolIdToName: Map<string, string>,
-    options: { signal?: AbortSignal; imageBudget?: ImageInputBudget } = {},
+    options: { signal?: AbortSignal; imageBudget?: ImageInputBudget; model?: string } = {},
 ): Promise<any[]> {
     const imageBudget = options.imageBudget ?? createImageInputBudget([{ role: "user", content }])
     if (typeof content === "string") {
@@ -325,17 +623,58 @@ export async function buildAntigravityParts(
             continue
         }
 
+        if (block.source?.type === "base64" && (block.type === "audio" || (block.type === "document" && block.source.media_type.startsWith("audio/")))) {
+            parts.push({
+                inlineData: {
+                    mimeType: block.source.media_type,
+                    data: block.source.data,
+                },
+            })
+            continue
+        }
+
+        if (block.type === "audio" && block.source?.type === "url") {
+            const audio = await fetchRemoteAudioAsBase64(block.source.url, {
+                signal: options.signal,
+            })
+            parts.push({
+                inlineData: {
+                    mimeType: audio.media_type,
+                    data: audio.data,
+                },
+            })
+            continue
+        }
+
         if (block.type === "tool_use") {
             const toolId = block.id || generateToolUseId()
             const toolName = block.name || toolId
             toolIdToName.set(toolId, toolName)
-            parts.push({
+
+            let signature = (block as any).thoughtSignature
+                || (block as any).thought_signature
+                || thoughtSignatureCache.get(toolId)
+                || thoughtSignatureCache.get(getToolSignatureKey(toolName, block.input))
+                || thoughtSignatureCache.get(`latest:${toolName}`)
+
+            // For Antigravity models, Google strictly requires a thought_signature in functionCall parts.
+            // If the client or cache dropped the signature (e.g. restart, new session, or standard OpenAI/VS Code client),
+            // use Google's official bypass sentinel to prevent a 400 rejection.
+            if (!signature) {
+                signature = "skip_thought_signature_validator"
+            }
+
+            const part: any = {
                 functionCall: {
                     name: toolName,
                     args: block.input || {},
                     id: toolId,
                 },
-            })
+            }
+            if (signature) {
+                part.thoughtSignature = signature
+            }
+            parts.push(part)
             continue
         }
 
@@ -354,17 +693,6 @@ export async function buildAntigravityParts(
     }
 
     return parts.length > 0 ? parts : [{ text: "[No text]" }]
-}
-
-function cleanJsonSchema(schema: any): any {
-    if (!schema || typeof schema !== "object") return schema
-    const result: any = {}
-    for (const [key, value] of Object.entries(schema)) {
-        if (key.startsWith("\$") || key === "additionalProperties") continue
-        if (typeof value === "object") result[key] = cleanJsonSchema(value)
-        else result[key] = value
-    }
-    return result
 }
 
 function normalizeToolParameters(schema: unknown): any {
@@ -435,7 +763,7 @@ You are pair programming with a USER to solve their coding task. The task may re
 
 function buildFunctionCallingConfig(toolChoice?: ChatRequest["toolChoice"]): any {
     if (!toolChoice) {
-        return { mode: "VALIDATED" }
+        return { mode: "AUTO" }
     }
 
     switch (toolChoice.type) {
@@ -450,12 +778,17 @@ function buildFunctionCallingConfig(toolChoice?: ChatRequest["toolChoice"]): any
             }
         case "auto":
         default:
-            return { mode: "VALIDATED" }
+            return { mode: "AUTO" }
     }
 }
 
+
 function isGemini31Model(model: string): boolean {
-    return /^gemini-3\.1-/i.test(model) || model === "gemini-pro-agent"
+    return /^gemini-3\./i.test(model) ||
+           model === "gemini-pro-agent" ||
+           /^gemini-3-/i.test(model) ||
+           /^gemini-4/i.test(model) ||
+           model.includes("argon")
 }
 
 /** Keep generation settings within the limits accepted by each native model family. */
@@ -463,13 +796,7 @@ export function buildGenerationConfig(model: string, maxTokens?: number): Record
     const modelLimit = isGemini31Model(model) ? 65536 : 64000
     const requested = Number.isFinite(maxTokens) ? Math.floor(maxTokens as number) : modelLimit
     const maxOutputTokens = Math.max(1, Math.min(requested, modelLimit))
-    if (isGemini31Model(model)) {
-        return { maxOutputTokens }
-    }
-    return {
-        maxOutputTokens,
-        stopSequences: ["\n\nHuman:", "[DONE]"],
-    }
+    return { maxOutputTokens }
 }
 
 export async function claudeToAntigravity(
@@ -486,7 +813,7 @@ export async function claudeToAntigravity(
     for (const msg of messages) {
         contents.push({
             role: msg.role === "assistant" ? "model" : msg.role,
-            parts: await buildAntigravityParts(msg.content, toolIdToName, { signal, imageBudget }),
+            parts: await buildAntigravityParts(msg.content, toolIdToName, { signal, imageBudget, model }),
         })
     }
 
@@ -500,15 +827,8 @@ export async function claudeToAntigravity(
         generationConfig: buildGenerationConfig(model, maxTokens),
     }
 
-    // Gemini 3.1 uses the native safety policy. Sending the legacy OFF enum
-    // causes INVALID_ARGUMENT on current Antigravity endpoints.
-    if (!isGemini31Model(model)) innerRequest.safetySettings = buildSafetySettings()
-
-    if (model.includes("claude")) {
+    if (tools && tools.length > 0) {
         innerRequest.toolConfig = { functionCallingConfig: buildFunctionCallingConfig(toolChoice) }
-    }
-
-    if (tools && tools.length > 0 && model.includes("claude")) {
         innerRequest.tools = tools.map(tool => ({
             functionDeclarations: [{
                 name: tool.name,
@@ -517,6 +837,7 @@ export async function claudeToAntigravity(
             }]
         }))
     }
+
 
     return {
         model,
@@ -528,7 +849,19 @@ export async function claudeToAntigravity(
     }
 }
 
-function parseApiResponse(rawResponse: string): ChatResponse {
+function mapGoogleFinishReason(reason?: string, hasToolUse = false): string {
+    if (hasToolUse) return "tool_use"
+    if (!reason) return "end_turn"
+    const upper = reason.toUpperCase()
+    if (upper === "STOP") return "end_turn"
+    if (upper === "MAX_TOKENS") return "max_tokens"
+    if (upper === "SAFETY" || upper === "BLOCKLIST" || upper === "PROHIBITED_CONTENT" || upper === "SPII" || upper === "RECITATION") {
+        return "content_filter"
+    }
+    return "end_turn"
+}
+
+export function parseApiResponse(rawResponse: string, sessionKey?: string, model?: string): ChatResponse {
     let chunks: any[] = []
     const trimmed = rawResponse.trim()
     if (trimmed.startsWith("[")) chunks = JSON.parse(trimmed)
@@ -540,10 +873,37 @@ function parseApiResponse(rawResponse: string): ChatResponse {
 
     const contentBlocks: ContentBlock[] = []
     let hasToolUse = false
+    let latestThoughtSignature: string | undefined
+    let latestFinishReason: string | undefined
+    let blockReason: string | undefined
 
     for (const chunk of chunks) {
-        const parts = chunk.response?.candidates?.[0]?.content?.parts || []
+        const resp = chunk.response || chunk
+        if (resp?.promptFeedback?.blockReason) {
+            blockReason = resp.promptFeedback.blockReason
+        }
+        const candidate = resp?.candidates?.[0]
+        const candSig = candidate?.thoughtSignature || candidate?.thought_signature
+        if (candSig) latestThoughtSignature = candSig
+        if (candidate?.finishReason || candidate?.finish_reason) {
+            latestFinishReason = candidate.finishReason || candidate.finish_reason
+        }
+
+        const parts = candidate?.content?.parts || []
         for (const part of parts) {
+            const partSig = part.thoughtSignature || part.thought_signature || part.functionCall?.thoughtSignature || part.functionCall?.thought_signature
+            if (partSig) latestThoughtSignature = partSig
+
+            const isThought = Boolean(part.thought) || (typeof part.thought === "string" && part.thought.length > 0)
+            const thoughtText = typeof part.thought === "string" ? part.thought : (isThought ? (part.text || "") : "")
+
+            if (isThought && thoughtText) {
+                const last = contentBlocks[contentBlocks.length - 1]
+                if (last?.type === "thinking") last.thinking = (last.thinking || "") + thoughtText
+                else contentBlocks.push({ type: "thinking", thinking: thoughtText })
+                continue
+            }
+
             if (part.text) {
                 const last = contentBlocks[contentBlocks.length - 1]
                 if (last?.type === "text") last.text = (last.text || "") + part.text
@@ -552,23 +912,69 @@ function parseApiResponse(rawResponse: string): ChatResponse {
             if (part.functionCall) {
                 hasToolUse = true
                 const input = parseFunctionCallArgs(part.functionCall.args)
-                contentBlocks.push({
+                const toolId = part.functionCall.id || generateToolUseId()
+                const signature = partSig || latestThoughtSignature
+                if (signature) {
+                    thoughtSignatureCache.set(toolId, signature)
+                    thoughtSignatureCache.set(getToolSignatureKey(part.functionCall.name, input), signature)
+                    thoughtSignatureCache.set(`latest:${part.functionCall.name}`, signature)
+                    thoughtSignatureCache.set("latest", signature)
+                }
+                const block: any = {
                     type: "tool_use",
-                    id: part.functionCall.id || generateToolUseId(),
+                    id: toolId,
                     name: part.functionCall.name,
                     input,
-                })
+                }
+                if (signature) {
+                    block.thought_signature = signature
+                    block.thoughtSignature = signature
+                }
+                contentBlocks.push(block)
             }
         }
     }
 
-    if (contentBlocks.length === 0) contentBlocks.push({ type: "text", text: "" })
+    if (blockReason) {
+        throw new UpstreamError(
+            "antigravity",
+            400,
+            `Prompt blocked by upstream safety policy: ${blockReason}`
+        )
+    }
+
+    const stopReason = mapGoogleFinishReason(latestFinishReason, hasToolUse)
+
+    if (contentBlocks.length === 0 && !hasToolUse) {
+        if (stopReason === "content_filter") {
+            contentBlocks.push({ type: "text", text: "Response filtered by upstream content policy." })
+        } else if (stopReason === "max_tokens") {
+            contentBlocks.push({ type: "text", text: "" })
+        } else {
+            throw new UpstreamError(
+                "antigravity",
+                502,
+                latestFinishReason
+                    ? `Upstream model ended with finishReason: ${latestFinishReason} without generating content`
+                    : "Upstream model returned empty response without content"
+            )
+        }
+    }
 
     const usage = lastChunk.response.usageMetadata || lastChunk.usageMetadata
+    const promptTokens = usage?.promptTokenCount || 0
+    let cachedTokens = Math.min(usage?.cachedContentTokenCount || 0, promptTokens)
+    if (cachedTokens === 0 && sessionKey && model) {
+        cachedTokens = estimatePromptCache(sessionKey, promptTokens, model)
+    }
     return {
         contentBlocks,
-        stopReason: hasToolUse ? "tool_use" : "end_turn",
-        usage: { inputTokens: usage?.promptTokenCount || 0, outputTokens: (usage?.candidatesTokenCount || 0) + (usage?.thoughtsTokenCount || 0) },
+        stopReason,
+        usage: {
+            inputTokens: promptTokens - cachedTokens,
+            outputTokens: (usage?.candidatesTokenCount || 0) + (usage?.thoughtsTokenCount || 0),
+            cacheReadTokens: cachedTokens,
+        },
     }
 }
 
@@ -638,7 +1044,8 @@ async function sendRequestSse(
     accountId?: string,
     allowRotation: boolean = true,
     modelName?: string,
-    routeTag?: string
+    routeTag?: string,
+    sessionKey?: string
 ): Promise<string> {
     const startTime = Date.now()
     let lastError: Error | null = null
@@ -659,6 +1066,8 @@ async function sendRequestSse(
         // 锁已在 handler.ts HTTP 层获取，这里不需要
         for (const baseUrl of ANTIGRAVITY_BASE_URLS) {
             const url = baseUrl + endpoint + "?alt=sse"
+            const currentAccount = currentAccountId ? accountManager.getAccount(currentAccountId) : undefined
+            const accountProxy = currentAccount?.proxy
             try {
                 const response = await fetchWithTimeout(url, {
                     method: "POST",
@@ -669,6 +1078,7 @@ async function sendRequestSse(
                         "Accept": "text/event-stream",
                     },
                     body: JSON.stringify(antigravityRequest),
+                    proxy: accountProxy,
                 }, FETCH_TIMEOUT_MS)
 
                 if (response.ok) {
@@ -744,7 +1154,8 @@ async function sendRequestSse(
                         }
 
                         if (allowRotation && accountManager.count() > 1) {
-                            const next = await accountManager.getNextAvailableAccount(true)
+                            const isEligible = modelName ? (id: string) => isAntigravityModelSupportedForAccount(id, modelName) !== false : undefined
+                            const next = await accountManager.getNextAvailableAccount(true, sessionKey, isEligible, modelName)
                             if (next && next.accountId !== currentAccountId) {
                                 currentAccessToken = next.accessToken
                                 currentAccountId = next.accountId
@@ -759,7 +1170,8 @@ async function sendRequestSse(
                         const cooldownMs = Math.max(boundedDelayMs, NON_QUOTA_429_COOLDOWN_MS)
                         accountManager.markRateLimited(currentAccountId, cooldownMs)
                         if (allowRotation && accountManager.count() > 1) {
-                            const next = await accountManager.getNextAvailableAccount(true)
+                            const isEligible = modelName ? (id: string) => isAntigravityModelSupportedForAccount(id, modelName) !== false : undefined
+                            const next = await accountManager.getNextAvailableAccount(true, sessionKey, isEligible, modelName)
                             if (next && next.accountId !== currentAccountId) {
                                 currentAccessToken = next.accessToken
                                 currentAccountId = next.accountId
@@ -792,7 +1204,8 @@ async function sendRequestSse(
                     }
                     // If refresh failed, try next account
                     if (allowRotation && accountManager.count() > 1) {
-                        const next = await accountManager.getNextAvailableAccount(true)
+                        const isEligible = modelName ? (id: string) => isAntigravityModelSupportedForAccount(id, modelName) !== false : undefined
+                        const next = await accountManager.getNextAvailableAccount(true, sessionKey, isEligible, modelName)
                         if (next && next.accountId !== currentAccountId) {
                             currentAccessToken = next.accessToken
                             currentAccountId = next.accountId
@@ -879,7 +1292,8 @@ async function* sendRequestSseStreaming(
     allowRotation: boolean = true,
     modelName?: string,
     routeTag?: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    sessionKey?: string
 ): AsyncGenerator<string, void, unknown> {
     const startTime = Date.now()
     const IDLE_TIMEOUT_MS = 900000  // 超过 15 分钟无数据则中断
@@ -917,6 +1331,9 @@ async function* sendRequestSseStreaming(
                 else signal.addEventListener("abort", abortListener, { once: true })
             }
 
+            const currentAccount = currentAccountId ? accountManager.getAccount(currentAccountId) : undefined
+            const accountProxy = currentAccount?.proxy
+
             try {
                 const response = await fetchWithTimeout(url, {
                     method: "POST",
@@ -928,6 +1345,7 @@ async function* sendRequestSseStreaming(
                     },
                     body: JSON.stringify(antigravityRequest),
                     signal: idleController.signal,
+                    proxy: accountProxy,
                 }, FETCH_TIMEOUT_MS)
 
                 if (!response.ok) {
@@ -963,7 +1381,8 @@ async function* sendRequestSseStreaming(
                         const cooldownMs = Math.max(waitMs, NON_QUOTA_429_COOLDOWN_MS)
                         accountManager.markRateLimited(currentAccountId, cooldownMs)
                         if (allowRotation && accountManager.count() > 1) {
-                            const next = await accountManager.getNextAvailableAccount(true)
+                            const isEligible = modelName ? (id: string) => isAntigravityModelSupportedForAccount(id, modelName) !== false : undefined
+                            const next = await accountManager.getNextAvailableAccount(true, sessionKey, isEligible, modelName)
                             if (next && next.accountId !== currentAccountId) {
                                 currentAccessToken = next.accessToken
                                 currentAccountId = next.accountId
@@ -1155,19 +1574,22 @@ function extractSseEventData(event: string): string | null {
     return dataLines.join("\n")
 }
 
-export async function createChatCompletion(request: ChatRequest): Promise<ChatResponse> {
-    return createChatCompletionWithOptions(request)
-}
-
-export async function createChatCompletionWithOptions(
-    request: ChatRequest,
-    options: { accountId?: string; allowRotation?: boolean; routeTag?: string } = {}
-): Promise<ChatResponse> {
+async function resolveAntigravityAccount(
+    modelName: string,
+    sessionKey: string,
+    options: { accountId?: string; routeTag?: string },
+    messages?: unknown
+): Promise<{
+    accessToken: string
+    accountId?: string
+    projectId?: string
+    accountEmail?: string
+    releaseAccountLock: (() => void) | null
+}> {
     let accessToken: string
     let accountId: string | undefined
     let projectId: string | undefined
     let accountEmail: string | undefined
-    let releaseAccountLock: (() => void) | null = null
 
     if (options.accountId) {
         const account = await accountManager.getAccountById(options.accountId)
@@ -1179,7 +1601,8 @@ export async function createChatCompletionWithOptions(
         projectId = account.projectId
         accountEmail = account.email
     } else {
-        const account = await accountManager.getNextAvailableAccount()
+        const isEligible = (id: string) => isAntigravityModelSupportedForAccount(id, modelName) !== false
+        const account = await accountManager.getNextAvailableAccount(false, sessionKey, isEligible, modelName, messages)
         if (account) {
             accessToken = account.accessToken
             accountId = account.accountId
@@ -1192,21 +1615,54 @@ export async function createChatCompletionWithOptions(
         }
     }
 
-    setRequestLogContext({ model: request.model, provider: "antigravity", account: accountEmail, routeTag: options.routeTag })
+    const releaseAccountLock = accountId ? await accountManager.acquireAccountLock(accountId) : null
+    return { accessToken, accountId, projectId, accountEmail, releaseAccountLock }
+}
 
+function recordAntigravityUsage(
+    accountId: string | undefined,
+    modelName: string,
+    uncachedInputTokens: number,
+    outputTokens: number,
+    cacheReadTokens: number = 0
+): void {
+    if (uncachedInputTokens <= 0 && outputTokens <= 0 && cacheReadTokens <= 0) return
+    const actualModelId = getAntigravityModelName(modelName)
     if (accountId) {
-        releaseAccountLock = await accountManager.acquireAccountLock(accountId)
+        accountManager.recordAccountUsage(accountId, uncachedInputTokens, outputTokens, cacheReadTokens, actualModelId)
     }
+    import("~/services/usage-tracker").then(({ recordUsage }) => {
+        recordUsage(actualModelId, uncachedInputTokens, outputTokens, cacheReadTokens)
+    }).catch(() => { })
+}
+
+export async function createChatCompletion(request: ChatRequest): Promise<ChatResponse> {
+    return createChatCompletionWithOptions(request)
+}
+
+export async function createChatCompletionWithOptions(
+    request: ChatRequest,
+    options: { accountId?: string; allowRotation?: boolean; routeTag?: string } = {}
+): Promise<ChatResponse> {
+    const sessionKey = computeSessionKey(request.messages)
+    const { accessToken, accountId, projectId, accountEmail, releaseAccountLock } = await resolveAntigravityAccount(
+        request.model,
+        sessionKey,
+        options,
+        request.messages
+    )
+
+    setRequestLogContext({ model: request.model, provider: "antigravity", account: accountEmail, routeTag: options.routeTag })
 
     try {
         const antigravityRequest = await claudeToAntigravity(
-        getAntigravityModelName(request.model),
-        request.messages,
-        request.tools,
-        request.toolChoice,
-        request.maxTokens,
-        request.signal,
-    )
+            getAntigravityModelName(request.model),
+            request.messages,
+            request.tools,
+            request.toolChoice,
+            request.maxTokens,
+            request.signal,
+        )
 
         if (projectId) antigravityRequest.project = projectId
 
@@ -1217,22 +1673,17 @@ export async function createChatCompletionWithOptions(
             accountId,
             options.allowRotation ?? true,
             request.model,
-            options.routeTag
+            options.routeTag,
+            sessionKey
         )
         const sseChunks = collectSseChunks(rawSse)
         const rawResponse = sseChunks.length > 0 ? JSON.stringify(sseChunks) : rawSse
 
-        const result = parseApiResponse(rawResponse)
-
-        // Record usage (fire-and-forget) - use actual native model ID
-        const inputTokens = result.usage?.inputTokens || 0
+        const result = parseApiResponse(rawResponse, sessionKey, request.model)
+        const uncachedInputTokens = result.usage?.inputTokens || 0
+        const cacheReadTokens = result.usage?.cacheReadTokens || 0
         const outputTokens = result.usage?.outputTokens || 0
-        const actualModelId = getAntigravityModelName(request.model)
-        if (inputTokens > 0 || outputTokens > 0) {
-            import("~/services/usage-tracker").then(({ recordUsage }) => {
-                recordUsage(actualModelId, inputTokens, outputTokens)
-            }).catch(() => { })
-        }
+        recordAntigravityUsage(accountId, request.model, uncachedInputTokens, outputTokens, cacheReadTokens)
 
         return result
     } finally {
@@ -1248,38 +1699,13 @@ export async function* createChatCompletionStreamWithOptions(
     request: ChatRequest,
     options: { accountId?: string; allowRotation?: boolean; routeTag?: string } = {}
 ): AsyncGenerator<string, void, unknown> {
-    let accessToken: string
-    let accountId: string | undefined
-    let projectId: string | undefined
-    let accountEmail: string | undefined
-    let releaseAccountLock: (() => void) | null = null
-
-    if (options.accountId) {
-        const account = await accountManager.getAccountById(options.accountId)
-        if (!account) {
-            throw new UpstreamError("antigravity", 429, `Account unavailable: ${options.accountId}`)
-        }
-        accessToken = account.accessToken
-        accountId = account.accountId
-        projectId = account.projectId
-        accountEmail = account.email
-    } else {
-        const account = await accountManager.getNextAvailableAccount()
-        if (account) {
-            accessToken = account.accessToken
-            accountId = account.accountId
-            projectId = account.projectId
-            accountEmail = account.email
-        } else {
-            accessToken = await getAccessToken()
-            projectId = state.cloudaicompanionProject || undefined
-            accountEmail = state.userEmail || undefined
-        }
-    }
-
-    if (accountId) {
-        releaseAccountLock = await accountManager.acquireAccountLock(accountId)
-    }
+    const sessionKey = computeSessionKey(request.messages)
+    const { accessToken, accountId, projectId, releaseAccountLock } = await resolveAntigravityAccount(
+        request.model,
+        sessionKey,
+        options,
+        request.messages
+    )
 
     try {
         const antigravityRequest = await claudeToAntigravity(
@@ -1302,99 +1728,170 @@ export async function* createChatCompletionStreamWithOptions(
             options.allowRotation ?? true,
             request.model,
             options.routeTag,
-            request.signal
+            request.signal,
+            sessionKey
         )
 
         let blockIndex = 0
         let hasToolUse = false
         let outputTokens = 0
+        let streamInputTokens = 0
+        let streamCacheReadTokens = 0
         let textBlockStarted = false
+        let thinkingBlockStarted = false
+        let latestThoughtSignature: string | undefined
 
-    const messageStart = {
-        type: "message_start",
-        message: {
-            id: "msg_" + crypto.randomUUID().replace(/-/g, "").slice(0, 24),
-            type: "message",
-            role: "assistant",
-            content: [],
-            model: request.model,
-            stop_reason: null,
-            stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 0 }
-        }
-    }
-    yield "event: message_start\ndata: " + JSON.stringify(messageStart) + "\n\n"
+        yield buildMessageStart(request.model)
 
-    for await (const chunkStr of sseStream) {
-        // 解析 JSON 字符串
-        let chunk: any
-        try {
-            chunk = JSON.parse(chunkStr)
-        } catch {
-            continue
-        }
+        let latestFinishReason: string | undefined
 
-        // chunk 可能直接是响应，也可能包含 response 字段
-        const responseData = chunk.response || chunk
-        const parts = responseData?.candidates?.[0]?.content?.parts || []
-
-        for (const part of parts) {
-            if (part.text) {
-                // 只在第一次遇到文本时发送 block_start
-                if (!textBlockStarted) {
-                    yield "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":" + blockIndex + ",\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
-                    textBlockStarted = true
-                }
-                // 每个 text chunk 只发送 delta
-                const textDelta = { type: "content_block_delta", index: blockIndex, delta: { type: "text_delta", text: part.text } }
-                yield "event: content_block_delta\ndata: " + JSON.stringify(textDelta) + "\n\n"
+        for await (const chunkStr of sseStream) {
+            let chunk: any
+            try {
+                chunk = JSON.parse(chunkStr)
+            } catch {
+                continue
             }
-            if (part.functionCall) {
-                // 先关闭文本块（如果有）
-                if (textBlockStarted) {
-                    yield "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":" + blockIndex + "}\n\n"
-                    blockIndex++
-                    textBlockStarted = false
+
+            const responseData = chunk.response || chunk
+            if (responseData?.promptFeedback?.blockReason) {
+                throw new UpstreamError(
+                    "antigravity",
+                    400,
+                    `Prompt blocked by upstream safety policy: ${responseData.promptFeedback.blockReason}`
+                )
+            }
+            const candidate = responseData?.candidates?.[0]
+            const candSig = candidate?.thoughtSignature || candidate?.thought_signature
+            if (candSig) latestThoughtSignature = candSig
+            if (candidate?.finishReason || candidate?.finish_reason) {
+                latestFinishReason = candidate.finishReason || candidate.finish_reason
+            }
+
+            const parts = candidate?.content?.parts || []
+
+            for (const part of parts) {
+                const partSig = part.thoughtSignature || part.thought_signature || part.functionCall?.thoughtSignature || part.functionCall?.thought_signature
+                if (partSig) latestThoughtSignature = partSig
+
+                const isThought = Boolean(part.thought) || (typeof part.thought === "string" && part.thought.length > 0)
+                const thoughtText = typeof part.thought === "string" ? part.thought : (isThought ? (part.text || "") : "")
+
+                if (isThought && thoughtText) {
+                    if (textBlockStarted) {
+                        yield buildContentBlockStop(blockIndex)
+                        blockIndex++
+                        textBlockStarted = false
+                    }
+                    if (!thinkingBlockStarted) {
+                        yield buildContentBlockStart(blockIndex, "thinking")
+                        thinkingBlockStarted = true
+                    }
+                    yield buildThinkingDelta(blockIndex, thoughtText)
+                    continue
                 }
 
-                hasToolUse = true
-                const toolStart = { type: "content_block_start", index: blockIndex, content_block: { type: "tool_use", id: part.functionCall.id || generateToolUseId(), name: part.functionCall.name, input: {} } }
-                yield "event: content_block_start\ndata: " + JSON.stringify(toolStart) + "\n\n"
-                if (part.functionCall.args) {
+                if (part.text) {
+                    if (thinkingBlockStarted) {
+                        yield buildContentBlockStop(blockIndex)
+                        blockIndex++
+                        thinkingBlockStarted = false
+                    }
+                    if (!textBlockStarted) {
+                        yield buildContentBlockStart(blockIndex, "text")
+                        textBlockStarted = true
+                    }
+                    yield buildTextDelta(blockIndex, part.text)
+                }
+                if (part.functionCall) {
+                    if (thinkingBlockStarted) {
+                        yield buildContentBlockStop(blockIndex)
+                        blockIndex++
+                        thinkingBlockStarted = false
+                    }
+                    if (textBlockStarted) {
+                        yield buildContentBlockStop(blockIndex)
+                        blockIndex++
+                        textBlockStarted = false
+                    }
+
+                    hasToolUse = true
+                    const toolId = part.functionCall.id || generateToolUseId()
                     const rawArgs = part.functionCall.args
-                    const partialJson = typeof rawArgs === "string" ? rawArgs : (JSON.stringify(rawArgs) || "{}")
-                    const inputDelta = { type: "content_block_delta", index: blockIndex, delta: { type: "input_json_delta", partial_json: partialJson } }
-                    yield "event: content_block_delta\ndata: " + JSON.stringify(inputDelta) + "\n\n"
+                    const parsedArgs = parseFunctionCallArgs(rawArgs)
+                    const signature = partSig || latestThoughtSignature
+
+                    if (signature) {
+                        thoughtSignatureCache.set(toolId, signature)
+                        thoughtSignatureCache.set(getToolSignatureKey(part.functionCall.name, parsedArgs), signature)
+                        thoughtSignatureCache.set(`latest:${part.functionCall.name}`, signature)
+                        thoughtSignatureCache.set("latest", signature)
+                    }
+
+                    yield buildContentBlockStart(blockIndex, "tool_use", {
+                        id: toolId,
+                        name: part.functionCall.name,
+                        thoughtSignature: signature,
+                    })
+                    if (rawArgs) {
+                        const partialJson = typeof rawArgs === "string" ? rawArgs : (JSON.stringify(rawArgs) || "{}")
+                        yield buildInputJsonDelta(blockIndex, partialJson)
+                    }
+                    yield buildContentBlockStop(blockIndex)
+                    blockIndex++
                 }
-                yield "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":" + blockIndex + "}\n\n"
-                blockIndex++
             }
-        }
 
             const usage = responseData?.usageMetadata
-            if (usage) outputTokens = (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0)
+            if (usage) {
+                outputTokens = (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0)
+                const promptTokens = usage.promptTokenCount || 0
+                let cached = Math.min(usage.cachedContentTokenCount || 0, promptTokens)
+                if (cached === 0 && sessionKey && request.model) {
+                    cached = estimatePromptCache(sessionKey, promptTokens, request.model)
+                }
+                streamCacheReadTokens = cached
+                streamInputTokens = promptTokens - cached
+            }
         }
 
-        // 关闭最后的文本块（如果有）
+        if (thinkingBlockStarted) {
+            yield buildContentBlockStop(blockIndex)
+        }
         if (textBlockStarted) {
-            yield "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":" + blockIndex + "}\n\n"
+            yield buildContentBlockStop(blockIndex)
         }
 
-    if (!hasToolUse && request.toolChoice?.type === "tool") {
-        consola.warn(`Tool choice "${request.toolChoice.name || "unknown"}" requested but no tool_use returned`)
-    }
-    const stopReason = hasToolUse ? "tool_use" : "end_turn"
-        const messageDelta = { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } }
-        yield "event: message_delta\ndata: " + JSON.stringify(messageDelta) + "\n\n"
-        yield "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
-
-        // Record usage (fire-and-forget) - use actual native model ID
-        const actualModelId = getAntigravityModelName(request.model)
-        if (outputTokens > 0) {
-            import("~/services/usage-tracker").then(({ recordUsage }) => {
-                recordUsage(actualModelId, 0, outputTokens)
-            }).catch(() => { })
+        if (!hasToolUse && request.toolChoice?.type === "tool") {
+            consola.warn(`Tool choice "${request.toolChoice.name || "unknown"}" requested but no tool_use returned`)
         }
+        const stopReason = mapGoogleFinishReason(latestFinishReason, hasToolUse)
+        if (!textBlockStarted && !hasToolUse) {
+            if (stopReason === "content_filter") {
+                yield buildContentBlockStart(blockIndex, "text")
+                yield buildTextDelta(blockIndex, "Response filtered by upstream content policy.")
+                yield buildContentBlockStop(blockIndex)
+            } else if (stopReason === "max_tokens") {
+                yield buildContentBlockStart(blockIndex, "text")
+                yield buildContentBlockStop(blockIndex)
+            } else {
+                throw new UpstreamError(
+                    "antigravity",
+                    502,
+                    latestFinishReason
+                        ? `Upstream model ended with finishReason: ${latestFinishReason} without generating content`
+                        : "Upstream model returned empty response without content"
+                )
+            }
+        }
+        yield buildMessageDelta(stopReason, {
+            inputTokens: streamInputTokens,
+            cacheReadTokens: streamCacheReadTokens,
+            outputTokens,
+        })
+        yield buildMessageStop()
+
+        recordAntigravityUsage(accountId, request.model, streamInputTokens, outputTokens, streamCacheReadTokens)
     } finally {
         if (releaseAccountLock) releaseAccountLock()
     }

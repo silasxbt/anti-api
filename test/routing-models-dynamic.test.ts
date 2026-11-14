@@ -7,15 +7,14 @@ afterEach(() => {
     clearDynamicKiroModels()
 })
 
-test("copilot models fall back to static list when dynamic list is empty", () => {
+test("copilot models are not hardcoded when dynamic list is empty", () => {
     clearDynamicCopilotModels()
     const models = getProviderModels("copilot")
 
-    expect(models.some(model => model.id === "gpt-4o")).toBe(true)
-    expect(models.some(model => model.id === "claude-opus-4-5-thinking")).toBe(true)
+    expect(models).toEqual([])
 })
 
-test("copilot models merge dynamic models before static fallback", () => {
+test("copilot models come only from the dynamic list", () => {
     setDynamicCopilotModels([
         { id: "gpt-5.2", label: "Copilot - GPT-5.2" },
         { id: "gpt-4o", label: "Copilot - GPT-4o Dynamic" },
@@ -27,6 +26,7 @@ test("copilot models merge dynamic models before static fallback", () => {
 
     expect(gpt52?.label).toBe("Copilot - GPT-5.2")
     expect(gpt4o?.label).toBe("Copilot - GPT-4o Dynamic")
+    expect(models.length).toBe(2)
 })
 
 test("dynamic copilot model options are sanitized and deduplicated", () => {
@@ -43,11 +43,11 @@ test("dynamic copilot model options are sanitized and deduplicated", () => {
     expect(matches[0].label).toBe("Copilot - GPT-5.2")
 })
 
-test("codex models fall back to static list when dynamic list is empty", () => {
+test("codex models are not hardcoded when dynamic list is empty", () => {
     clearDynamicCodexModels()
     const models = getProviderModels("codex")
 
-    expect(models.some(model => model.id === "gpt-5.3-codex")).toBe(true)
+    expect(models).toEqual([])
 })
 
 test("codex dynamic models override static list when available", () => {
@@ -60,12 +60,11 @@ test("codex dynamic models override static list when available", () => {
     expect(models.map(model => model.id)).toEqual(["gpt-5.3-codex", "gpt-5.2-codex"])
 })
 
-test("kiro models fall back to static list when dynamic list is empty", () => {
+test("kiro models are not hardcoded when dynamic list is empty", () => {
     clearDynamicKiroModels()
     const models = getProviderModels("kiro")
 
-    expect(models.some(model => model.id === "auto")).toBe(true)
-    expect(models.some(model => model.id === "claude-sonnet-4.6")).toBe(true)
+    expect(models).toEqual([])
 })
 
 test("kiro models merge dynamic models before static fallback", () => {

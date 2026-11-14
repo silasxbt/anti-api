@@ -10,8 +10,9 @@ export interface ClaudeMessage {
 }
 
 export interface ClaudeContentBlock {
-    type: "text" | "tool_use" | "tool_result" | "image"
+    type: "text" | "tool_use" | "tool_result" | "image" | "audio" | "document" | "thinking"
     text?: string
+    thinking?: string
     id?: string
     name?: string
     input?: any
@@ -34,6 +35,18 @@ export interface ClaudeTool {
 }
 
 // 响应内容块
+/** Token usage reported by a provider. `inputTokens` excludes prompt-cache hits (Anthropic semantics). */
+export interface CompletionUsage {
+    inputTokens: number
+    outputTokens: number
+    cacheReadTokens?: number
+}
+
+/** Prompt-cache hits for providers that report them (0 otherwise). */
+export function getCacheReadTokens(usage: Partial<CompletionUsage> | undefined): number {
+    return usage?.cacheReadTokens || 0
+}
+
 export interface ContentBlock {
     type: "text" | "tool_use"
     text?: string
@@ -82,10 +95,24 @@ export function buildMessageStart(model: string): string {
 /**
  * 构建 content_block_start 事件
  */
-export function buildContentBlockStart(index: number, type: "text" | "tool_use", toolInfo?: { id: string; name: string }): string {
+export function buildContentBlockStart(
+    index: number,
+    type: "text" | "tool_use" | "thinking",
+    toolInfo?: { id: string; name: string; thoughtSignature?: string }
+): string {
     let contentBlock: any = { type }
     if (type === "tool_use" && toolInfo) {
-        contentBlock = { type: "tool_use", id: toolInfo.id, name: toolInfo.name, input: {} }
+        contentBlock = {
+            type: "tool_use",
+            id: toolInfo.id,
+            name: toolInfo.name,
+            input: {},
+            ...(toolInfo.thoughtSignature
+                ? { thought_signature: toolInfo.thoughtSignature, thoughtSignature: toolInfo.thoughtSignature }
+                : {}),
+        }
+    } else if (type === "thinking") {
+        contentBlock = { type: "thinking", thinking: "" }
     } else {
         contentBlock = { type: "text", text: "" }
     }
@@ -96,6 +123,18 @@ export function buildContentBlockStart(index: number, type: "text" | "tool_use",
         content_block: contentBlock,
     }
     return `event: content_block_start\ndata: ${JSON.stringify(event)}\n\n`
+}
+
+/**
+ * 构建 content_block_delta 事件 (思考内容)
+ */
+export function buildThinkingDelta(index: number, thinking: string): string {
+    const event = {
+        type: "content_block_delta",
+        index,
+        delta: { type: "thinking_delta", thinking },
+    }
+    return `event: content_block_delta\ndata: ${JSON.stringify(event)}\n\n`
 }
 
 /**
@@ -133,11 +172,20 @@ export function buildContentBlockStop(index: number): string {
 /**
  * 构建 message_delta 事件
  */
-export function buildMessageDelta(stopReason: string, usage?: { inputTokens: number; outputTokens: number }): string {
+export function buildMessageDelta(
+    stopReason: string,
+    usage?: { inputTokens?: number; outputTokens: number; cacheReadTokens?: number }
+): string {
     const event = {
         type: "message_delta",
         delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: usage ? { output_tokens: usage.outputTokens } : undefined,
+        usage: usage
+            ? {
+                ...(usage.inputTokens !== undefined ? { input_tokens: usage.inputTokens } : {}),
+                ...(usage.cacheReadTokens !== undefined ? { cache_read_input_tokens: usage.cacheReadTokens } : {}),
+                output_tokens: usage.outputTokens,
+            }
+            : undefined,
     }
     return `event: message_delta\ndata: ${JSON.stringify(event)}\n\n`
 }
@@ -154,56 +202,4 @@ export function buildMessageStop(): string {
  */
 export function buildPing(): string {
     return `event: ping\ndata: {"type":"ping"}\n\n`
-}
-
-/**
- * 转换状态
- */
-export interface ConversionState {
-    messageId: string
-    currentBlockIndex: number
-    toolCallsAccumulator: Map<number, { id: string; name: string; input: string }>
-}
-
-export function createConversionState(): ConversionState {
-    return {
-        messageId: generateMessageId(),
-        currentBlockIndex: 0,
-        toolCallsAccumulator: new Map(),
-    }
-}
-
-/**
- * Claude 到 Antigravity 格式转换
- */
-export function claudeToAntigravity(messages: ClaudeMessage[], tools?: ClaudeTool[]): any {
-    return {
-        messages: messages.map(msg => ({
-            role: msg.role,
-            content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
-        })),
-        tools: tools?.map(t => ({
-            name: t.name,
-            description: t.description,
-            parameters: t.input_schema
-        }))
-    }
-}
-
-/**
- * Antigravity SSE 到 Claude SSE 格式转换
- */
-export function* antigravityToClaudeSSE(chunk: any, state: ConversionState): Generator<string> {
-    // 确保 chunk 是字符串
-    const chunkStr = typeof chunk === 'string' ? chunk : JSON.stringify(chunk)
-
-    // 简化实现 - 直接透传文本内容
-    if (chunkStr.includes('"text"')) {
-        try {
-            const match = chunkStr.match(/"text":"([^"]+)"/)
-            if (match) {
-                yield buildTextDelta(state.currentBlockIndex, match[1])
-            }
-        } catch (e) { }
-    }
 }

@@ -12,3 +12,7 @@ anti-api-v*/
 anti-api-test-bundle/
 packaging/winget/manifests/
 kiro-gateway/
+auth.json
+accounts.json
+antigravity-account.json
+extracted_accounts/

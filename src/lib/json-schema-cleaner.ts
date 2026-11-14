@@ -21,13 +21,15 @@ const VALIDATION_FIELDS = [
 
 // Fields to be completely removed
 const HARD_REMOVE_FIELDS = [
-    '$schema', '$id', 'additionalProperties', 'enumCaseInsensitive',
+    '$schema', '$id', '$comment', 'additionalProperties', 'enumCaseInsensitive',
     'enumNormalizeWhitespace', 'uniqueItems', 'default', 'const',
-    'examples', 'propertyNames', 'anyOf', 'oneOf', 'allOf', 'not',
+    'examples', 'example', 'propertyNames', 'anyOf', 'oneOf', 'allOf', 'not',
     'if', 'then', 'else', 'dependencies', 'dependentSchemas',
     'dependentRequired', 'cache_control', 'contentEncoding',
     'contentMediaType', 'deprecated', 'readOnly', 'writeOnly',
-    'format'  // Added - Gemini doesn't support format
+    'format',  // Added - Gemini doesn't support format
+    'enumDescriptions', 'markdownDescription', 'markdownEnumDescriptions',
+    'enumItemLabels', 'title'
 ]
 
 /**
@@ -119,7 +121,35 @@ function cleanJsonSchemaRecursive(value: any): void {
         cleanJsonSchemaRecursive(value[key])
     }
 
-    // 2. Migrate validation fields to description
+    // 2. Migrate markdownDescription / title if description is absent
+    if (!value.description && typeof value.markdownDescription === 'string' && value.markdownDescription.trim()) {
+        value.description = value.markdownDescription.trim()
+    } else if (!value.description && typeof value.title === 'string' && value.title.trim()) {
+        value.description = value.title.trim()
+    }
+
+    // 2b. Migrate enumDescriptions / markdownEnumDescriptions to description
+    const enumDescs = Array.isArray(value.enumDescriptions)
+        ? value.enumDescriptions
+        : Array.isArray(value.markdownEnumDescriptions)
+            ? value.markdownEnumDescriptions
+            : null
+    if (enumDescs && Array.isArray(value.enum)) {
+        const enumHelp: string[] = []
+        for (let i = 0; i < value.enum.length; i++) {
+            const val = value.enum[i]
+            const desc = enumDescs[i]
+            if (desc && typeof desc === 'string' && desc.trim()) {
+                enumHelp.push(`${val}: ${desc.trim()}`)
+            }
+        }
+        if (enumHelp.length > 0) {
+            const suffix = ` (Options: ${enumHelp.join('; ')})`
+            value.description = (value.description || '') + suffix
+        }
+    }
+
+    // 2c. Migrate validation fields to description
     const constraints: string[] = []
     for (const field of VALIDATION_FIELDS) {
         if (field in value) {

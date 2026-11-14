@@ -80,7 +80,9 @@ function resetTracking(resetCounts: boolean) {
     }
 }
 
+const realChat = await import("~/services/antigravity/chat")
 mock.module("~/services/antigravity/chat", () => ({
+    ...realChat,
     createChatCompletionWithOptions: async (_request: any, options: { accountId?: string }) => {
         const accountId = options?.accountId || "auto"
         callOrder.push(accountId)
@@ -129,7 +131,9 @@ mock.module("~/services/antigravity/account-manager", () => ({
     },
 }))
 
+const realConfig = await import("~/services/routing/config")
 mock.module("~/services/routing/config", () => ({
+    ...realConfig,
     loadRoutingConfig: () => routingConfig,
 }))
 

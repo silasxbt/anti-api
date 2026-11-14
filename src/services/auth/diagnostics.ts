@@ -5,7 +5,7 @@ import { createServer } from "node:net"
 import { join } from "path"
 import { getDataDir } from "~/lib/data-dir"
 import { authStore } from "./store"
-import type { AuthProvider } from "./types"
+import { AUTH_PROVIDERS, type AuthProvider } from "./types"
 import { getZedCredentialsStatus } from "~/services/zed/oauth"
 import { OAUTH_CONFIG } from "~/services/antigravity/oauth"
 
@@ -26,7 +26,7 @@ export interface DiagnosticReport {
     checks: DiagnosticCheck[]
 }
 
-const PROVIDERS: AuthProvider[] = ["antigravity", "codex", "copilot", "zed", "kiro", "grok"]
+const PROVIDERS: readonly AuthProvider[] = AUTH_PROVIDERS
 const COMMAND_TIMEOUT_MS = 6000
 const MAX_OUTPUT_LENGTH = 1000
 

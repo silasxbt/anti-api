@@ -248,6 +248,11 @@
             box-shadow: 0 0 14px rgba(71, 150, 227, 0.6);
         }
 
+        .argon-bar {
+            background: linear-gradient(90deg, #818cf8, #c084fc);
+            box-shadow: 0 0 14px rgba(192, 132, 252, 0.6);
+        }
+
         .codex-bar {
             background: linear-gradient(90deg, #e6e6e6, #bdbdbd);
             box-shadow: 0 0 10px rgba(255, 255, 255, 0.35);
@@ -328,17 +333,23 @@
             left: 22px;
             background: white;
         }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        @media (max-width: 640px) {
+            .tab-btn { padding: 0.45rem 0.75rem !important; font-size: 0.75rem !important; white-space: nowrap; flex-shrink: 0; }
+            #log-view { height: 360px !important; }
+        }
     </style>
 </head>
 
-<body class="min-h-screen p-6">
+<body class="min-h-screen p-3 sm:p-6 overflow-x-hidden">
     <div id="loading-screen" class="loading-screen">
         <div class="loading-spinner"></div>
     </div>
     <!-- Main Content -->
     <div class="max-w-6xl mx-auto">
         <!-- Tab Navigation -->
-        <div class="flex items-center gap-1 mb-6">
+        <div class="flex items-center gap-1.5 mb-5 overflow-x-auto no-scrollbar pb-1 -mx-1 px-1">
             <button onclick="switchTab('quota')" id="tab-quota"
                 class="tab-btn px-5 py-2 rounded-lg font-bold text-sm transition-all duration-200 text-white bg-gradient-to-r from-cyan-500/30 to-blue-500/30 border border-cyan-500/50">
                 <span data-i18n="nav.quota">Quota</span>
@@ -355,6 +366,10 @@
                 class="tab-btn px-5 py-2 rounded-lg font-bold text-sm transition-all duration-200 text-gray-400 hover:text-gray-200">
                 <span data-i18n="nav.routing">Routing</span> <span class="text-[10px] text-gray-500" data-i18n="nav.beta">(Beta)</span>
             </button>
+            <button onclick="switchTab('api')" id="tab-api"
+                class="tab-btn px-5 py-2 rounded-lg font-bold text-sm transition-all duration-200 text-gray-400 hover:text-gray-200">
+                <span data-i18n="nav.api">API</span>
+            </button>
             <button onclick="switchTab('logs')" id="tab-logs"
                 class="tab-btn px-5 py-2 rounded-lg font-bold text-sm transition-all duration-200 text-gray-400 hover:text-gray-200">
                 <span data-i18n="nav.logs">Logs</span>
@@ -367,29 +382,23 @@
 
         <!-- Toast -->
         <div id="copy-toast"
-            class="fixed bottom-32 right-8 bg-gray-800 text-gray-300 px-4 py-2 rounded-lg text-sm opacity-0 translate-x-8 transition-all duration-300 pointer-events-none z-50">
+            class="fixed bottom-6 right-4 sm:bottom-32 sm:right-8 bg-gray-800 text-gray-300 px-4 py-2 rounded-lg text-sm opacity-0 translate-x-8 transition-all duration-300 pointer-events-none z-50 max-w-[90vw] truncate">
             <span data-i18n="toast.copied">Copied!</span></div>
 
         <!-- ==================== QUOTA TAB ==================== -->
         <div id="tab-content-quota" class="tab-content">
             <!-- Quota Header -->
-            <div class="mb-6 flex items-start justify-between">
+            <div class="mb-6 flex flex-col sm:flex-row sm:items-start justify-between gap-3">
                 <div>
                     <h1 class="text-3xl font-bold text-gray-300" data-i18n="quota.title">Quota</h1>
                     <p id="plan-info" class="text-gray-500 text-sm font-bold mt-1" data-i18n="common.loading">Loading...</p>
                 </div>
-                <div class="flex flex-col items-end gap-2">
-                    <div class="flex items-center gap-3">
+                <div class="flex flex-col items-start sm:items-end gap-2 w-full sm:w-auto">
+                    <div class="flex flex-wrap items-center gap-2 sm:gap-3 w-full sm:w-auto">
                         <div class="refresh-btn inline-block">
                             <button onclick="openDiagnosticsModal()" id="diagnostics-btn"
                                 class="px-4 py-1.5 rounded-lg font-bold text-gray-300 text-sm">
                                 <span data-i18n="diagnostics.button">Diagnostics</span>
-                            </button>
-                        </div>
-                        <div class="refresh-btn inline-block">
-                            <button onclick="openIdeLogoutModal()" id="ide-logout-btn"
-                                class="px-4 py-1.5 rounded-lg font-bold text-gray-300 text-sm">
-                                <span data-i18n="quota.logIdeOut">Log IDE Out</span>
                             </button>
                         </div>
                         <div class="refresh-btn inline-block" id="add-account-container">
@@ -405,14 +414,28 @@
                             </button>
                         </div>
                     </div>
-                    <p id="last-updated" class="text-gray-600 text-xs text-right"></p>
+                    <p id="last-updated" class="text-gray-600 text-xs text-left sm:text-right"></p>
                 </div>
+            </div>
+
+            <!-- Antigravity Reauth Banner -->
+            <div id="antigravity-reauth-banner" class="hidden mb-6 rounded-xl border border-yellow-700/60 bg-yellow-950/25 p-4 text-yellow-200 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-xl">
+                <div class="flex items-center gap-3">
+                    <span class="text-2xl flex-shrink-0">⚠️</span>
+                    <div>
+                        <div class="font-bold text-sm text-yellow-100">Accesso Antigravity Richiesto</div>
+                        <div class="text-xs text-yellow-300/80 mt-0.5">È necessario collegare il tuo account Google con il nuovo metodo basato su codice per abilitare Gemini 4 Argon e tutti i modelli attivi su Docker e server remoti.</div>
+                    </div>
+                </div>
+                <button onclick="startAntigravityCodeLogin()" class="px-4 py-2 rounded-lg bg-yellow-500 hover:bg-yellow-400 text-black font-bold text-xs transition-colors shrink-0 shadow-md">
+                    Accedi con Google
+                </button>
             </div>
 
             <!-- Quota Grid -->
             <div id="quota-grid" class="space-y-6">
                 <!-- Loading placeholder -->
-                <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4">
                     <div class="card-3d">
                         <div class="card-inner rounded-lg p-4 animate-pulse">
                             <div class="h-3 bg-gray-800 rounded w-1/2 mb-3"></div>
@@ -425,7 +448,7 @@
 
         <!-- ==================== USAGE TAB ==================== -->
         <div id="tab-content-usage" class="tab-content hidden">
-            <div class="mb-8 flex items-start justify-between">
+            <div class="mb-6 sm:mb-8 flex flex-wrap items-start justify-between gap-3">
                 <div>
                     <h1 class="text-3xl font-bold text-gray-300" data-i18n="usage.title">Usage Statistics</h1>
                     <p class="text-gray-500 text-sm mt-1 font-bold" data-i18n="usage.subtitle">Token consumption and estimated cost</p>
@@ -471,7 +494,7 @@
                 <div class="text-sm font-bold text-gray-300 mb-4" data-i18n="usage.modelDistribution">Model Distribution</div>
                 <div class="flex flex-col md:flex-row md:items-center gap-10 py-4">
                     <!-- Chart on left -->
-                    <div class="flex-shrink-0 ml-4" style="width: 240px; height: 240px;">
+                    <div class="flex-shrink-0 mx-auto md:ml-4" style="width: 220px; height: 220px;">
                         <canvas id="model-chart"></canvas>
                     </div>
                     <!-- Model details on right -->
@@ -496,7 +519,7 @@
 
         <!-- ==================== LOGS TAB ==================== -->
         <div id="tab-content-logs" class="tab-content hidden">
-            <div class="mb-6 flex items-start justify-between">
+            <div class="mb-6 flex flex-col sm:flex-row sm:items-start justify-between gap-3">
                 <div>
                     <h1 class="text-2xl font-bold text-gray-300" data-i18n="logs.title">Logs</h1>
                     <p class="text-gray-500 text-sm font-bold mt-1" data-i18n="logs.subtitle">Live server output (recent lines only)</p>
@@ -538,6 +561,102 @@
             </div>
         </div>
 
+        <!-- ==================== API TAB ==================== -->
+        <div id="tab-content-api" class="tab-content hidden">
+            <!-- Header -->
+            <div class="mb-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div>
+                    <h1 class="text-2xl font-bold text-gray-300 flex items-center gap-2">
+                        <span data-i18n="api.title">API & Models</span>
+                        <span id="api-exposed-count-badge" class="text-xs px-2.5 py-0.5 rounded-full bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 font-mono">...</span>
+                    </h1>
+                    <p class="text-gray-500 text-sm font-bold mt-1" data-i18n="api.subtitle">Manage exposed models, filter policies, and OpenAI endpoint settings</p>
+                </div>
+                <div class="flex items-center gap-3">
+                    <button onclick="loadApiTabContent()" class="refresh-btn px-4 py-2 rounded-lg font-bold text-gray-300 text-sm flex items-center gap-2">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                        <span data-i18n="common.refresh">Refresh</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Endpoint Quick Cards -->
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                <div class="p-4 rounded-xl border border-gray-800 bg-black/40 backdrop-blur-sm flex flex-col justify-between">
+                    <div class="text-xs text-gray-500 uppercase tracking-wider font-semibold" data-i18n="api.baseUrl">Base URL</div>
+                    <div class="flex items-center justify-between gap-2 mt-2">
+                        <code id="api-base-url-code" class="text-sm font-mono text-cyan-400 truncate">.../v1</code>
+                        <button onclick="copyToClipboard(document.getElementById('api-base-url-code').textContent)" class="p-1.5 hover:bg-gray-800 rounded text-gray-400 hover:text-gray-200 transition-colors" title="Copy">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="p-4 rounded-xl border border-gray-800 bg-black/40 backdrop-blur-sm flex flex-col justify-between">
+                    <div class="text-xs text-gray-500 uppercase tracking-wider font-semibold" data-i18n="api.modelsUrl">Models Endpoint</div>
+                    <div class="flex items-center justify-between gap-2 mt-2">
+                        <code id="api-models-url-code" class="text-sm font-mono text-purple-400 truncate">.../v1/models</code>
+                        <button onclick="copyToClipboard(document.getElementById('api-models-url-code').textContent)" class="p-1.5 hover:bg-gray-800 rounded text-gray-400 hover:text-gray-200 transition-colors" title="Copy">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="p-4 rounded-xl border border-gray-800 bg-black/40 backdrop-blur-sm flex flex-col justify-between">
+                    <div class="text-xs text-gray-500 uppercase tracking-wider font-semibold" data-i18n="api.chatUrl">Chat Endpoint</div>
+                    <div class="flex items-center justify-between gap-2 mt-2">
+                        <code id="api-chat-url-code" class="text-sm font-mono text-emerald-400 truncate">.../v1/chat/completions</code>
+                        <button onclick="copyToClipboard(document.getElementById('api-chat-url-code').textContent)" class="p-1.5 hover:bg-gray-800 rounded text-gray-400 hover:text-gray-200 transition-colors" title="Copy">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Policy Controls (Final Filter) -->
+            <div class="rounded-xl border border-gray-800 bg-black/40 p-5 mb-6">
+                <div class="mb-4">
+                    <h2 class="text-lg font-bold text-gray-200" data-i18n="api.filterPolicies">Exposure Filters</h2>
+                    <p class="text-xs text-gray-500 mt-0.5" data-i18n="api.filterPoliciesDesc">Configure which models are advertised on /v1/models</p>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <!-- Only Active Providers -->
+                    <label class="flex items-start justify-between p-4 rounded-xl border border-gray-800 hover:border-gray-700 bg-gray-900/30 transition-colors cursor-pointer">
+                        <div class="pr-3">
+                            <div class="text-sm font-medium text-gray-200" data-i18n="api.activeProvidersOnly">Active Providers Only</div>
+                            <div class="text-xs text-gray-500 mt-1" data-i18n="api.activeProvidersOnlyDesc">Hide providers without authenticated accounts (Copilot, Codex, Kiro, Grok)</div>
+                        </div>
+                        <input type="checkbox" id="api-filter-active-providers" onchange="handleApiFilterChange('onlyActiveProviders', this.checked)" class="toggle-switch mt-1 flex-shrink-0">
+                    </label>
+
+                    <!-- Separate Thinking Models -->
+                    <label class="flex items-start justify-between p-4 rounded-xl border border-gray-800 hover:border-gray-700 bg-gray-900/30 transition-colors cursor-pointer">
+                        <div class="pr-3">
+                            <div class="text-sm font-medium text-gray-200" data-i18n="api.separateThinking">Separate Thinking Models</div>
+                            <div class="text-xs text-gray-500 mt-1" data-i18n="api.separateThinkingDesc">Expose explicit suffix variants (-high, -medium, -low, -thinking) as standalone model IDs</div>
+                        </div>
+                        <input type="checkbox" id="api-filter-separate-thinking" onchange="handleApiFilterChange('separateThinkingModels', this.checked)" class="toggle-switch mt-1 flex-shrink-0">
+                    </label>
+                </div>
+            </div>
+
+            <!-- Live Models Catalog & Allowlist -->
+            <div class="rounded-xl border border-gray-800 bg-black/40 p-5">
+                <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-4">
+                    <div>
+                        <h2 class="text-lg font-bold text-gray-200" data-i18n="api.catalogTitle">Models Catalog</h2>
+                        <p id="api-stats-text" class="text-xs text-gray-500 mt-0.5" data-i18n="api.catalogDesc">Real-time overview of available models and exposure status</p>
+                    </div>
+                    <div class="flex flex-wrap items-center gap-2 sm:gap-3 w-full sm:w-auto">
+                        <input type="text" id="api-model-search" oninput="filterApiModelsList()" placeholder="Search models..." data-i18n-placeholder="api.searchPlaceholder"
+                            class="bg-black/50 border border-gray-800 rounded-lg px-3 py-1.5 text-xs text-gray-300 placeholder-gray-600 outline-none focus:border-cyan-500/50 w-full sm:w-64">
+                    </div>
+                </div>
+
+                <div id="api-models-container" class="space-y-2 max-h-[600px] overflow-y-auto pr-1">
+                    <div class="text-xs text-gray-500 p-4 text-center" data-i18n="common.loading">Loading...</div>
+                </div>
+            </div>
+        </div>
+
         <!-- ==================== SETTINGS TAB ==================== -->
         <div id="tab-content-settings" class="tab-content hidden">
             <div class="mb-6">
@@ -557,6 +676,7 @@
                         <select id="setting-language"
                             class="bg-black/50 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-300 outline-none hover:border-gray-500">
                             <option value="en">English</option>
+                            <option value="it">Italiano</option>
                             <option value="zh-CN">中文</option>
                         </select>
                     </label>
@@ -625,6 +745,16 @@
                         </div>
                         <input type="checkbox" id="setting-compact-layout" class="toggle-switch">
                     </label>
+
+                    <!-- Cache-Aware Account Routing -->
+                    <label
+                        class="flex items-center justify-between p-4 rounded-xl border border-gray-800 hover:border-gray-700 transition-colors cursor-pointer">
+                        <div>
+                            <div class="text-gray-200 font-medium" data-i18n="settings.cacheAwareRouting">Intelligent Routing</div>
+                            <div class="text-gray-500 text-xs mt-0.5" data-i18n="settings.cacheAwareRoutingDesc">Prioritize accounts nearing quota reset, preserve warm prompt cache, and balance load when scores are close</div>
+                        </div>
+                        <input type="checkbox" id="setting-cache-aware-routing" class="toggle-switch">
+                    </label>
                 </div>
 
                 <div class="space-y-4">
@@ -637,6 +767,15 @@
                         </div>
                         <input type="checkbox" id="setting-track-usage" class="toggle-switch" checked>
                     </label>
+
+                    <!-- Refresh Pricing -->
+                    <div class="flex items-center justify-between p-4 rounded-xl border border-gray-800">
+                        <div>
+                            <div class="text-gray-200 font-medium" data-i18n="settings.pricing">Model Pricing</div>
+                            <div id="pricing-status" class="text-gray-500 text-xs mt-0.5" data-i18n="settings.pricingDesc">Per-model prices used to estimate cost and quota value</div>
+                        </div>
+                        <button id="pricing-refresh-btn" onclick="refreshPricing()" class="px-3 py-1.5 rounded-lg border border-gray-700 text-gray-200 text-sm hover:border-cyan-500 transition-colors" data-i18n="settings.pricingRefresh">Update prices</button>
+                    </div>
 
                     <!-- Capture Logs -->
                     <label
@@ -724,12 +863,102 @@
                 class="hover:text-gray-400 transition-colors">Silas</a> · <a href="https://github.com/silasxbt/anti-api"
                 target="_blank" class="hover:text-gray-400 transition-colors">github.com/silasxbt/anti-api</a>
         </div>
+    <!-- Account Options & Egress Proxy Modal -->
+    <div id="account-options-modal"
+        class="fixed inset-0 bg-black/75 backdrop-blur-sm hidden items-center justify-center z-50 p-4">
+        <div class="bg-[#111111] border border-[#2f253f] rounded-2xl w-full max-w-lg p-4 sm:p-6 max-h-[90vh] overflow-y-auto text-gray-200 shadow-2xl space-y-4">
+            <div class="flex items-center justify-between pb-3 border-b border-[#2f253f]">
+                <div class="flex items-center gap-3">
+                    <div id="acc-modal-logo" class="flex-shrink-0"></div>
+                    <div>
+                        <div class="flex items-center gap-2">
+                            <h2 class="text-base font-bold text-gray-100">Account Options</h2>
+                            <span id="acc-modal-provider-badge" class="text-[10px] font-mono px-2 py-0.5 rounded-full bg-purple-900/40 border border-purple-700/50 text-purple-300"></span>
+                        </div>
+                        <p id="acc-modal-id-subtitle" class="text-xs text-gray-400 font-mono truncate max-w-[260px]"></p>
+                    </div>
+                </div>
+                <button onclick="closeAccountOptionsModal()" class="text-gray-400 hover:text-gray-200 text-base p-1">✕</button>
+            </div>
+
+            <div class="space-y-4 text-xs">
+                <div>
+                    <label class="block font-semibold text-gray-300 mb-1.5">Custom Label / Alias</label>
+                    <input id="acc-modal-label-input" type="text"
+                        placeholder="e.g. Work, Backup, Residential Proxy"
+                        class="w-full bg-[#16161a] border border-[#2f253f] focus:border-cyan-500 focus:outline-none rounded-xl px-3.5 py-2.5 text-xs text-gray-100 placeholder-gray-600 transition-colors" />
+                    <p class="text-[11px] text-gray-500 mt-1">Friendly display name shown on dashboard cards.</p>
+                </div>
+
+                <div>
+                    <div class="flex items-center justify-between mb-1.5">
+                        <label class="block font-semibold text-gray-300">🌐 Egress Proxy</label>
+                        <span class="text-[10px] text-gray-400 font-mono">http://, socks5://</span>
+                    </div>
+                    <input id="acc-modal-proxy-input" type="text"
+                        placeholder="http://user:pass@host:port or socks5://host:port"
+                        class="w-full bg-[#16161a] border border-[#2f253f] focus:border-cyan-500 focus:outline-none rounded-xl px-3.5 py-2.5 text-xs text-gray-100 font-mono placeholder-gray-600 transition-colors" />
+                    <p class="text-[11px] text-gray-500 mt-1">
+                        All outgoing API calls and token refreshes for this account will route through this proxy. Leave empty for direct host egress.
+                    </p>
+                    <div class="mt-2.5 flex items-center gap-2">
+                        <button type="button" id="acc-modal-test-btn" onclick="testAccountProxy()"
+                            class="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-cyan-400 border border-cyan-800/40 transition-colors flex items-center gap-1.5 font-medium">
+                            <span id="acc-modal-test-spinner" class="hidden">🔄</span>
+                            <span>⚡ Test Proxy Connection</span>
+                        </button>
+                        <span id="acc-modal-test-result" class="text-[11px] text-gray-400 truncate flex-1"></span>
+                    </div>
+                </div>
+
+                <div id="acc-modal-project-group">
+                    <label class="block font-semibold text-gray-300 mb-1.5">Google Cloud Project ID</label>
+                    <input id="acc-modal-project-input" type="text"
+                        placeholder="e.g. aicode-consumers"
+                        class="w-full bg-[#16161a] border border-[#2f253f] focus:border-cyan-500 focus:outline-none rounded-xl px-3.5 py-2.5 text-xs text-gray-100 font-mono placeholder-gray-600 transition-colors" />
+                    <p class="text-[11px] text-gray-500 mt-1">Cloud AI Companion project ID (Antigravity only).</p>
+                </div>
+
+                <div id="acc-modal-plan-group">
+                    <label class="block font-semibold text-gray-300 mb-1.5">📋 Subscription Plan</label>
+                    <select id="acc-modal-plan-select"
+                        class="w-full bg-[#16161a] border border-[#2f253f] focus:border-cyan-500 focus:outline-none rounded-xl px-3.5 py-2.5 text-xs text-gray-100 transition-colors">
+                        <option value="">Auto (provider default)</option>
+                    </select>
+                    <p class="text-[11px] text-gray-500 mt-1">Quota budget calibration: accounts on the same plan pool one per-1% budget (per-account median, best-of across the group).</p>
+                </div>
+            </div>
+
+            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-3 border-t border-[#2f253f]">
+                <div class="flex items-center gap-2">
+                    <button type="button" onclick="pingFromAccountModal()" class="text-xs text-gray-400 hover:text-cyan-400 transition-colors flex items-center gap-1">
+                        <span>📡 Test Latency</span>
+                    </button>
+                    <span class="text-gray-700">|</span>
+                    <button type="button" id="acc-modal-export-btn" onclick="exportCurrentAccount()" class="text-xs text-purple-400 hover:text-purple-300 transition-colors flex items-center gap-1 font-medium">
+                        <span id="acc-modal-export-spinner" class="hidden">🔄</span>
+                        <span>📥 <span data-i18n="accModal.export">Export JSON</span></span>
+                    </button>
+                </div>
+                <div class="flex items-center gap-2">
+                    <button type="button" onclick="closeAccountOptionsModal()"
+                        class="px-4 py-2 text-xs font-medium rounded-xl text-gray-400 hover:text-gray-200 hover:bg-gray-800 transition-colors" data-i18n="settings.ideLogoutCancel">
+                        Cancel
+                    </button>
+                    <button type="button" id="acc-modal-save-btn" onclick="saveAccountOptions()"
+                        class="px-4 py-2 text-xs font-semibold rounded-xl bg-cyan-600 hover:bg-cyan-500 text-black shadow-lg shadow-cyan-600/30 transition-all flex items-center gap-1.5">
+                        <span id="acc-modal-save-spinner" class="hidden">🔄</span>
+                        <span data-i18n="common.saveChanges">Save Changes</span>
+                    </button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <!-- Diagnostics Modal -->
     <div id="diagnostics-modal"
         class="fixed inset-0 bg-black/70 backdrop-blur-sm hidden items-center justify-center z-50">
-        <div class="bg-[#111111] border border-[#2f253f] rounded-2xl w-full max-w-4xl p-6 text-gray-200 max-h-[82vh] flex flex-col">
+        <div class="bg-[#111111] border border-[#2f253f] rounded-2xl w-full max-w-4xl p-4 sm:p-6 mx-3 text-gray-200 max-h-[88vh] flex flex-col">
             <div class="flex items-center justify-between mb-4 flex-shrink-0">
                 <div>
                     <h2 class="text-lg font-bold" data-i18n="diagnostics.title">Account Diagnostics</h2>
@@ -792,7 +1021,7 @@
     <!-- Add Account Modal -->
     <div id="add-account-modal"
         class="fixed inset-0 bg-black/70 backdrop-blur-sm hidden items-center justify-center z-50">
-        <div class="bg-[#111111] border border-[#2f253f] rounded-2xl w-full max-w-3xl p-6 text-gray-200">
+        <div class="bg-[#111111] border border-[#2f253f] rounded-2xl w-full max-w-3xl p-4 sm:p-6 mx-3 max-h-[90vh] overflow-y-auto text-gray-200">
             <div class="flex items-center justify-between mb-4">
                 <h2 class="text-lg font-bold" data-i18n="quota.addAccountTitle">Add Account</h2>
                 <button onclick="closeAddAccountModal()" class="text-gray-500 hover:text-gray-300">✕</button>
@@ -864,6 +1093,19 @@
                 </div>
             </div>
 
+            <!-- Drag & Drop JSON Import Area -->
+            <div id="drop-account-zone"
+                class="mt-4 p-4 border-2 border-dashed border-[#2f253f] hover:border-purple-400 rounded-xl bg-purple-950/15 hover:bg-purple-950/30 transition-all text-center cursor-pointer flex flex-col items-center justify-center gap-1 group">
+                <div class="flex items-center gap-2 text-purple-300 font-semibold text-xs group-hover:text-purple-200">
+                    <svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path>
+                    </svg>
+                    <span>Trascina qui il file JSON credenziali o clicca per caricarlo</span>
+                </div>
+                <div class="text-[11px] text-gray-400">Importa direttamente il file senza bisogno di SSH (supporta antigravity-account.json, auth.json, accounts.json)</div>
+                <input type="file" id="account-file-input" class="hidden" accept=".json,application/json">
+            </div>
+
             <div id="add-account-status" class="mt-4 text-xs text-gray-400 hidden"></div>
             <div id="codex-device" class="mt-4 hidden">
                 <div class="text-sm text-gray-400 mb-2" data-i18n="quota.openBrowserCode">Open the browser and enter this code:</div>
@@ -893,11 +1135,43 @@
                 <a id="copilot-link" href="#" target="_blank"
                     class="inline-block mt-3 text-blue-400 hover:text-blue-300 text-xs" data-i18n="quota.openVerificationPage">Open verification page</a>
             </div>
+            <div id="antigravity-device" class="mt-4 hidden p-4 rounded-xl border border-cyan-800/60 bg-cyan-950/20 space-y-3">
+                <div class="flex items-center justify-between">
+                    <div class="text-sm font-semibold text-cyan-300">Accesso Google Antigravity</div>
+                    <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-cyan-900/60 text-cyan-200 border border-cyan-700/50">Docker / Remote</span>
+                </div>
+                <div class="text-xs text-gray-300">
+                    <strong>1.</strong> Clicca sul pulsante sottostante per autorizzare l'accesso Google:
+                </div>
+                <div>
+                    <a id="antigravity-auth-link" href="#" target="_blank"
+                        class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-black font-semibold text-xs shadow-md transition-colors">
+                        <span>Apri pagina di accesso Google</span>
+                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
+                    </a>
+                </div>
+                <div class="text-xs text-gray-400">
+                    Dopo l'accesso, Google mostrerà il <strong>codice di autorizzazione</strong> (oppure copia l'URL della pagina aperta).
+                </div>
+                <div class="space-y-1.5 pt-1">
+                    <label class="block text-xs font-semibold text-gray-300"><strong>2.</strong> Incolla qui il codice (o l'URL):</label>
+                    <div class="flex flex-col sm:flex-row gap-2">
+                        <input id="antigravity-code-input" type="text" placeholder="es. 4/0Abc... oppure https://antigravity.google/oauth-callback?code=..."
+                            class="flex-1 bg-[#16161a] border border-[#2f253f] focus:border-cyan-500 focus:outline-none rounded-xl px-3.5 py-2 text-xs text-gray-100 font-mono placeholder-gray-600 transition-colors" />
+                        <button id="antigravity-submit-btn" onclick="submitAntigravityCode()"
+                            class="px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-black font-semibold text-xs transition-colors shrink-0 flex items-center gap-1.5">
+                            <span id="antigravity-submit-spinner" class="hidden">🔄</span>
+                            <span>Verifica e Accedi</span>
+                        </button>
+                    </div>
+                    <p id="antigravity-code-error" class="text-[11px] text-red-400 hidden mt-1"></p>
+                </div>
+            </div>
         </div>
     </div>
 
     <script>
-        const API_BASE = 'http://localhost:8964';
+        const API_BASE = window.location.origin;
         const CODEX_SESSION_KEY = 'anti-api-codex-session';
         const LANGUAGE_STORAGE_KEY = 'anti-api-language';
         let loadingDismissed = false;
@@ -925,7 +1199,10 @@
                 const intlLocale = Intl.DateTimeFormat().resolvedOptions().locale;
                 if (intlLocale) candidates.push(intlLocale);
             } catch { }
-            return candidates.join(' ').toLowerCase().includes('zh') ? 'zh-CN' : 'en';
+            const str = candidates.join(' ').toLowerCase();
+            if (str.includes('it')) return 'it';
+            if (str.includes('zh')) return 'zh-CN';
+            return 'en';
         }
         let currentLanguage = localStorage.getItem(LANGUAGE_STORAGE_KEY) || detectPreferredLanguage();
 
@@ -1004,12 +1281,20 @@
                 'settings.compactDesc': 'Reduce Antigravity cards to 2 bars',
                 'settings.trackUsage': 'Track Token Usage',
                 'settings.trackUsageDesc': 'Estimate cost based on token consumption',
+                'settings.pricing': 'Model Pricing',
+                'settings.pricingDesc': 'Per-model prices used to estimate cost and quota value',
+                'settings.pricingRefresh': 'Update prices',
+                'settings.pricingStatus': '{models} models, updated {date}',
                 'settings.captureLogs': 'Capture Logs',
                 'settings.captureLogsDesc': 'Store recent console logs for dashboard',
                 'settings.optimizeSort': 'Optimize Quota Sorting',
                 'settings.optimizeSortDesc': 'Sort cards by remaining quota within each provider',
                 'settings.autoRestart': 'Auto Restart (Watchdog)',
                 'settings.autoRestartDesc': 'Restart server automatically after a crash',
+                'settings.cacheAwareRouting': 'Intelligent Routing',
+                'settings.cacheAwareRoutingDesc': 'Prioritize accounts nearing quota reset, preserve warm prompt cache, and balance load when scores are close',
+                'accModal.export': 'Export JSON',
+                'accModal.exportSuccess': 'Account exported successfully',
                 'settings.enableAll': 'Enable All',
                 'settings.disableAll': 'Disable All',
                 'settings.saveNote': 'Settings are saved to ~/.anti-api/settings.json. Click Save to apply changes.',
@@ -1050,6 +1335,29 @@
                 'status.refreshing': 'Refreshing...',
                 'status.refreshed': 'Refreshed',
                 'status.failed': 'Failed: {message}',
+                'nav.api': 'API',
+                'api.title': 'API & Models',
+                'api.subtitle': 'Manage exposed models, filter policies, and OpenAI endpoint settings',
+                'api.baseUrl': 'Base URL',
+                'api.modelsUrl': 'Models Endpoint',
+                'api.chatUrl': 'Chat Endpoint',
+                'api.filterPolicies': 'Exposure Filters',
+                'api.filterPoliciesDesc': 'Configure which models are advertised on /v1/models',
+                'api.activeProvidersOnly': 'Active Providers Only',
+                'api.activeProvidersOnlyDesc': 'Hide providers without authenticated accounts (Copilot, Codex, Kiro, Grok)',
+                'api.separateThinking': 'Separate Thinking Models',
+                'api.separateThinkingDesc': 'Expose explicit suffix variants (-high, -medium, -low, -thinking) as standalone model IDs',
+                'api.catalogTitle': 'Models Catalog',
+                'api.catalogDesc': 'Real-time overview of available models and exposure status',
+                'api.searchPlaceholder': 'Search models...',
+                'api.statusExposed': 'Exposed',
+                'api.statusHidden': 'Hidden',
+                'api.badgeLatest': 'Latest',
+                'api.badgeUnavailable': 'Unavailable',
+                'api.badgeThinking': 'Thinking',
+                'api.badgeBase': 'Base',
+                'api.filterStats': '{exposed} of {total} models exposed on /v1/models',
+                'api.saveSuccess': 'API model settings updated!',
                 'quota.connectionFailed': 'Connection failed',
                 'quota.connectionUnable': 'Unable to connect to {base}',
                 'quota.retry': 'Retry',
@@ -1175,12 +1483,20 @@
                 'settings.compactDesc': 'Antigravity 卡片只显示 2 个指标',
                 'settings.trackUsage': '跟踪 Token 用量',
                 'settings.trackUsageDesc': '根据 Token 消耗预估成本',
+                'settings.pricing': '模型价格',
+                'settings.pricingDesc': '用于估算成本和配额价值的各模型价格',
+                'settings.pricingRefresh': '更新价格',
+                'settings.pricingStatus': '{models} 个模型，更新于 {date}',
                 'settings.captureLogs': '捕获日志',
                 'settings.captureLogsDesc': '保存最近控制台日志供面板查看',
                 'settings.optimizeSort': '优化配额排序',
                 'settings.optimizeSortDesc': '按各 provider 剩余配额排序卡片',
                 'settings.autoRestart': '自动重启（守护）',
                 'settings.autoRestartDesc': '服务崩溃后自动重启',
+                'settings.cacheAwareRouting': '智能路由（缓存与重置时间感知）',
+                'settings.cacheAwareRoutingDesc': '优先消耗即将重置的配额，保持活跃对话的 Prompt 缓存命中，并在分值接近时自动均衡负载',
+                'accModal.export': '导出 JSON',
+                'accModal.exportSuccess': '账号已成功导出',
                 'settings.enableAll': '全部启用',
                 'settings.disableAll': '全部禁用',
                 'settings.saveNote': '设置保存到 ~/.anti-api/settings.json。点击保存后生效。',
@@ -1221,6 +1537,29 @@
                 'status.refreshing': '刷新中...',
                 'status.refreshed': '已刷新',
                 'status.failed': '失败：{message}',
+                'nav.api': 'API',
+                'api.title': 'API与模型',
+                'api.subtitle': '管理已暴露的模型、过滤策略及OpenAI端点设置',
+                'api.baseUrl': '基础URL',
+                'api.modelsUrl': '模型端点',
+                'api.chatUrl': '对话端点',
+                'api.filterPolicies': '暴露过滤规则',
+                'api.filterPoliciesDesc': '配置在 /v1/models 中展示哪些模型',
+                'api.activeProvidersOnly': '仅已授权提供商',
+                'api.activeProvidersOnlyDesc': '隐藏未配置账号的提供商（如 Copilot、Codex、Kiro、Grok）',
+                'api.separateThinking': '独立Thinking模型',
+                'api.separateThinkingDesc': '将思考变体（-high, -medium, -low, -thinking）作为独立模型暴露',
+                'api.catalogTitle': '实时模型目录',
+                'api.catalogDesc': '查看全部可用模型及其实时暴露状态',
+                'api.searchPlaceholder': '搜索模型...',
+                'api.statusExposed': '已暴露',
+                'api.statusHidden': '已隐藏',
+                'api.badgeLatest': '最新',
+                'api.badgeUnavailable': '不可用',
+                'api.badgeThinking': 'Thinking',
+                'api.badgeBase': '基础',
+                'api.filterStats': '已在 /v1/models 暴露 {exposed} / {total} 个模型',
+                'api.saveSuccess': 'API模型设置已更新！',
                 'quota.connectionFailed': '连接失败',
                 'quota.connectionUnable': '无法连接到 {base}',
                 'quota.retry': '重试',
@@ -1271,6 +1610,208 @@
                 'quota.codexAuthFailed': 'Codex 认证失败',
                 'quota.usageCleared': '用量数据已清除',
                 'quota.resetUsageFailed': '重置用量失败',
+            },
+            it: {
+                'nav.quota': 'Quota',
+                'nav.usage': 'Utilizzo',
+                'nav.remote': 'Remoto',
+                'nav.routing': 'Routing',
+                'nav.beta': '(Beta)',
+                'nav.api': 'API',
+                'nav.logs': 'Log',
+                'nav.settings': 'Impostazioni',
+                'common.add': 'Aggiungi',
+                'common.refresh': 'Aggiorna',
+                'common.reload': 'Ricarica',
+                'common.pause': 'Pausa',
+                'common.resume': 'Riprendi',
+                'common.clear': 'Pulisci',
+                'common.save': 'Salva',
+                'common.reset': 'Ripristina',
+                'common.loading': 'Caricamento...',
+                'common.connecting': 'Connessione...',
+                'common.accountCount': '{count} account',
+                'common.copy': 'Copia',
+                'common.yes': 'Sì',
+                'common.no': 'No',
+                'toast.copied': 'Copiato!',
+                'diagnostics.button': 'Diagnostica',
+                'diagnostics.title': 'Diagnostica Account',
+                'diagnostics.subtitle': 'Controlla file locali, comandi e configurazioni usati dall\'importazione degli account.',
+                'diagnostics.idle': 'Esegui la diagnostica per ispezionare la configurazione dell\'account.',
+                'diagnostics.run': 'Esegui',
+                'diagnostics.running': 'Esecuzione diagnostica...',
+                'diagnostics.done': 'Diagnostica completata: {pass} superati, {warn} avvisi, {fail} errori.',
+                'diagnostics.failed': 'Diagnostica fallita: {message}',
+                'diagnostics.command': 'Comando',
+                'diagnostics.output': 'Output',
+                'diagnostics.noOutput': 'Nessun output',
+                'quota.title': 'Quota',
+                'quota.logIdeOut': 'Disconnetti IDE',
+                'quota.detailsUnavailable': 'Dettagli quota non disponibili',
+                'quota.tapToPing': 'Tocca per verificare l\'account',
+                'usage.title': 'Statistiche di Utilizzo',
+                'usage.subtitle': 'Consumo token e costo stimato',
+                'usage.daily': 'Utilizzo Giornaliero',
+                'usage.todayCost': 'Costo Oggi',
+                'usage.totalCost': 'Costo Totale',
+                'usage.tokens': 'token',
+                'usage.in': 'Input',
+                'usage.out': 'Output',
+                'usage.pricingNote': 'Basato sui prezzi delle API pubbliche',
+                'usage.modelDistribution': 'Distribuzione Modelli',
+                'usage.noData': 'Nessun dato di utilizzo',
+                'usage.loading': 'Caricamento...',
+                'usage.refreshed': 'Utilizzo aggiornato',
+                'usage.loadFailed': 'Impossibile caricare l\'utilizzo',
+                'logs.title': 'Log',
+                'logs.subtitle': 'Output in tempo reale del server (solo righe recenti)',
+                'logs.follow': 'Segui',
+                'logs.disabledLine': 'La cattura dei log è disattivata. Abilitala nelle Impostazioni.',
+                'settings.title': 'Impostazioni',
+                'settings.subtitle': 'Configura il comportamento dell\'applicazione',
+                'settings.language': 'Lingua',
+                'settings.languageDesc': 'Cambia la lingua della dashboard',
+                'settings.preloadRouting': 'Precarica Routing',
+                'settings.preloadRoutingDesc': 'Carica la tab Routing in background per un passaggio immediato',
+                'settings.autoNgrok': 'Avvio Automatico ngrok',
+                'settings.autoNgrokDesc': 'Avvia automaticamente il tunnel ngrok all\'avvio del server',
+                'settings.autoOpen': 'Apertura Automatica Dashboard',
+                'settings.autoOpenDesc': 'Apri il browser sulla Dashboard all\'avvio del server',
+                'settings.autoRefresh': 'Aggiornamento Automatico Quota',
+                'settings.autoRefreshDesc': 'Aggiorna automaticamente quota e utilizzo ogni 10 minuti',
+                'settings.privacy': 'Protezione Privacy',
+                'settings.privacyDesc': 'Nascondi email e nomi utente',
+                'settings.compact': 'Layout Compatto',
+                'settings.compactDesc': 'Riduci le schede Antigravity a 2 barre',
+                'settings.trackUsage': 'Traccia Utilizzo Token',
+                'settings.trackUsageDesc': 'Stima i costi in base al consumo di token',
+                'settings.pricing': 'Prezzi Modelli',
+                'settings.pricingDesc': 'Prezzi per modello usati per stimare costi e valore della quota',
+                'settings.pricingRefresh': 'Aggiorna prezzi',
+                'settings.pricingStatus': '{models} modelli, aggiornati {date}',
+                'settings.captureLogs': 'Cattura Log',
+                'settings.captureLogsDesc': 'Memorizza i log recenti per la dashboard',
+                'settings.optimizeSort': 'Ottimizza Ordinamento Quota',
+                'settings.optimizeSortDesc': 'Ordina le schede per quota residua all\'interno di ciascun provider',
+                'settings.autoRestart': 'Riavvio Automatico (Watchdog)',
+                'settings.autoRestartDesc': 'Riavvia automaticamente il server dopo un crash',
+                'settings.cacheAwareRouting': 'Routing Intelligente',
+                'settings.cacheAwareRoutingDesc': 'Dà priorità agli account vicini al reset della quota, mantiene la cache prompt attiva e bilancia il carico quando i punteggi sono vicini',
+                'accModal.export': 'Esporta JSON',
+                'accModal.exportSuccess': 'Account esportato con successo',
+                'settings.enableAll': 'Abilita Tutti',
+                'settings.disableAll': 'Disabilita Tutti',
+                'settings.saveNote': 'Le impostazioni vengono salvate in ~/.anti-api/settings.json. Clicca Salva per applicare.',
+                'settings.saved': 'Impostazioni salvate!',
+                'settings.saveFailed': 'Impossibile salvare le impostazioni',
+                'settings.defaults': 'Ripristina predefiniti',
+                'settings.allEnabled': 'Tutte le impostazioni abilitate',
+                'settings.allDisabled': 'Tutte le impostazioni disabilitate',
+                'settings.updateTitle': 'Aggiornamenti',
+                'settings.updateDesc': 'Verifica le release GitHub e aggiorna sul posto.',
+                'settings.updateIdle': 'Nessun controllo aggiornamenti eseguito.',
+                'settings.checkUpdate': 'Controlla',
+                'settings.applyUpdate': 'Aggiorna',
+                'settings.updateChecking': 'Controllo aggiornamenti...',
+                'settings.updateApplying': 'Aggiornamento in corso. Il servizio si riavvierà al termine...',
+                'settings.updateCurrent': 'Già aggiornato all\'ultima versione: {current}.',
+                'settings.updateAvailable': 'Aggiornamento disponibile: {current} -> {latest}.',
+                'settings.updateBlocked': '{message} {hint}',
+                'settings.updateRestarting': 'Aggiornamento applicato. Riavvio in corso...',
+                'settings.updateFailed': 'Aggiornamento fallito: {message}',
+                'settings.ideLogoutTitle': 'Disconnetti IDE',
+                'settings.ideLogoutChecking': 'Controllo stato IDE...',
+                'settings.ideLogoutBody': 'Questa operazione eseguirà le seguenti azioni:',
+                'settings.ideLogoutQuit': 'Chiudi l\'IDE Antigravity in esecuzione (terminazione pulita via SIGTERM)',
+                'settings.ideLogoutClear': 'Cancella la sessione di accesso dal database locale dell\'IDE',
+                'settings.ideLogoutWarning': 'Attenzione: L\'IDE verrà chiuso. Salva il tuo lavoro prima di procedere. Gli account Anti-API non saranno interessati.',
+                'settings.ideLogoutCancel': 'Annulla',
+                'settings.ideLogoutConfirm': 'Conferma Disconnessione',
+                'settings.ideLogoutClosing': 'Chiusura IDE...',
+                'settings.ideLogoutDone': 'Fatto',
+                'settings.ideLogoutLoggedOut': 'IDE disconnesso',
+                'settings.ideLogoutFailed': 'Disconnessione fallita',
+                'settings.ideLogoutNetwork': 'Errore di rete',
+                'status.connected': 'Connesso',
+                'status.disconnected': 'Disconnesso',
+                'status.disabled': 'Disabilitato',
+                'status.paused': 'In pausa',
+                'status.refreshing': 'Aggiornamento...',
+                'status.refreshed': 'Aggiornato',
+                'status.failed': 'Fallito: {message}',
+                'api.title': 'API & Modelli',
+                'api.subtitle': 'Gestisci i modelli esposti, i filtri di visibilità e gli endpoint OpenAI',
+                'api.baseUrl': 'URL di Base',
+                'api.modelsUrl': 'Endpoint Modelli',
+                'api.chatUrl': 'Endpoint Chat',
+                'api.filterPolicies': 'Filtri di Visibilità',
+                'api.filterPoliciesDesc': 'Configura quali modelli vengono mostrati su /v1/models',
+                'api.activeProvidersOnly': 'Solo Provider Attivi',
+                'api.activeProvidersOnlyDesc': 'Nasconde automaticamente i provider senza account autenticati (Copilot, Codex, Kiro, Grok)',
+                'api.separateThinking': 'Modelli Thinking Separati',
+                'api.separateThinkingDesc': 'Espone suffissi espliciti (-high, -medium, -low, -thinking) come modelli a parte, invece di usare solo lo standard OpenAI reasoning_effort',
+                'api.catalogTitle': 'Catalogo Modelli in Tempo Reale',
+                'api.catalogDesc': 'Panoramica in tempo reale dei modelli disponibili e dello stato di esposizione',
+                'api.searchPlaceholder': 'Cerca modelli...',
+                'api.statusExposed': 'Esposto',
+                'api.statusHidden': 'Nascosto',
+                'api.badgeLatest': 'Recente',
+                'api.badgeUnavailable': 'Non disponibile',
+                'api.badgeThinking': 'Thinking',
+                'api.badgeBase': 'Base',
+                'api.filterStats': '{exposed} di {total} modelli esposti su /v1/models',
+                'api.saveSuccess': 'Impostazioni modelli API salvate con successo!',
+                'quota.connectionFailed': 'Connessione fallita',
+                'quota.connectionUnable': 'Impossibile connettersi a {base}',
+                'quota.retry': 'Riprova',
+                'quota.refreshing': 'Aggiornamento...',
+                'quota.refreshed': 'Aggiornato',
+                'quota.none': 'Nessun account presente',
+                'quota.addToView': 'Aggiungi account per visualizzare le schede della quota',
+                'quota.unavailable': 'Non disponibile',
+                'quota.copiedModel': 'Copiato: {model}',
+                'quota.removedAccount': 'Rimosso: {name}',
+                'quota.failedWithError': 'Fallito: {message}',
+                'quota.errorWithMessage': 'Errore: {message}',
+                'quota.removeConfirm': 'Rimuovere l\'account "{name}"?',
+                'quota.removeAccountLabel': 'Rimuovi account',
+                'quota.latency': 'Latenza {value}s',
+                'quota.copyTunnel': 'Copiato: {value}',
+                'quota.copyFailed': 'Copia fallita: {value}',
+                'quota.unknownError': 'Errore sconosciuto',
+                'quota.connecting': 'Connessione...',
+                'common.updated': 'Aggiornato',
+                'quota.ideStatusLoggedIn': 'IDE connesso: {email}',
+                'quota.ideStatusNotLoggedIn': 'IDE non connesso',
+                'quota.ideStatusUnable': 'Impossibile verificare lo stato dell\'IDE',
+                'quota.ideLogoutClosingNote': 'Apri manualmente Antigravity per accedere con un altro account.',
+                'quota.ideLogoutAuthCleared': 'Autenticazione cancellata',
+                'quota.ideLogoutWas': ' (era: {email})',
+                'quota.ideLoggedOut': 'IDE disconnesso',
+                'quota.addAccountTitle': 'Aggiungi Account',
+                'quota.capQuota': 'Monitoraggio quota',
+                'quota.capProxy': 'Compatibilità di protocollo',
+                'quota.capMultiAccount': 'Account autorizzati',
+                'quota.openBrowserCode': 'Apri il browser e inserisci questo codice:',
+                'quota.openVerificationPage': 'Apri pagina di verifica',
+                'quota.ideLogoutWarningTitle': 'Attenzione:',
+                'quota.ideLogoutWarningBody': 'L\'IDE verrà chiuso. Salva il tuo lavoro prima di procedere. Gli account Anti-API non saranno interessati.',
+                'quota.importedCopilot': 'Importato Copilot: {name}',
+                'quota.importedCodexMany': 'Importati {count} account Codex',
+                'quota.importedCodexOne': 'Importato Codex: {name}',
+                'quota.importedKiroMany': 'Importati {count} account Kiro',
+                'quota.connected': 'Connesso: {name}',
+                'quota.authFailed': 'Autenticazione fallita',
+                'quota.authError': 'Errore di autenticazione: {message}',
+                'quota.codexResuming': 'Ripresa autenticazione Codex...',
+                'quota.authStarting': 'Avvio autenticazione...',
+                'quota.waitingCopilot': 'In attesa dell\'autorizzazione GitHub Copilot...',
+                'quota.waitingCodex': 'In attesa dell\'autorizzazione Codex CLI...',
+                'quota.copilotAuthFailed': 'Autenticazione Copilot fallita',
+                'quota.codexAuthFailed': 'Autenticazione Codex CLI fallita',
+                'quota.usageCleared': 'Dati di utilizzo azzerati',
+                'quota.resetUsageFailed': 'Impossibile azzerare i dati di utilizzo',
             }
         };
 
@@ -1316,6 +1857,41 @@
             captureLogs: false
         };
 
+        function renderPricingStatus(data) {
+            const el = document.getElementById('pricing-status');
+            if (!el || !data) return;
+            if (data.models > 0 && data.fetchedAt) {
+                el.textContent = t('settings.pricingStatus', { models: data.models, date: new Date(data.fetchedAt).toLocaleString() });
+            }
+        }
+
+        async function loadPricingStatus() {
+            try {
+                const res = await fetch(`${API_BASE}/usage/pricing`);
+                if (res.ok) renderPricingStatus(await res.json());
+            } catch (e) { /* ignore */ }
+        }
+
+        async function refreshPricing() {
+            const btn = document.getElementById('pricing-refresh-btn');
+            if (btn) btn.disabled = true;
+            try {
+                const res = await fetch(`${API_BASE}/usage/pricing/refresh`, { method: 'POST' });
+                const data = await res.json().catch(() => ({}));
+                if (res.ok && data.success) {
+                    renderPricingStatus(data);
+                    showSettingsToast(t('settings.pricingStatus', { models: data.models, date: new Date(data.fetchedAt).toLocaleString() }));
+                    if (typeof loadUsage === 'function') loadUsage();
+                } else {
+                    showSettingsToast(t('settings.saveFailed'), true);
+                }
+            } catch (e) {
+                showSettingsToast(t('settings.saveFailed'), true);
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        }
+
         async function loadSettings() {
             try {
                 const res = await fetch(`${API_BASE}/settings`);
@@ -1337,6 +1913,7 @@
                 autoRestart: document.getElementById('setting-auto-restart').checked,
                 privacyMode: document.getElementById('setting-privacy-mode').checked,
                 compactLayout: document.getElementById('setting-compact-layout').checked,
+                cacheAwareRouting: document.getElementById('setting-cache-aware-routing')?.checked ?? false,
                 trackUsage: document.getElementById('setting-track-usage').checked,
                 optimizeQuotaSort: document.getElementById('setting-optimize-quota-sort').checked,
                 captureLogs: document.getElementById('setting-capture-logs').checked
@@ -1381,6 +1958,7 @@
             document.getElementById('setting-auto-restart').checked = false;
             document.getElementById('setting-privacy-mode').checked = false;
             document.getElementById('setting-compact-layout').checked = false;
+            if (document.getElementById('setting-cache-aware-routing')) document.getElementById('setting-cache-aware-routing').checked = false;
             document.getElementById('setting-track-usage').checked = true;
             document.getElementById('setting-optimize-quota-sort').checked = false;
             document.getElementById('setting-capture-logs').checked = false;
@@ -1398,6 +1976,7 @@
             document.getElementById('setting-auto-restart').checked = true;
             document.getElementById('setting-privacy-mode').checked = true;
             document.getElementById('setting-compact-layout').checked = true;
+            if (document.getElementById('setting-cache-aware-routing')) document.getElementById('setting-cache-aware-routing').checked = true;
             document.getElementById('setting-track-usage').checked = true;
             document.getElementById('setting-optimize-quota-sort').checked = true;
             document.getElementById('setting-capture-logs').checked = true;
@@ -1414,6 +1993,7 @@
             document.getElementById('setting-auto-restart').checked = false;
             document.getElementById('setting-privacy-mode').checked = false;
             document.getElementById('setting-compact-layout').checked = false;
+            if (document.getElementById('setting-cache-aware-routing')) document.getElementById('setting-cache-aware-routing').checked = false;
             document.getElementById('setting-track-usage').checked = false;
             document.getElementById('setting-optimize-quota-sort').checked = false;
             document.getElementById('setting-capture-logs').checked = false;
@@ -1773,6 +2353,7 @@
         }
 
         async function initSettings() {
+            loadPricingStatus();
             const settings = await loadSettings();
             settings.language = settings.language || localStorage.getItem(LANGUAGE_STORAGE_KEY) || defaultSettings.language;
 
@@ -1793,6 +2374,11 @@
             document.getElementById('setting-auto-restart').checked = settings.autoRestart;
             document.getElementById('setting-privacy-mode').checked = settings.privacyMode;
             document.getElementById('setting-compact-layout').checked = settings.compactLayout;
+            const cacheAwareEl = document.getElementById('setting-cache-aware-routing');
+            if (cacheAwareEl) {
+                cacheAwareEl.checked = !!settings.cacheAwareRouting;
+                cacheAwareEl.onchange = () => saveAllSettings();
+            }
             document.getElementById('setting-track-usage').checked = settings.trackUsage;
             document.getElementById('setting-optimize-quota-sort').checked = settings.optimizeQuotaSort;
             document.getElementById('setting-capture-logs').checked = settings.captureLogs;
@@ -1926,6 +2512,10 @@
                 stopLogStream();
             }
 
+            if (tabName === 'api') {
+                loadApiTabContent();
+            }
+
             if (tabName === 'settings' && !updateChecked) {
                 checkUpdates(false);
             }
@@ -1937,6 +2527,168 @@
                 iframe.src = '/remote-panel';
             }
             remoteLoaded = true;
+        }
+
+        let apiCatalogData = null;
+
+        async function loadApiTabContent() {
+            const origin = window.location.origin;
+            const baseCode = document.getElementById('api-base-url-code');
+            const modelsCode = document.getElementById('api-models-url-code');
+            const chatCode = document.getElementById('api-chat-url-code');
+            if (baseCode) baseCode.textContent = `${origin}/v1`;
+            if (modelsCode) modelsCode.textContent = `${origin}/v1/models`;
+            if (chatCode) chatCode.textContent = `${origin}/v1/chat/completions`;
+
+            try {
+                const res = await fetch(`${API_BASE}/api/models-catalog`);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                apiCatalogData = await res.json();
+                renderApiTabContent();
+            } catch (e) {
+                console.error('Failed to load api models catalog:', e);
+            }
+        }
+
+        function renderApiTabContent() {
+            if (!apiCatalogData) return;
+            const { allAvailable, exposedIds, settings } = apiCatalogData;
+
+            const activeInput = document.getElementById('api-filter-active-providers');
+            if (activeInput) activeInput.checked = settings.onlyActiveProviders !== false;
+
+            const thinkingInput = document.getElementById('api-filter-separate-thinking');
+            if (thinkingInput) thinkingInput.checked = !!settings.separateThinkingModels;
+
+            const badge = document.getElementById('api-exposed-count-badge');
+            if (badge) badge.textContent = `${exposedIds.length} ${t('api.statusExposed').toLowerCase()}`;
+
+            const statsText = document.getElementById('api-stats-text');
+            if (statsText) {
+                statsText.textContent = (t('api.filterStats') || '{exposed} of {total} models exposed on /v1/models')
+                    .replace('{exposed}', exposedIds.length)
+                    .replace('{total}', allAvailable.length);
+            }
+
+            renderApiModelsList();
+        }
+
+        function filterApiModelsList() {
+            renderApiModelsList();
+        }
+
+        function renderApiModelsList() {
+            const container = document.getElementById('api-models-container');
+            if (!container || !apiCatalogData) return;
+
+            const { allAvailable, exposedIds, settings } = apiCatalogData;
+            const disabledSet = new Set(settings.disabledModels || []);
+            const exposedSet = new Set(exposedIds || []);
+            const searchTerm = (document.getElementById('api-model-search')?.value || '').toLowerCase().trim();
+
+            container.innerHTML = '';
+
+            const showActiveProvidersOnly = settings.onlyActiveProviders !== false;
+            const showSeparateThinking = !!settings.separateThinkingModels;
+
+            const filtered = allAvailable.filter(m => {
+                if (showActiveProvidersOnly && !m.isProviderActive) return false;
+                if (!showSeparateThinking && m.isThinking) return false;
+                if (!searchTerm) return true;
+                return m.id.toLowerCase().includes(searchTerm) || m.name.toLowerCase().includes(searchTerm) || m.owned_by.toLowerCase().includes(searchTerm);
+            });
+
+            if (filtered.length === 0) {
+                container.innerHTML = `<div class="text-xs text-gray-500 p-6 text-center">Nessun modello trovato.</div>`;
+                return;
+            }
+
+            filtered.forEach(m => {
+                const isExposed = exposedSet.has(m.id);
+                const isDisabledByUser = disabledSet.has(m.id);
+
+                const card = document.createElement('div');
+                card.className = `p-3 rounded-xl border transition-all flex items-center justify-between gap-3 ${
+                    isExposed
+                        ? 'bg-gray-900/40 border-gray-800 hover:border-gray-700'
+                        : 'bg-black/20 border-gray-900 opacity-60 hover:opacity-80'
+                }`;
+
+                let catBadge = '';
+                if (m.isAvailable === false) {
+                    catBadge = `<span class="text-[10px] px-2 py-0.5 rounded bg-rose-500/10 text-rose-400 border border-rose-500/20 font-medium">${t('api.badgeUnavailable')}</span>`;
+                } else if (m.isThinking) {
+                    catBadge = `<span class="text-[10px] px-2 py-0.5 rounded bg-purple-500/10 text-purple-400 border border-purple-500/20 font-medium">${t('api.badgeThinking')}</span>`;
+                } else {
+                    catBadge = `<span class="text-[10px] px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 font-medium">${t('api.badgeLatest')}</span>`;
+                }
+
+                const provBadge = `<span class="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-400 font-mono">${m.owned_by}</span>`;
+
+                const statusBadge = isExposed
+                    ? `<span class="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 flex items-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>${t('api.statusExposed')}</span>`
+                    : `<span class="text-[10px] px-2 py-0.5 rounded-full bg-gray-800 text-gray-500 border border-gray-700/50 flex items-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-gray-500"></span>${t('api.statusHidden')}</span>`;
+
+                card.innerHTML = `
+                    <div class="flex items-center gap-3 min-w-0">
+                        <input type="checkbox" ${!isDisabledByUser ? 'checked' : ''} onchange="toggleApiModelEnabled('${m.id}', this.checked)"
+                            class="rounded border-gray-700 text-cyan-500 focus:ring-0 focus:ring-offset-0 bg-black/50 cursor-pointer"
+                            title="${!isDisabledByUser ? 'Disabilita questo modello' : 'Abilita questo modello'}">
+                        <div class="min-w-0">
+                            <div class="flex items-center gap-2 flex-wrap">
+                                <span class="font-mono text-xs font-semibold text-gray-200 cursor-pointer hover:text-cyan-400 transition-colors" onclick="copyToClipboard('${m.id}')" title="Clicca per copiare ID">${m.id}</span>
+                                ${provBadge}
+                                ${catBadge}
+                            </div>
+                            <div class="text-[11px] text-gray-500 truncate mt-0.5">${m.name}</div>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-3 flex-shrink-0">
+                        ${statusBadge}
+                        <button onclick="copyToClipboard('${m.id}')" class="p-1 hover:bg-gray-800 rounded text-gray-400 hover:text-gray-200 transition-colors" title="Copia ID modello">
+                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                        </button>
+                    </div>
+                `;
+                container.appendChild(card);
+            });
+        }
+
+        async function handleApiFilterChange(key, value) {
+            try {
+                const res = await fetch(`${API_BASE}/settings`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ [key]: value })
+                });
+                if (!res.ok) throw new Error('Save failed');
+                showToast(t('api.saveSuccess'));
+                await loadApiTabContent();
+            } catch (e) {
+                showToast(t('settings.saveFailed'));
+            }
+        }
+
+        async function toggleApiModelEnabled(modelId, enabled) {
+            if (!apiCatalogData?.settings) return;
+            const current = new Set(apiCatalogData.settings.disabledModels || []);
+            if (!enabled) {
+                current.add(modelId);
+            } else {
+                current.delete(modelId);
+            }
+            const disabledModels = Array.from(current);
+            try {
+                const res = await fetch(`${API_BASE}/settings`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ disabledModels })
+                });
+                if (!res.ok) throw new Error('Save failed');
+                await loadApiTabContent();
+            } catch (e) {
+                showToast(t('settings.saveFailed'));
+            }
         }
 
         function loadRoutingContent() {
@@ -2097,7 +2849,8 @@
             // 卡片效果
             document.querySelectorAll('.card-3d').forEach(card => {
                 const inner = card.querySelector('.card-inner');
-                if (!card.dataset.tiltBound) {
+                const canHover = window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches;
+                if (canHover && !card.dataset.tiltBound) {
                     card.dataset.tiltBound = 'true';
                     card.addEventListener('mousemove', (e) => {
                         const rect = card.getBoundingClientRect();
@@ -2120,13 +2873,13 @@
                     });
                 }
 
-                if (!card.dataset.pingBound) {
-                    card.dataset.pingBound = 'true';
+                if (!card.dataset.optionsBound) {
+                    card.dataset.optionsBound = 'true';
                     card.addEventListener('click', (e) => {
                         if (e.target.closest('button') || e.target.closest('a') || e.target.closest('input')) {
                             return;
                         }
-                        pingAccountCard(card);
+                        openAccountOptionsModal(card);
                     });
                 }
             });
@@ -2182,6 +2935,19 @@
             }
         }
 
+        function fmtQuotaTokens(n) {
+            n = Number(n || 0);
+            if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1) + 'M';
+            if (n >= 1_000) return (n / 1_000).toFixed(n >= 100_000 ? 0 : 1) + 'k';
+            return String(Math.round(n));
+        }
+
+        // Mirror of backend src/lib/account-plans (plan enums) for the options modal.
+        const ACCOUNT_PLAN_OPTIONS = {
+            antigravity: ['free', 'plus', 'free_pro', 'pro', 'ultra'],
+            copilot: ['free', 'student', 'pro', 'pro_plus', 'max', 'business', 'enterprise'],
+        };
+
         function formatResetTime(resetTime) {
             const now = new Date();
             const reset = new Date(resetTime);
@@ -2191,6 +2957,12 @@
 
             const hours = Math.floor(diffMs / (1000 * 60 * 60));
             const minutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+
+            if (hours >= 24) {
+                const days = Math.floor(hours / 24);
+                const remHours = hours % 24;
+                return remHours > 0 ? `${days}d ${remHours}h` : `${days}d`;
+            }
 
             if (hours > 0) return `${hours}h ${minutes}m`;
             return `${minutes}m`;
@@ -2321,13 +3093,234 @@
             showToast(t('quota.copiedModel', { model: modelId }));
         }
 
+        let currentModalAccount = null;
+
+        function openAccountOptionsModal(cardOrData) {
+            const modal = document.getElementById('account-options-modal');
+            if (!modal) return;
+
+            let provider, accountId, displayName, proxy, label;
+            if (cardOrData instanceof HTMLElement) {
+                provider = cardOrData.dataset.provider || 'antigravity';
+                accountId = cardOrData.dataset.accountId || '';
+                displayName = cardOrData.dataset.displayName || accountId;
+                proxy = cardOrData.dataset.proxy || '';
+                label = cardOrData.dataset.label || '';
+            } else {
+                provider = cardOrData.provider || 'antigravity';
+                accountId = cardOrData.accountId || '';
+                displayName = cardOrData.displayName || accountId;
+                proxy = cardOrData.proxy || '';
+                label = cardOrData.label || '';
+            }
+
+            currentModalAccount = { provider, accountId, displayName };
+
+            const logoContainer = document.getElementById('acc-modal-logo');
+            if (logoContainer) logoContainer.innerHTML = getProviderLogo(provider, `modal-${accountId}`);
+            const badge = document.getElementById('acc-modal-provider-badge');
+            if (badge) badge.textContent = provider.toUpperCase();
+            const subtitle = document.getElementById('acc-modal-id-subtitle');
+            if (subtitle) subtitle.textContent = displayName;
+            const labelInput = document.getElementById('acc-modal-label-input');
+            if (labelInput) labelInput.value = label;
+            const proxyInput = document.getElementById('acc-modal-proxy-input');
+            if (proxyInput) proxyInput.value = proxy;
+            const testResult = document.getElementById('acc-modal-test-result');
+            if (testResult) testResult.textContent = '';
+
+            const projectGroup = document.getElementById('acc-modal-project-group');
+            if (projectGroup) {
+                if (provider === 'antigravity') {
+                    projectGroup.classList.remove('hidden');
+                } else {
+                    projectGroup.classList.add('hidden');
+                }
+            }
+
+            const planGroup = document.getElementById('acc-modal-plan-group');
+            const planSelect = document.getElementById('acc-modal-plan-select');
+            if (planGroup && planSelect) {
+                const planOpts = ACCOUNT_PLAN_OPTIONS[provider] || [];
+                planSelect.innerHTML = '<option value="">Auto (provider default)</option>' +
+                    planOpts.map(o => `<option value="${o}">${o}</option>`).join('');
+                planSelect.value = '';
+                if (planOpts.length > 0) {
+                    planGroup.classList.remove('hidden');
+                } else {
+                    planGroup.classList.add('hidden');
+                }
+            }
+
+            // Fetch fresh details from backend
+            fetch(`${API_BASE}/accounts/${encodeURIComponent(accountId)}/options?provider=${encodeURIComponent(provider)}`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data && data.success && data.account) {
+                        const acc = data.account;
+                        if (labelInput) labelInput.value = acc.label || '';
+                        if (proxyInput) proxyInput.value = acc.proxy || '';
+                        const projectInput = document.getElementById('acc-modal-project-input');
+                        if (acc.projectId && projectInput) {
+                            projectInput.value = acc.projectId;
+                        }
+                        if (planSelect) planSelect.value = acc.plan || '';
+                    }
+                })
+                .catch(() => {});
+
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+        }
+
+        function closeAccountOptionsModal() {
+            const modal = document.getElementById('account-options-modal');
+            if (!modal) return;
+            modal.classList.add('hidden');
+            modal.classList.remove('flex');
+            currentModalAccount = null;
+        }
+
+        async function testAccountProxy() {
+            const proxyInput = document.getElementById('acc-modal-proxy-input');
+            const resultEl = document.getElementById('acc-modal-test-result');
+            const spinner = document.getElementById('acc-modal-test-spinner');
+            const proxy = (proxyInput.value || '').trim();
+
+            if (!proxy) {
+                resultEl.textContent = '❌ Enter a proxy URL first';
+                resultEl.className = 'text-[11px] text-amber-400 truncate flex-1';
+                return;
+            }
+
+            resultEl.textContent = 'Testing connection...';
+            resultEl.className = 'text-[11px] text-gray-400 truncate flex-1';
+            spinner.classList.remove('hidden');
+
+            try {
+                const res = await fetch(`${API_BASE}/accounts/test-proxy`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ proxy })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    resultEl.textContent = `✅ Connected (${data.latencyMs}ms, IP: ${data.exitIp})`;
+                    resultEl.className = 'text-[11px] text-emerald-400 font-mono truncate flex-1';
+                } else {
+                    resultEl.textContent = `❌ ${data.error || 'Failed'}`;
+                    resultEl.className = 'text-[11px] text-red-400 truncate flex-1';
+                }
+            } catch (e) {
+                resultEl.textContent = `❌ ${e.message || 'Error'}`;
+                resultEl.className = 'text-[11px] text-red-400 truncate flex-1';
+            } finally {
+                spinner.classList.add('hidden');
+            }
+        }
+
+        async function saveAccountOptions() {
+            if (!currentModalAccount) return;
+            const spinner = document.getElementById('acc-modal-save-spinner');
+            const saveBtn = document.getElementById('acc-modal-save-btn');
+            const label = document.getElementById('acc-modal-label-input').value;
+            const proxy = document.getElementById('acc-modal-proxy-input').value;
+            const projectInput = document.getElementById('acc-modal-project-input');
+            const projectId = projectInput ? projectInput.value : undefined;
+            const planSelect = document.getElementById('acc-modal-plan-select');
+            const plan = planSelect ? planSelect.value : undefined;
+
+            spinner.classList.remove('hidden');
+            saveBtn.disabled = true;
+
+            try {
+                const res = await fetch(`${API_BASE}/accounts/${encodeURIComponent(currentModalAccount.accountId)}/options`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        provider: currentModalAccount.provider,
+                        label,
+                        proxy,
+                        projectId,
+                        plan
+                    })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    showToast('Account options saved');
+                    closeAccountOptionsModal();
+                    fetchQuota(false);
+                } else {
+                    showToast(data.error || 'Failed to save options');
+                }
+            } catch (e) {
+                showToast(e.message || 'Error saving options');
+            } finally {
+                spinner.classList.add('hidden');
+                saveBtn.disabled = false;
+            }
+        }
+
+        async function pingFromAccountModal() {
+            if (!currentModalAccount) return;
+            const card = document.querySelector(`[data-account-id="${CSS.escape(currentModalAccount.accountId)}"]`);
+            if (card) {
+                await pingAccountCard(card);
+            }
+        }
+
+        async function exportCurrentAccount() {
+            if (!currentModalAccount) return;
+            const spinner = document.getElementById('acc-modal-export-spinner');
+            const exportBtn = document.getElementById('acc-modal-export-btn');
+            if (spinner) spinner.classList.remove('hidden');
+            if (exportBtn) exportBtn.disabled = true;
+
+            try {
+                const res = await fetch(`${API_BASE}/accounts/${encodeURIComponent(currentModalAccount.accountId)}/export?provider=${encodeURIComponent(currentModalAccount.provider)}`);
+                const data = await res.json();
+                if (data.success && data.account) {
+                    const exportData = JSON.stringify(data.account, null, 2);
+                    const blob = new Blob([exportData], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    const safeName = (data.account.displayName || data.account.email || data.account.id || 'account').replace(/[^a-zA-Z0-9_-]/g, '_');
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `${data.account.provider || 'anti-api'}-${safeName}.json`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                    showToast(t('accModal.exportSuccess') || 'Account exported successfully');
+                } else {
+                    showToast(data.error || 'Failed to export account');
+                }
+            } catch (e) {
+                showToast(e.message || 'Export failed');
+            } finally {
+                if (spinner) spinner.classList.add('hidden');
+                if (exportBtn) exportBtn.disabled = false;
+            }
+        }
+
         document.addEventListener('click', (event) => {
-            const button = event.target.closest('[data-delete-account]');
-            if (!button) return;
-            event.stopPropagation();
-            const card = button.closest('[data-account-id]');
-            if (!card) return;
-            deleteAccount(card.dataset.accountId || '', card.dataset.displayName || card.dataset.accountId || '');
+            const deleteBtn = event.target.closest('[data-delete-account]');
+            if (deleteBtn) {
+                event.stopPropagation();
+                const card = deleteBtn.closest('[data-account-id]');
+                if (!card) return;
+                deleteAccount(card.dataset.accountId || '', card.dataset.displayName || card.dataset.accountId || '');
+                return;
+            }
+
+            const editBtn = event.target.closest('[data-edit-account]');
+            if (editBtn) {
+                event.stopPropagation();
+                const card = editBtn.closest('[data-account-id]');
+                if (!card) return;
+                openAccountOptionsModal(card);
+                return;
+            }
         });
 
         async function deleteAccount(accountId, displayName) {
@@ -2355,28 +3348,23 @@
             let bars = account.bars || [];
             const cardId = `${provider}-${account.accountId}`;
 
-            // Compact layout: for Antigravity, show only 2 bars (claude_gpt + lower of gpro/gflash)
-            if (window._compactLayout && provider === 'antigravity' && bars.length >= 3) {
-                const claudeGpt = bars.find(b => b.key === 'claude_gpt');
-                const gpro = bars.find(b => b.key === 'gpro');
-                const gflash = bars.find(b => b.key === 'gflash');
-
-                // Pick the Gemini bar with lower percentage
-                let geminiBar = null;
-                if (gpro && gflash) {
-                    geminiBar = gpro.percentage <= gflash.percentage ? gpro : gflash;
-                    geminiBar = { ...geminiBar, label: 'gemini' }; // Unified label
-                } else {
-                    geminiBar = gpro || gflash;
-                    if (geminiBar) geminiBar = { ...geminiBar, label: 'gemini' };
-                }
-
-                bars = [claudeGpt, geminiBar].filter(Boolean);
+            // Compact layout: for Antigravity, show up to 3 bars (lowest of gemini, lowest of claude_gpt, lowest of argon)
+            if (window._compactLayout && provider === 'antigravity' && bars.length >= 2) {
+                const geminiBars = bars.filter(b => b.key.startsWith('gemini') && !b.key.includes('argon'));
+                const claudeBars = bars.filter(b => b.key.startsWith('claude_gpt'));
+                const argonBars = bars.filter(b => b.key.includes('argon'));
+                const minBar = (arr, label) => {
+                    if (arr.length === 0) return null;
+                    const lowest = arr.reduce((min, b) => (b.percentage || 0) < (min.percentage || 0) ? b : min, arr[0]);
+                    return { ...lowest, label };
+                };
+                bars = [minBar(geminiBars, 'gemini'), minBar(claudeBars, 'claude&gpt'), minBar(argonBars, 'argon')].filter(Boolean);
             }
 
             const barHtml = bars.map(bar => {
                     const percentage = Math.max(0, Math.min(100, Math.round(bar.percentage || 0)));
                     const zedSupported = provider === 'zed' && percentage > 0;
+                    const barClass = bar.key.includes('argon') ? 'argon-bar' : `${provider}-bar`;
                     return `
                         <div class="space-y-1">
                             <div class="flex items-center justify-between text-xs text-gray-400">
@@ -2384,10 +3372,21 @@
                                 <span class="font-bold text-gray-400">${provider === 'zed' ? (zedSupported ? 'supported' : 'unsupported') : `${percentage}%`}</span>
                             </div>
                             <div class="h-2 bg-gray-900 rounded-full overflow-hidden">
-                                <div class="progress-bar h-full rounded-full transition-all ${provider}-bar"
+                                <div class="progress-bar h-full rounded-full transition-all ${barClass}"
                                      style="width: ${percentage}%;"></div>
                             </div>
-                            <div class="text-[10px] text-gray-500">${bar.resetTime ? formatResetTime(bar.resetTime) : '—'}</div>
+                            <div class="flex items-center justify-between text-[10px] text-gray-500">
+                                <span>${bar.resetTime ? formatResetTime(bar.resetTime) : '—'}</span>
+                                ${provider !== 'zed' ? `
+                                    ${typeof bar.estimatedValueUsd === 'number' && bar.estimatedValueUsd > 0 ? `
+                                        <span class="font-mono ${bar.planShared ? 'text-cyan-500' : 'text-gray-400'}" title="Quota: ~$${Number(bar.estimatedValueUsd).toFixed(2)} remaining / ~$${Number(bar.estimatedTotalValueUsd || (bar.valuePerPercentUsd ? bar.valuePerPercentUsd * 100 : 0)).toFixed(2)} total (~$${Number(bar.valuePerPercentUsd || 0).toFixed(2)} per 1%)${bar.effectiveTokensPerPercent ? ` | ~${fmtQuotaTokens(bar.effectiveTokensPerPercent)} eff. tokens per 1%` : ''}${bar.planShared ? ` | plan-pooled budget across ${bar.planAccounts || 2} same-plan account(s)` : ''}">
+                                            ~$${Number(bar.estimatedValueUsd).toFixed(2)} / $${Number(bar.estimatedTotalValueUsd || (bar.valuePerPercentUsd ? bar.valuePerPercentUsd * 100 : 0)).toFixed(2)}${bar.estimatedTokensRemaining ? ` ≈${fmtQuotaTokens(bar.estimatedTokensRemaining)}t` : ''}${bar.planShared ? ' ★' : ''}
+                                        </span>
+                                    ` : `
+                                        <span class="text-gray-600 italic tracking-tight" title="Observing your local usage to calibrate quota dollar value">not enough data</span>
+                                    `}
+                                ` : ''}
+                            </div>
                         </div>
                     `;
                 }).join('');
@@ -2398,16 +3397,19 @@
             const providerLogo = getProviderLogo(provider, cardId);
 
             return `
-                <div class="card-3d" data-provider="${escapeHtml(provider)}" data-card-id="${escapeHtml(cardId)}" data-account-id="${escapeHtml(account.accountId)}" data-display-name="${escapeHtml(displayName)}">
-                    <div class="card-inner rounded-2xl p-5">
+                <div class="card-3d cursor-pointer" data-provider="${escapeHtml(provider)}" data-card-id="${escapeHtml(cardId)}" data-account-id="${escapeHtml(account.accountId)}" data-display-name="${escapeHtml(displayName)}" data-proxy="${escapeHtml(account.proxy || '')}" data-label="${escapeHtml(account.label || '')}">
+                    <div class="card-inner rounded-2xl p-5 hover:border-cyan-500/40 transition-all">
                         <div class="flex items-center justify-between mb-4">
-                            <div class="flex items-center gap-2">
+                            <div class="flex items-center gap-2 flex-wrap">
                                 ${providerLogo}
                                 <div class="text-sm font-bold text-gray-300">${escapeHtml(maskedName)}</div>
+                                ${account.proxy ? `<span class="text-[9px] font-mono px-1.5 py-0.5 rounded-full bg-cyan-950/80 border border-cyan-700/60 text-cyan-300" title="Proxy: ${escapeHtml(account.proxy)}">🌐 proxy</span>` : ''}
                             </div>
-                            <div class="flex items-center gap-2">
+                            <div class="flex items-center gap-1.5">
+                                <button type="button" data-edit-account="1"
+                                        class="text-gray-500 hover:text-cyan-400 transition-colors text-xs p-1" title="Account settings & proxy">⚙️</button>
                                 <button type="button" data-delete-account="1"
-                                        class="text-gray-600 hover:text-red-500 transition-colors text-xs px-1" data-i18n-title="quota.removeAccountLabel" title="Remove account">✕</button>
+                                        class="text-gray-600 hover:text-red-500 transition-colors text-xs p-1" data-i18n-title="quota.removeAccountLabel" title="Remove account">✕</button>
                             </div>
                         </div>
                         <div class="space-y-4">${barHtml}</div>
@@ -2443,7 +3445,13 @@
             for (const provider of providerOrder) {
                 const group = accounts.filter(acc => acc.provider === provider);
                 const metricInfo = (acc) => {
-                    if (provider === 'antigravity') return getQuotaBarInfo(acc, 'claude_gpt', 'claude&gpt');
+                    if (provider === 'antigravity') {
+                        const info = getQuotaBarInfo(acc, 'claude_gpt_week', 'weekly claude gpt');
+                        if (info && (info.percent !== 0 || info.resetTime)) return info;
+                        const argonInfo = getQuotaBarInfo(acc, 'argon_week', 'weekly argon');
+                        if (argonInfo && (argonInfo.percent !== 0 || argonInfo.resetTime)) return argonInfo;
+                        return getQuotaBarInfo(acc, 'gemini_5h', '5hr gemini');
+                    }
                     if (provider === 'codex') return getQuotaBarInfo(acc, 'session', '5h');
                     if (provider === 'copilot') return getQuotaBarInfo(acc, 'premium', 'premium');
                     if (provider === 'zed') return getQuotaBarInfo(acc, 'hosted', 'hosted');
@@ -2510,7 +3518,7 @@
                         </div>
                     `;
                 } else {
-                    grid.innerHTML = `<div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                    grid.innerHTML = `<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-4">
                         ${accounts.map(renderAccountCard).join('')}
                     </div>`;
                 }
@@ -2609,19 +3617,31 @@
                 const data = await response.json();
 
                 const logoutContainer = document.getElementById('logout-container');
+                const reauthBanner = document.getElementById('antigravity-reauth-banner');
 
-                if (data.authenticated) {
+                if (data.authenticated && !data.requiresReauth) {
                     if (logoutContainer) {
                         logoutContainer.style.display = 'block';
+                    }
+                    if (reauthBanner) {
+                        reauthBanner.classList.add('hidden');
                     }
                 } else {
                     if (logoutContainer) {
                         logoutContainer.style.display = 'none';
                     }
+                    if (reauthBanner) {
+                        reauthBanner.classList.remove('hidden');
+                    }
                 }
             } catch (error) {
                 console.error('Failed to check auth status:', error);
             }
+        }
+
+        function startAntigravityCodeLogin() {
+            openAddAccountModal();
+            startProviderLogin('antigravity');
         }
 
         function hideLoadingOnce() {
@@ -2638,11 +3658,15 @@
             document.getElementById('add-account-status').classList.add('hidden');
             document.getElementById('codex-device').classList.add('hidden');
             document.getElementById('copilot-device').classList.add('hidden');
+            const agyDev = document.getElementById('antigravity-device');
+            if (agyDev) agyDev.classList.add('hidden');
         }
 
         function closeAddAccountModal() {
             document.getElementById('add-account-modal').classList.add('hidden');
             document.getElementById('add-account-modal').classList.remove('flex');
+            const agyDev = document.getElementById('antigravity-device');
+            if (agyDev) agyDev.classList.add('hidden');
         }
 
         function setAddAccountStatus(message) {
@@ -2690,6 +3714,75 @@
             await pollCodexStatus(stored.sessionId);
         }
 
+        function showAntigravityCodeFlow(data) {
+            const device = document.getElementById('antigravity-device');
+            const linkEl = document.getElementById('antigravity-auth-link');
+            const inputEl = document.getElementById('antigravity-code-input');
+            const errEl = document.getElementById('antigravity-code-error');
+            if (!device) return;
+            device.classList.remove('hidden');
+            if (errEl) {
+                errEl.classList.add('hidden');
+                errEl.textContent = '';
+            }
+            if (inputEl) inputEl.value = '';
+            if (linkEl && data.auth_url) {
+                linkEl.href = data.auth_url;
+                window.open(data.auth_url, '_blank');
+            }
+            setAddAccountStatus('Autorizza l\'accesso con Google nel browser, poi incolla il codice ricevuto.');
+            if (inputEl) setTimeout(() => inputEl.focus(), 300);
+        }
+
+        async function submitAntigravityCode() {
+            const inputEl = document.getElementById('antigravity-code-input');
+            const errEl = document.getElementById('antigravity-code-error');
+            const spinner = document.getElementById('antigravity-submit-spinner');
+            const btn = document.getElementById('antigravity-submit-btn');
+            const code = (inputEl ? inputEl.value : '').trim();
+            if (!code) {
+                if (errEl) {
+                    errEl.textContent = 'Inserisci il codice di autorizzazione o l\'URL ricevuto da Google.';
+                    errEl.classList.remove('hidden');
+                }
+                return;
+            }
+            if (errEl) errEl.classList.add('hidden');
+            if (btn) btn.disabled = true;
+            if (spinner) spinner.classList.remove('hidden');
+            setAddAccountStatus('Verifica codice e collegamento in corso...');
+
+            try {
+                const response = await fetch(`${API_BASE}/auth/login`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ provider: 'antigravity', code: code })
+                });
+                const data = await response.json();
+                if (!data.success) {
+                    if (errEl) {
+                        errEl.textContent = data.error || 'Autenticazione fallita. Verifica il codice e riprova.';
+                        errEl.classList.remove('hidden');
+                    }
+                    setAddAccountStatus(data.error || 'Autenticazione fallita.');
+                    return;
+                }
+                setAddAccountStatus(t('quota.connected', { name: data.email || 'Antigravity' }));
+                closeAddAccountModal();
+                await checkAuthStatus();
+                refreshAll(true);
+            } catch (err) {
+                if (errEl) {
+                    errEl.textContent = err.message || 'Errore di rete.';
+                    errEl.classList.remove('hidden');
+                }
+                setAddAccountStatus('Errore durante il collegamento.');
+            } finally {
+                if (btn) btn.disabled = false;
+                if (spinner) spinner.classList.add('hidden');
+            }
+        }
+
         async function startProviderLogin(provider) {
             setAddAccountStatus(t('quota.authStarting'));
 
@@ -2711,6 +3804,18 @@
 
                 if (!data.success) {
                     setAddAccountStatus(data.error || t('quota.authFailed'));
+                    return;
+                }
+
+                if (provider === 'antigravity') {
+                    if (data.status === 'pending' && data.auth_url) {
+                        showAntigravityCodeFlow(data);
+                        return;
+                    }
+                    setAddAccountStatus(t('quota.connected', { name: data.email || 'Antigravity' }));
+                    closeAddAccountModal();
+                    await checkAuthStatus();
+                    refreshAll(true);
                     return;
                 }
 
@@ -2869,12 +3974,90 @@
             }
         }
 
+        // Gestione Drag & Drop per importazione file credenziali JSON
+        function initAccountDropZone() {
+            const dropZone = document.getElementById('drop-account-zone');
+            const fileInput = document.getElementById('account-file-input');
+            if (!dropZone || !fileInput) return;
+
+            dropZone.addEventListener('click', () => fileInput.click());
+
+            fileInput.addEventListener('change', (e) => {
+                if (e.target.files && e.target.files[0]) {
+                    handleAccountFileImport(e.target.files[0]);
+                }
+            });
+
+            ['dragenter', 'dragover'].forEach(name => {
+                dropZone.addEventListener(name, (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    dropZone.classList.add('border-purple-400', 'bg-purple-950/40');
+                });
+            });
+
+            ['dragleave', 'drop'].forEach(name => {
+                dropZone.addEventListener(name, (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    dropZone.classList.remove('border-purple-400', 'bg-purple-950/40');
+                });
+            });
+
+            dropZone.addEventListener('drop', (e) => {
+                const dt = e.dataTransfer;
+                if (dt && dt.files && dt.files[0]) {
+                    handleAccountFileImport(dt.files[0]);
+                }
+            });
+
+            // Supporta drag & drop globale sulla pagina per file .json
+            window.addEventListener('dragover', (e) => e.preventDefault());
+            window.addEventListener('drop', (e) => {
+                if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]) {
+                    const file = e.dataTransfer.files[0];
+                    if (file.name.endsWith('.json')) {
+                        e.preventDefault();
+                        openAddAccountModal();
+                        handleAccountFileImport(file);
+                    }
+                }
+            });
+        }
+
+        async function handleAccountFileImport(file) {
+            setAddAccountStatus('Importazione credenziali in corso...');
+            try {
+                const text = await file.text();
+                const json = JSON.parse(text);
+
+                const response = await fetch(`${API_BASE}/auth/import`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(json)
+                });
+                const data = await response.json();
+
+                if (data.success) {
+                    closeAddAccountModal();
+                    showToast(`✓ Account ${data.email || ''} importato con successo!`);
+                    await checkAuthStatus();
+                    refreshAll(true);
+                } else {
+                    setAddAccountStatus(data.error || 'Errore durante l\'importazione del file.');
+                }
+            } catch (err) {
+                setAddAccountStatus('File non valido o JSON corrotto: ' + err.message);
+            }
+        }
+
         // Initial load
         refreshAll(false);
-        init3DEffect();
+        // init3DEffect() is already called inside refreshAll()
         initSettings();
         fetchIdeStatus();
         resumeCodexSession();
+        initAccountDropZone();
 
         // 🆕 Auto-refresh when returning from OAuth window
         // Attach click handlers to Add buttons to track login
@@ -2995,11 +4178,11 @@
                 const outputDisplay = outputK >= 1000 ? outputM + 'M' : outputK + 'K';
                 const color = getModelColor(m.model);
                 return `
-                    <div class="py-1.5 border-b border-gray-800/30 last:border-0 flex items-center" style="gap: 10px;">
+                    <div class="py-2 border-b border-gray-800/30 last:border-0 flex flex-wrap items-center gap-x-2.5 gap-y-1">
                         <span class="w-3.5 h-3.5 rounded-sm flex-shrink-0" style="background: ${color}"></span>
                         <span class="text-sm font-semibold text-gray-200">${m.model}</span>
                         <span class="text-gray-600">›</span>
-                        <span style="font-size: 12px;" class="text-gray-400">${t('usage.in')}: ${inputDisplay}</span>
+                        <span style="font-size: 12px;" class="text-gray-400">${t('usage.in')}: ${inputDisplay}${(m.cachedInput || 0) > 0 ? ` <span class="text-emerald-400/80 text-[11px]" title="Prompt cache read (0.1x cost)">(⚡${formatTokenCount(m.cachedInput)})</span>` : ''}</span>
                         <span style="font-size: 12px;" class="text-cyan-400 font-medium">$${m.inputCost.toFixed(2)}</span>
                         <span style="font-size: 12px;" class="text-gray-400 ml-2">${t('usage.out')}: ${outputDisplay}</span>
                         <span style="font-size: 12px;" class="text-cyan-400 font-medium">$${m.outputCost.toFixed(2)}</span>
@@ -3061,6 +4244,9 @@
             }
             if (m.includes('claude') || m.includes('opus') || m.includes('sonnet')) {
                 return getCssColor('--copilot-red', '#f85149');
+            }
+            if (m.includes('argon')) {
+                return '#a78bfa';
             }
             if (m.includes('gemini') || m.includes('flash') || m.includes('pro')) {
                 return getCssColor('--anti-purple', '#6b4da3');

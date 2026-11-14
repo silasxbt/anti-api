@@ -13,24 +13,21 @@ let tempHome: string | null = null
 let prevHome: string | undefined
 let prevProfile: string | undefined
 
-mock.module("~/services/auth/store", () => ({
-    authStore: {
-        listAccounts: (_provider?: Provider) => [],
-        listSummaries: (_provider?: Provider) => [],
-        getAccount: () => null,
-    },
-}))
+const realStore = await import("../src/services/auth/store")
+mock.module("~/services/auth/store", () => realStore)
 
 mock.module("~/services/antigravity/account-manager", () => ({
     accountManager: {
         load: () => { },
         clearAllRateLimits: () => { },
         hasAccount: () => true,
+        addAccount: () => { },
     },
 }))
 
 mock.module("~/services/copilot/chat", () => ({
     createCopilotCompletion: async () => ({ contentBlocks: [], stopReason: "end_turn", usage: {} }),
+    getCopilotReasoningEfforts: () => [],
     listCopilotModelsForAccount: async (_account: ProviderAccount) => [],
 }))
 

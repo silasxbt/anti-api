@@ -21,11 +21,15 @@ import { openBrowser } from "./lib/open-browser"
 import { LOG_LEVELS, resolveLogLevel } from "./lib/log-level"
 import { startAntigravityIdeVersionUpdater } from "./lib/antigravity-client"
 import { safeErrorMessage } from "./lib/redaction"
+import { initNativeProxy } from "./lib/native-proxy"
+
+// Initialize native outbound proxy bridge immediately
+initNativeProxy()
 
 function getLocalHost(): string {
     const host = process.env.ANTI_API_HOST?.trim() || "127.0.0.1"
     if (!isLoopbackAddress(host)) {
-        if (isContainerControlPlaneEnabled() && host === "0.0.0.0" && getControlPlaneToken()) {
+        if ((isContainerControlPlaneEnabled() || process.env.ANTI_API_BEHIND_REVERSE_PROXY === "1") && host === "0.0.0.0") {
             return host
         }
         if (isContainerControlPlaneEnabled() && host === "0.0.0.0") {
@@ -71,6 +75,7 @@ const start = defineCommand({
         },
     },
     async run({ args }) {
+        initNativeProxy()
         state.port = parseInt(args.port, 10)
         const logLevel = resolveLogLevel(process.env, args.verbose)
         state.verbose = logLevel >= LOG_LEVELS.debug

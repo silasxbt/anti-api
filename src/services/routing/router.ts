@@ -1,6 +1,12 @@
-import type { ClaudeMessage, ClaudeTool } from "~/lib/translator"
+import type { ClaudeMessage, ClaudeTool, CompletionUsage, ContentBlock } from "~/lib/translator"
 import { UpstreamError } from "~/lib/error"
-import { createChatCompletionWithOptions, createChatCompletionStreamWithOptions } from "~/services/antigravity/chat"
+import {
+    createChatCompletionWithOptions,
+    createChatCompletionStreamWithOptions,
+    isAntigravityModelSupportedForAccount,
+    markAntigravityModelUnsupported,
+    computeSessionKey,
+} from "~/services/antigravity/chat"
 import { accountManager } from "~/services/antigravity/account-manager"
 import { createCodexCompletion, isCodexModelSupportedForAccount, isCodexUnsupportedModelError } from "~/services/codex/chat"
 import { createCopilotCompletion } from "~/services/copilot/chat"
@@ -8,12 +14,26 @@ import { createZedCompletion } from "~/services/zed/chat"
 import { createKiroCompletion } from "~/services/kiro/chat"
 import { createGrokCompletion } from "~/services/grok/chat"
 import { authStore } from "~/services/auth/store"
-import type { ProviderAccount } from "~/services/auth/types"
+import { AUTH_PROVIDERS, type ProviderAccount, type AuthProvider } from "~/services/auth/types"
 import { loadRoutingConfig, type RoutingEntry, type RoutingConfig, type AccountRoutingEntry } from "./config"
-import { getProviderModels, isHiddenCodexModel } from "./models"
-import { buildMessageStart, buildContentBlockStart, buildTextDelta, buildInputJsonDelta, buildContentBlockStop, buildMessageDelta, buildMessageStop } from "~/lib/translator"
+import { ensureProviderModelsSynced, getProviderModels, isHiddenCodexModel } from "./models"
+import { isCacheAwareRoutingEnabled } from "~/services/settings"
+import {
+    rankAccountCandidates,
+    recordIntelligentDispatch,
+    recordIntelligentTokenUsage,
+} from "./intelligent-scorer"
+import {
+    buildMessageStart,
+    buildContentBlockStart,
+    buildTextDelta,
+    buildInputJsonDelta,
+    buildContentBlockStop,
+    buildMessageDelta,
+    buildMessageStop,
+} from "~/lib/translator"
+import { baseModelIdFor, getAntigravityCatalog } from "~/lib/model-catalog"
 import { formatSuccessLine, setRequestLogContext } from "~/lib/logger"
-import type { AuthProvider } from "~/services/auth/types"
 import { recordUsage } from "~/services/usage-tracker"
 
 export class RoutingError extends Error {
@@ -39,34 +59,90 @@ interface RoutedRequest {
     signal?: AbortSignal
 }
 
-type FlowStickyState = {
-    cursor: number
-}
-type AccountStickyState = {
+type StickyCursorState = {
     cursor: number
 }
 
-type ProviderUsage = {
-    usage?: {
-        inputTokens?: number
-        outputTokens?: number
-    }
+type ProviderCompletion = {
+    contentBlocks: ContentBlock[]
+    stopReason: string | null
+    usage?: Partial<CompletionUsage>
+}
+
+/** Canonical official model IDs for known aliases (keys are lower-case). */
+const OFFICIAL_MODEL_ALIASES: Record<string, string> = {
+    "gpt-oss": "gpt-oss-120b",
+    "gpt-oss-120b": "gpt-oss-120b",
+    "claude-opus": "claude-opus-5-5-thinking",
+    "claude-sonnet": "claude-sonnet-5-5",
+    "gemini-pro": "gemini-3.1-pro-high",
+    "gemini-flash": "gemini-3.8-flash-medium",
+    "gemini-flash-lite": "gemini-3.8-flash-lite",
+    "claude-opus-4-7": "claude-opus-4.7",
+    "claude-opus-5-5": "claude-opus-5-5-thinking",
+    "claude-opus-5.5": "claude-opus-5-5-thinking",
+    "claude-opus-5-5-thinking": "claude-opus-5-5-thinking",
+    "claude-sonnet-5-5": "claude-sonnet-5-5",
+    "claude-sonnet-5.5": "claude-sonnet-5-5",
+    "claude-sonnet-5-5-thinking": "claude-sonnet-5-5-thinking",
+    "claude-opus-4-6": "claude-opus-4-6-thinking",
+    "claude-opus-4.6": "claude-opus-4-6-thinking",
+    "claude-opus-4-6-thinking": "claude-opus-4-6-thinking",
+    "claude-sonnet-4-6": "claude-sonnet-4-6",
+    "claude-sonnet-4.6": "claude-sonnet-4-6",
+    "claude-opus-4-5": "claude-opus-4-5-thinking",
+    "claude-opus-4.5": "claude-opus-4-5-thinking",
+    "claude-opus-4-5-thinking": "claude-opus-4-5-thinking",
+    "claude-sonnet-4.5": "claude-sonnet-4-5",
+    "claude-sonnet-4.5-thinking": "claude-sonnet-4-5-thinking",
+    "claude-3-7-sonnet": "claude-sonnet-5-5",
+    "claude-3.7-sonnet": "claude-sonnet-5-5",
+    "claude-3-7-sonnet-latest": "claude-sonnet-5-5",
+    "claude-3-7-sonnet-20250219": "claude-sonnet-5-5",
+    "claude-3-5-sonnet": "claude-sonnet-4-5",
+    "claude-3.5-sonnet": "claude-sonnet-4-5",
+    "claude-3-5-sonnet-latest": "claude-sonnet-4-5",
+    "claude-3-5-sonnet-20241022": "claude-sonnet-4-5",
+    "claude-3-5-sonnet-20240620": "claude-sonnet-4-5",
+    "claude-3-5-haiku": "claude-sonnet-4-5",
+    "claude-3.5-haiku": "claude-sonnet-4-5",
+    "claude-3-opus": "claude-opus-5-5-thinking",
+    "claude-3.0-opus": "claude-opus-5-5-thinking",
+    "claude-3-opus-20240229": "claude-opus-5-5-thinking",
+    "gemini-3.8-flash": "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-high": "gemini-3.8-flash-high",
+    "gemini-3.8-flash-medium": "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-low": "gemini-3.8-flash-low",
+    "gemini-3.5-flash-lite": "gemini-3.5-flash-lite",
+    "gemini-3.1-pro": "gemini-3.1-pro-high",
+    "gemini-3.1-pro-preview": "gemini-3.1-pro-high",
+    "gemini-3-pro": "gemini-3-pro-high",
+    "gemini-2.5-pro": "gemini-2.5-pro",
+    "gemini-2.5-flash": "gemini-2.5-flash",
+    "gemini-transcribe": "gemini-flash",
+    "whisper-1": "gemini-flash",
+    "whisper": "gemini-flash",
+    "gemini-4-argon": "gemini-4-argon",
+    "gemini-argon": "gemini-4-argon",
+    "argon": "gemini-4-argon",
+    "gemini-argon-high": "gemini-4-argon-high",
+    "gemini-argon-medium": "gemini-4-argon-medium",
+    "gemini-argon-low": "gemini-4-argon-low",
+    "gemini-argon-thinking": "gemini-4-argon-thinking",
 }
 
 export function normalizeOfficialModelId(model: string): string {
     const normalized = model?.trim()
     if (!normalized) return model
     const lookupKey = normalized.toLowerCase()
-    const map: Record<string, string> = {
-        "claude-opus-4-7": "claude-opus-4.7",
-        "claude-opus-4-6": "claude-opus-4-6-thinking",
-        "claude-opus-4.6": "claude-opus-4-6-thinking",
-        "claude-sonnet-4.5": "claude-sonnet-4-5",
-        "claude-sonnet-4.5-thinking": "claude-sonnet-4-5-thinking",
-        "claude-opus-4.5-thinking": "claude-opus-4-5-thinking",
-        "claude-opus-4.6-thinking": "claude-opus-4-6-thinking",
+    if (OFFICIAL_MODEL_ALIASES[lookupKey]) {
+        return OFFICIAL_MODEL_ALIASES[lookupKey]
     }
-    return map[lookupKey] || normalized
+    const catalogAlias = getAntigravityCatalog().aliases.get(lookupKey)
+    if (catalogAlias) {
+        return catalogAlias
+    }
+    return normalized
 }
 
 /**
@@ -76,19 +152,29 @@ export function normalizeOfficialModelId(model: string): string {
  * versus `claude-sonnet-4-5`). Keep the public/request model untouched, but
  * use the same key while deciding which provider or account route applies.
  */
+const officialModelKeyCache = new Map<string, string>()
+
 function officialModelKey(model: string): string {
-    return normalizeOfficialModelId(model || "")
+    const raw = model || ""
+    const cached = officialModelKeyCache.get(raw)
+    if (cached !== undefined) return cached
+    const computed = normalizeOfficialModelId(raw)
         .trim()
         .toLowerCase()
         .replace(/[._]/g, "-")
         .replace(/-+/g, "-")
+    if (officialModelKeyCache.size > 1000) {
+        officialModelKeyCache.clear()
+    }
+    officialModelKeyCache.set(raw, computed)
+    return computed
 }
 
 export function modelIdsMatch(left: string, right: string): boolean {
     return officialModelKey(left) === officialModelKey(right)
 }
 
-function isEntryUsable(entry: RoutingEntry): boolean {
+function isEntryUsable(entry: RoutingEntry | AccountRoutingEntry): boolean {
     if (entry.provider === "antigravity") {
         return true
     }
@@ -99,9 +185,9 @@ function isEntryUsable(entry: RoutingEntry): boolean {
 // 因此能在请求期 accountManager.load() 重置 rateLimitedUntil 后仍保住限流状态。
 // 其它 provider 的限流仅依赖 authStore.isRateLimited。
 const routerRateLimits = new Map<string, number>()  // "antigravity:accountId" -> expiry timestamp
-const PROVIDER_ORDER: AuthProvider[] = ["antigravity", "codex", "copilot", "zed", "kiro", "grok"]
-const flowStickyStates = new Map<string, FlowStickyState>()
-const accountStickyStates = new Map<string, AccountStickyState>()
+const PROVIDER_ORDER: readonly AuthProvider[] = AUTH_PROVIDERS
+const flowStickyStates = new Map<string, StickyCursorState>()
+const accountStickyStates = new Map<string, StickyCursorState>()
 
 function getRouterRateLimitKey(provider: string, accountId: string): string {
     return `${provider}:${accountId}`
@@ -123,11 +209,11 @@ function markRouterRateLimited(provider: string, accountId: string, durationMs: 
     routerRateLimits.set(key, Date.now() + durationMs)
 }
 
-function getFlowStickyState(flowKey: string, entriesLength: number): FlowStickyState {
-    const existing = flowStickyStates.get(flowKey)
+function getStickyCursorState(map: Map<string, StickyCursorState>, key: string, entriesLength: number): StickyCursorState {
+    const existing = map.get(key)
     if (!existing) {
         const state = { cursor: 0 }
-        flowStickyStates.set(flowKey, state)
+        map.set(key, state)
         return state
     }
     if (existing.cursor < 0 || existing.cursor >= entriesLength) {
@@ -136,21 +222,7 @@ function getFlowStickyState(flowKey: string, entriesLength: number): FlowStickyS
     return existing
 }
 
-function getAccountStickyState(model: string, entriesLength: number): AccountStickyState {
-    const key = model || ""
-    const existing = accountStickyStates.get(key)
-    if (!existing) {
-        const state = { cursor: 0 }
-        accountStickyStates.set(key, state)
-        return state
-    }
-    if (existing.cursor < 0 || existing.cursor >= entriesLength) {
-        existing.cursor = 0
-    }
-    return existing
-}
-
-function advanceAccountCursor(state: AccountStickyState | null, entriesLength: number, currentIndex: number): void {
+function advanceAccountCursor(state: StickyCursorState | null, entriesLength: number, currentIndex: number): void {
     if (!state || entriesLength <= 1) return
     state.cursor = (currentIndex + 1) % entriesLength
 }
@@ -158,7 +230,7 @@ function advanceAccountCursor(state: AccountStickyState | null, entriesLength: n
 function buildOfficialModelIndex(): Map<string, Set<AuthProvider>> {
     const index = new Map<string, Set<AuthProvider>>()
     for (const provider of PROVIDER_ORDER) {
-        const models = getProviderModels(provider)
+        const models = getProviderModels(provider, { includeAllVariants: true })
         for (const model of models) {
             const key = officialModelKey(model.id)
             if (!index.has(key)) {
@@ -185,7 +257,6 @@ function normalizeEntries(entries: RoutingEntry[]): RoutingEntry[] {
             return false
         }
         if (!isEntryUsable(entry)) return false
-        // 🆕 Antigravity 账号需检查是否存在于 accountManager
         if (entry.provider === "antigravity" && entry.accountId !== "auto") {
             if (!accountManager.hasAccount(entry.accountId)) {
                 return false
@@ -219,7 +290,20 @@ function buildAutoEntriesForProvider(provider: AuthProvider): AccountRoutingEntr
     }))
 }
 
-function resolveAccountRoutingEntries(config: RoutingConfig, model: string): AccountRoutingEntry[] {
+function isAccountRoutingEntryValid(entry: AccountRoutingEntry, model: string): boolean {
+    if (!isEntryUsable(entry)) return false
+    if (entry.provider === "antigravity" && entry.accountId !== "auto") {
+        if (!accountManager.hasAccount(entry.accountId)) {
+            return false
+        }
+        if (isAntigravityModelSupportedForAccount(entry.accountId, model) === false) {
+            return false
+        }
+    }
+    return true
+}
+
+export function resolveAccountRoutingEntries(config: RoutingConfig, model: string): AccountRoutingEntry[] {
     const providers = getOfficialModelProviders(model)
     if (providers.length === 0) {
         throw new RoutingError(`Model "${model}" is not an official model`, 400)
@@ -227,7 +311,9 @@ function resolveAccountRoutingEntries(config: RoutingConfig, model: string): Acc
 
     const accountRouting = config.accountRouting
     const smartSwitch = accountRouting?.smartSwitch ?? false
+    const baseModelId = baseModelIdFor(model)
     const route = accountRouting?.routes.find(r => modelIdsMatch(r.modelId, model))
+        || (baseModelId ? accountRouting?.routes.find(r => modelIdsMatch(r.modelId, baseModelId)) : undefined)
 
     let entries: AccountRoutingEntry[] = route?.entries ? [...route.entries] : []
 
@@ -251,25 +337,14 @@ function resolveAccountRoutingEntries(config: RoutingConfig, model: string): Acc
         entries = expanded
     }
 
-    let filtered = entries.filter(entry => providers.includes(entry.provider))
+    const filterValid = (candidates: AccountRoutingEntry[]) =>
+        candidates
+            .filter(entry => providers.includes(entry.provider))
+            .filter(entry => isAccountRoutingEntryValid(entry, model))
 
-    let valid = filtered.filter(entry => {
-        if (!isEntryUsable(entry as RoutingEntry)) return false
-        if (entry.provider === "antigravity" && entry.accountId !== "auto") {
-            return accountManager.hasAccount(entry.accountId)
-        }
-        return true
-    })
-
+    let valid = filterValid(entries)
     if (valid.length === 0 && smartSwitch) {
-        filtered = providers.flatMap(provider => buildAutoEntriesForProvider(provider))
-        valid = filtered.filter(entry => {
-            if (!isEntryUsable(entry as RoutingEntry)) return false
-            if (entry.provider === "antigravity" && entry.accountId !== "auto") {
-                return accountManager.hasAccount(entry.accountId)
-            }
-            return true
-        })
+        valid = filterValid(providers.flatMap(provider => buildAutoEntriesForProvider(provider)))
     }
 
     if (valid.length === 0) {
@@ -308,7 +383,7 @@ function isTransientTransportError(error: unknown): boolean {
 function shouldFallbackOnUpstream(entry: RoutingEntry | AccountRoutingEntry, error: UpstreamError): boolean {
     if ((error as any).streamingStarted) return false
     if (error.status === 429) {
-        return isQuotaExhausted(error) || (error as any).retryable === true
+        return true
     }
     if (entry.provider === "codex" && isCodexUnsupportedModelError(error)) {
         return true
@@ -326,7 +401,7 @@ function shouldAdvanceCursorOnError(entry: RoutingEntry | AccountRoutingEntry, e
     if (error.status === 401 || error.status === 403) return true
     if (error.status === 404) return true
     if (error.status >= 500) return true
-    if (error.status === 429 && isQuotaExhausted(error)) return true
+    if (error.status === 429) return true
     return false
 }
 
@@ -347,9 +422,12 @@ function isQuotaExhausted(error: UpstreamError): boolean {
             const details = err?.details
             if (Array.isArray(details)) {
                 for (const detail of details) {
-                    if (detail?.reason === "QUOTA_EXHAUSTED") return true
+                    if (detail?.reason === "QUOTA_EXHAUSTED" || detail?.reason === "RESOURCE_EXHAUSTED") return true
                 }
             }
+            const status = String(err?.status || "")
+            if (status === "RESOURCE_EXHAUSTED") return true
+            if (errMessage.toLowerCase().includes("resource exhausted") || errMessage.toLowerCase().includes("resource_exhausted")) return true
         } catch {
             // ignore parse errors
         }
@@ -358,6 +436,7 @@ function isQuotaExhausted(error: UpstreamError): boolean {
     const lower = body.toLowerCase()
     if (lower.includes("usage_limit_reached") || lower.includes("usage limit")) return true
     if (lower.includes("quota_exhausted")) return true
+    if (lower.includes("resource_exhausted") || lower.includes("resource exhausted")) return true
     if (lower.includes("quota") && lower.includes("reset")) return true
     return false
 }
@@ -387,18 +466,6 @@ function findFlow(config: RoutingConfig, model: string): RoutingConfig["flows"][
     return config.flows.find(flow => modelIdsMatch(flow.name, flowKey))
 }
 
-function selectFlowEntries(config: RoutingConfig, model: string): RoutingEntry[] {
-    return findFlow(config, model)?.entries || []
-}
-
-function resolveFlowEntries(config: RoutingConfig, model: string): RoutingEntry[] {
-    const entries = normalizeEntries(selectFlowEntries(config, model))
-    if (entries.length === 0) {
-        throw new RoutingError(`No flow routing entries configured for model "${model}"`, 400)
-    }
-    return entries
-}
-
 function resolveFlowSelection(config: RoutingConfig, model: string): { flowKey: string; entries: RoutingEntry[] } {
     const flow = findFlow(config, model)
     const flowKey = flow?.name || getFlowKey(model)
@@ -418,10 +485,6 @@ function resolveActiveFlowSelection(config: RoutingConfig): { flowKey: string; e
     return { flowKey: flow.name || "active", entries }
 }
 
-function resolveAccountEntries(config: RoutingConfig, model: string): AccountRoutingEntry[] {
-    return resolveAccountRoutingEntries(config, model)
-}
-
 function shouldSkipFlowEntry(
     entry: RoutingEntry,
     entriesLength: number,
@@ -430,6 +493,9 @@ function shouldSkipFlowEntry(
     const ignoreRateLimit = options.ignoreRateLimit ?? false
     if (entry.provider === "antigravity") {
         const accountId = entry.accountId === "auto" ? undefined : entry.accountId
+        if (accountId && isAntigravityModelSupportedForAccount(accountId, entry.modelId) === false) {
+            return true
+        }
         if (!ignoreRateLimit && accountId && entriesLength > 1) {
             const isLimited = accountManager.isAccountRateLimited(accountId) || isRouterRateLimited("antigravity", accountId)
             if (isLimited) return true
@@ -453,7 +519,12 @@ function shouldSkipFlowEntry(
     return !account
 }
 
-function applyFlowRateLimit(entry: RoutingEntry, error: UpstreamError, requestModel: string): void {
+function applyEntryRateLimit(
+    entry: RoutingEntry | AccountRoutingEntry,
+    error: UpstreamError,
+    requestModel: string,
+    defaultAntigravityCooldownMs: number
+): void {
     if (entry.provider === "antigravity" && entry.accountId !== "auto") {
         // 404 is usually a model-account mismatch or transient upstream routing miss,
         // not an account quota/rate-limit signal. Avoid cooling down the account.
@@ -462,16 +533,28 @@ function applyFlowRateLimit(entry: RoutingEntry, error: UpstreamError, requestMo
         if (error.status === 404 || error.status === 401 || error.status === 403) {
             return
         }
-        const cooldownMs = error.status >= 500 ? ANTIGRAVITY_SERVER_ERROR_COOLDOWN_MS : 30_000
-        accountManager
-            .markRateLimitedFromError(entry.accountId, error.status, error.body, error.retryAfter, requestModel, { maxDurationMs: cooldownMs })
-            .then((limit) => {
-                const duration = limit?.durationMs ?? cooldownMs
-                markRouterRateLimited("antigravity", entry.accountId, duration)
-            })
-            .catch(() => {
-                markRouterRateLimited("antigravity", entry.accountId, cooldownMs)
-            })
+        const cooldownMs = error.status >= 500 ? ANTIGRAVITY_SERVER_ERROR_COOLDOWN_MS : defaultAntigravityCooldownMs
+        if (defaultAntigravityCooldownMs === DEFAULT_ROUTER_COOLDOWN_MS) {
+            accountManager.markRateLimitedFromError(
+                entry.accountId,
+                error.status,
+                error.body,
+                error.retryAfter,
+                requestModel,
+                { maxDurationMs: cooldownMs }
+            )
+            markRouterRateLimited("antigravity", entry.accountId, cooldownMs)
+        } else {
+            accountManager
+                .markRateLimitedFromError(entry.accountId, error.status, error.body, error.retryAfter, requestModel, { maxDurationMs: cooldownMs })
+                .then((limit) => {
+                    const duration = limit?.durationMs ?? cooldownMs
+                    markRouterRateLimited("antigravity", entry.accountId, duration)
+                })
+                .catch(() => {
+                    markRouterRateLimited("antigravity", entry.accountId, cooldownMs)
+                })
+        }
         return
     }
 
@@ -480,7 +563,7 @@ function applyFlowRateLimit(entry: RoutingEntry, error: UpstreamError, requestMo
     }
 }
 
-function advanceFlowCursor(flowState: FlowStickyState | null, entries: RoutingEntry[], startIndex: number): void {
+function advanceFlowCursor(flowState: StickyCursorState | null, entries: RoutingEntry[], startIndex: number): void {
     if (!flowState || entries.length <= 1) return
     for (let offset = 1; offset < entries.length; offset++) {
         const nextIndex = (startIndex + offset) % entries.length
@@ -492,12 +575,26 @@ function advanceFlowCursor(flowState: FlowStickyState | null, entries: RoutingEn
     }
 }
 
-function recordProviderUsage(modelId: string, completion: ProviderUsage | null | undefined): void {
+function recordProviderUsage(
+    modelId: string,
+    completion: ProviderCompletion | null | undefined,
+    provider?: string,
+    accountId?: string
+): void {
     if (!completion?.usage) return
     const inputTokens = completion.usage.inputTokens ?? 0
+    const cacheReadTokens = completion.usage.cacheReadTokens ?? 0
     const outputTokens = completion.usage.outputTokens ?? 0
-    if (inputTokens > 0 || outputTokens > 0) {
-        recordUsage(modelId, inputTokens, outputTokens)
+    if (inputTokens > 0 || outputTokens > 0 || cacheReadTokens > 0) {
+        recordUsage(modelId, inputTokens, outputTokens, cacheReadTokens)
+        if (provider && accountId) {
+            recordIntelligentTokenUsage(provider, accountId, {
+                uncachedInputTokens: inputTokens,
+                outputTokens,
+                cacheReadTokens,
+                model: modelId,
+            })
+        }
     }
 }
 
@@ -506,12 +603,12 @@ async function createHostedProviderCompletion(
     account: ProviderAccount,
     model: string,
     request: RoutedRequest
-) {
+): Promise<ProviderCompletion> {
     if (provider === "codex") {
         return createCodexCompletion(account, model, request.messages, request.tools, request.maxTokens, request.reasoningEffort, request.signal)
     }
     if (provider === "copilot") {
-        return createCopilotCompletion(account, model, request.messages, request.tools, request.maxTokens, request.signal)
+        return createCopilotCompletion(account, model, request.messages, request.tools, request.maxTokens, request.reasoningEffort, request.signal)
     }
     if (provider === "zed") {
         return createZedCompletion(account, model, request.messages, request.tools, request.maxTokens, request.reasoningEffort, request.signal)
@@ -525,9 +622,117 @@ async function createHostedProviderCompletion(
     throw new Error("Unsupported provider")
 }
 
+function* emitHostedCompletionAsSse(model: string, completion: ProviderCompletion): Generator<string, void, unknown> {
+    yield buildMessageStart(model)
+    let blockIndex = 0
+    for (const block of completion.contentBlocks) {
+        if (block.type === "tool_use") {
+            yield buildContentBlockStart(blockIndex, "tool_use", { id: block.id!, name: block.name! })
+            const inputText = JSON.stringify(block.input || {})
+            yield buildInputJsonDelta(blockIndex, inputText)
+            yield buildContentBlockStop(blockIndex)
+            blockIndex++
+            continue
+        }
+
+        yield buildContentBlockStart(blockIndex, "text")
+        yield buildTextDelta(blockIndex, block.text || "")
+        yield buildContentBlockStop(blockIndex)
+        blockIndex++
+    }
+    yield buildMessageDelta(
+        completion.stopReason || "end_turn",
+        completion.usage ? { inputTokens: completion.usage.inputTokens ?? 0, outputTokens: completion.usage.outputTokens ?? 0 } : undefined
+    )
+    yield buildMessageStop()
+}
+
+function handleFlowEntryError(
+    entry: RoutingEntry,
+    error: unknown,
+    requestModel: string,
+    flowState: StickyCursorState | null,
+    entries: RoutingEntry[],
+    index: number,
+    startIndex: number
+): boolean {
+    if (entry.provider === "antigravity" && isAccountUnavailableError(error)) {
+        return true
+    }
+    if (error instanceof UpstreamError && shouldFallbackOnUpstream(entry, error)) {
+        if (entry.provider === "antigravity" && error.status === 404 && entry.accountId !== "auto") {
+            markAntigravityModelUnsupported(entry.accountId, requestModel)
+        }
+        if (shouldAdvanceCursorOnError(entry, error)) {
+            applyEntryRateLimit(entry, error, requestModel, 30_000)
+            if (flowState && index === startIndex) {
+                advanceFlowCursor(flowState, entries, startIndex)
+            }
+        }
+        return true
+    }
+    if (isTransientTransportError(error)) {
+        if (entry.provider !== "antigravity") {
+            authStore.markRateLimited(entry.provider, entry.accountId, 500, (error as Error).message)
+        }
+        return true
+    }
+    return false
+}
+
+function selectFallbackFlowEntry(entries: RoutingEntry[], fallbackIndex: number): RoutingEntry {
+    for (let offset = 0; offset < entries.length; offset++) {
+        const index = (fallbackIndex + offset) % entries.length
+        const candidate = entries[index]
+        if (!shouldSkipFlowEntry(candidate, entries.length)) {
+            return candidate
+        }
+    }
+    const cursorEntry = entries[fallbackIndex]
+    if (cursorEntry.provider === "codex") {
+        const support = isCodexModelSupportedForAccount(cursorEntry.accountId, cursorEntry.modelId)
+        if (support === false) {
+            throw new RoutingError("No routing entries available", 400)
+        }
+    }
+    return cursorEntry
+}
+
+function handleAccountEntryError(
+    entry: AccountRoutingEntry,
+    error: unknown,
+    requestModel: string,
+    accountState: StickyCursorState,
+    entriesLength: number,
+    index: number
+): boolean {
+    if (entry.provider === "antigravity" && isAccountUnavailableError(error)) {
+        advanceAccountCursor(accountState, entriesLength, index)
+        return true
+    }
+    if (error instanceof UpstreamError && shouldFallbackOnUpstream(entry, error)) {
+        if (entry.provider === "antigravity" && error.status === 404 && entry.accountId !== "auto") {
+            markAntigravityModelUnsupported(entry.accountId, requestModel)
+        }
+        if (shouldAdvanceCursorOnError(entry, error)) {
+            applyEntryRateLimit(entry, error, requestModel, DEFAULT_ROUTER_COOLDOWN_MS)
+            advanceAccountCursor(accountState, entriesLength, index)
+        }
+        return true
+    }
+    if (isTransientTransportError(error)) {
+        if (entry.provider !== "antigravity") {
+            authStore.markRateLimited(entry.provider, entry.accountId, 500, (error as Error).message)
+            advanceAccountCursor(accountState, entriesLength, index)
+        }
+        return true
+    }
+    return false
+}
+
 async function createFlowCompletionWithEntries(request: RoutedRequest, entries: RoutingEntry[], flowKey?: string) {
     let lastError: Error | null = null
-    const flowState = flowKey ? getFlowStickyState(flowKey, entries.length) : null
+    const flowState = flowKey ? getStickyCursorState(flowStickyStates, flowKey, entries.length) : null
     const startIndex = flowState?.cursor ?? 0
 
     const attemptEntry = async (entry: RoutingEntry) => {
@@ -536,7 +741,7 @@ async function createFlowCompletionWithEntries(request: RoutedRequest, entries: 
             setRequestLogContext({ model: entry.modelId, provider: "antigravity", account: entry.accountId, routeTag: "fr" })
             return await createChatCompletionWithOptions({ ...request, model: entry.modelId }, {
                 accountId,
-                allowRotation: accountId ? false : true,
+                allowRotation: !accountId,
                 routeTag: "fr",
             })
         }
@@ -570,23 +775,7 @@ async function createFlowCompletionWithEntries(request: RoutedRequest, entries: 
             return result
         } catch (error) {
             lastError = error as Error
-            if (entry.provider === "antigravity" && isAccountUnavailableError(error)) {
-                continue
-            }
-            if (error instanceof UpstreamError && shouldFallbackOnUpstream(entry, error)) {
-                const shouldAdvance = shouldAdvanceCursorOnError(entry, error)
-                if (shouldAdvance) {
-                    applyFlowRateLimit(entry, error, request.model)
-                    if (flowState && index === startIndex) {
-                        advanceFlowCursor(flowState, entries, startIndex)
-                    }
-                }
-                continue
-            }
-            if (isTransientTransportError(error)) {
-                if (entry.provider !== "antigravity") {
-                    authStore.markRateLimited(entry.provider, entry.accountId, 500, (error as Error).message)
-                }
+            if (handleFlowEntryError(entry, error, request.model, flowState, entries, index, startIndex)) {
                 continue
             }
             throw error
@@ -594,33 +783,8 @@ async function createFlowCompletionWithEntries(request: RoutedRequest, entries: 
     }
 
     if (!lastError && entries.length > 0) {
-        const fallbackIndex = flowState?.cursor ?? 0
-        let entry: RoutingEntry | null = null
-        for (let offset = 0; offset < entries.length; offset++) {
-            const index = (fallbackIndex + offset) % entries.length
-            const candidate = entries[index]
-            if (shouldSkipFlowEntry(candidate, entries.length)) {
-                continue
-            }
-            entry = candidate
-            break
-        }
-        if (!entry) {
-            const cursorEntry = entries[fallbackIndex]
-            if (cursorEntry.provider === "codex") {
-                const support = isCodexModelSupportedForAccount(cursorEntry.accountId, cursorEntry.modelId)
-                if (support === false) {
-                    throw new RoutingError("No routing entries available", 400)
-                }
-            }
-            entry = cursorEntry
-        }
-        try {
-            return await attemptEntry(entry)
-        } catch (error) {
-            lastError = error as Error
-            throw error
-        }
+        const entry = selectFallbackFlowEntry(entries, flowState?.cursor ?? 0)
+        return await attemptEntry(entry)
     }
 
     if (lastError) {
@@ -630,22 +794,79 @@ async function createFlowCompletionWithEntries(request: RoutedRequest, entries: 
     throw new RoutingError("No routing entries available", 400)
 }
 
-async function createAccountCompletionWithEntries(request: RoutedRequest, entries: AccountRoutingEntry[]) {
-    let lastError: Error | null = null
-    const accountState = getAccountStickyState(request.model, entries.length)
-    const startIndex = accountState?.cursor ?? 0
+function orderAccountEntriesForRequest(
+    entries: AccountRoutingEntry[],
+    request: RoutedRequest,
+    useIntelligentRouting: boolean
+): {
+    orderedEntries: Array<{ entry: AccountRoutingEntry; originalIndex: number }>
+    sessionKey?: string
+    accountState: StickyCursorState
+} {
+    const accountState = getStickyCursorState(accountStickyStates, request.model || "", entries.length)
+    const startIndex = accountState.cursor
+    const sessionKey =
+        typeof computeSessionKey === "function" && Array.isArray(request.messages) && request.messages.length > 0
+            ? computeSessionKey(request.messages)
+            : undefined
 
+    if (useIntelligentRouting && entries.length > 1) {
+        const ranked = rankAccountCandidates(entries, {
+            model: request.model,
+            sessionKey,
+            isInFlight: (id) => accountManager.isAccountInFlight?.(id) ?? false,
+            getConsecutiveFailures: (id) => accountManager.getAccount?.(id)?.consecutiveFailures ?? 0,
+            getTotalTokens: (id) => accountManager.getAccountUsage?.(id) ?? 0,
+            messages: request.messages,
+        })
+        return {
+            orderedEntries: ranked.map((r) => ({ entry: r.entry, originalIndex: r.originalIndex })),
+            sessionKey,
+            accountState,
+        }
+    }
+
+    const orderedEntries: Array<{ entry: AccountRoutingEntry; originalIndex: number }> = []
     for (let offset = 0; offset < entries.length; offset++) {
         const index = (startIndex + offset) % entries.length
-        const entry = entries[index]
+        orderedEntries.push({ entry: entries[index], originalIndex: index })
+    }
+    return { orderedEntries, sessionKey, accountState }
+}
+
+async function createAccountCompletionWithEntries(
+    request: RoutedRequest,
+    entries: AccountRoutingEntry[],
+    useIntelligentRouting: boolean = false
+) {
+    let lastError: Error | null = null
+    const { orderedEntries, sessionKey, accountState } = orderAccountEntriesForRequest(
+        entries,
+        request,
+        useIntelligentRouting
+    )
+    let inFlightEntry: { entry: AccountRoutingEntry; index: number } | null = null
+    let hasRateLimited = false
+
+    for (const { entry, originalIndex: index } of orderedEntries) {
         try {
             if (entry.provider === "antigravity") {
                 if (entry.accountId === "auto") {
                     throw new RoutingError(`Account routing entry for "${request.model}" cannot use auto without smart switch expansion`, 400)
                 }
+                if (isAntigravityModelSupportedForAccount(entry.accountId, request.model) === false) {
+                    advanceAccountCursor(accountState, entries.length, index)
+                    continue
+                }
                 const isLimited = accountManager.isAccountRateLimited(entry.accountId) || isRouterRateLimited("antigravity", entry.accountId)
-                if (isLimited) continue
-                if (entries.length > 1 && accountManager.isAccountInFlight(entry.accountId)) continue
+                if (isLimited) {
+                    hasRateLimited = true
+                    continue
+                }
+                if (entries.length > 1 && accountManager.isAccountInFlight(entry.accountId)) {
+                    if (!inFlightEntry) inFlightEntry = { entry, index }
+                    continue
+                }
                 const accountDisplay = getAccountDisplay("antigravity", entry.accountId)
                 setRequestLogContext({ model: request.model, provider: "antigravity", account: accountDisplay, routeTag: "ar" })
                 const result = await createChatCompletionWithOptions({ ...request, model: request.model }, {
@@ -653,11 +874,15 @@ async function createAccountCompletionWithEntries(request: RoutedRequest, entrie
                     allowRotation: false,
                     routeTag: "ar",
                 })
+                if (useIntelligentRouting) {
+                    recordIntelligentDispatch("antigravity", entry.accountId, sessionKey, request.model)
+                }
                 accountState.cursor = index
                 return result
             }
 
             if (authStore.isRateLimited(entry.provider, entry.accountId)) {
+                hasRateLimited = true
                 continue
             }
 
@@ -678,72 +903,71 @@ async function createAccountCompletionWithEntries(request: RoutedRequest, entrie
 
             const startTime = Date.now()
             const result = await createHostedProviderCompletion(entry.provider, account, request.model, request)
-            recordProviderUsage(request.model, result)
+            recordProviderUsage(request.model, result, entry.provider, entry.accountId)
+            if (useIntelligentRouting) {
+                recordIntelligentDispatch(entry.provider, entry.accountId, sessionKey, request.model)
+            }
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
             console.log(formatSuccessLine({ elapsed, model: request.model, provider: entry.provider, account: accountDisplay, routeTag: "ar" }))
             accountState.cursor = index
             return result
         } catch (error) {
             lastError = error as Error
-            if (entry.provider === "antigravity" && isAccountUnavailableError(error)) {
-                advanceAccountCursor(accountState, entries.length, index)
-                continue
-            }
-            if (error instanceof UpstreamError && shouldFallbackOnUpstream(entry, error)) {
-                const shouldAdvance = shouldAdvanceCursorOnError(entry, error)
-                if (shouldAdvance) {
-                    if (entry.provider === "antigravity") {
-                        if (error.status !== 404 && error.status !== 401 && error.status !== 403) {
-                            const cooldownMs = error.status >= 500 ? ANTIGRAVITY_SERVER_ERROR_COOLDOWN_MS : DEFAULT_ROUTER_COOLDOWN_MS
-                            accountManager.markRateLimitedFromError(
-                                entry.accountId,
-                                error.status,
-                                error.body,
-                                error.retryAfter,
-                                request.model,
-                                { maxDurationMs: cooldownMs }
-                            )
-                            markRouterRateLimited("antigravity", entry.accountId, cooldownMs)
-                        }
-                    } else {
-                        authStore.markRateLimited(entry.provider, entry.accountId, error.status, error.body, error.retryAfter)
-                    }
-                    advanceAccountCursor(accountState, entries.length, index)
-                }
-                continue
-            }
-            if (isTransientTransportError(error)) {
-                if (entry.provider !== "antigravity") {
-                    authStore.markRateLimited(entry.provider, entry.accountId, 500, (error as Error).message)
-                    advanceAccountCursor(accountState, entries.length, index)
-                }
+            if (handleAccountEntryError(entry, error, request.model, accountState, entries.length, index)) {
                 continue
             }
             throw error
         }
     }
 
+    if (inFlightEntry && inFlightEntry.entry.provider === "antigravity") {
+        const { entry, index } = inFlightEntry
+        const accountDisplay = getAccountDisplay("antigravity", entry.accountId)
+        setRequestLogContext({ model: request.model, provider: "antigravity", account: accountDisplay, routeTag: "ar" })
+        const result = await createChatCompletionWithOptions({ ...request, model: request.model }, {
+            accountId: entry.accountId,
+            allowRotation: false,
+            routeTag: "ar",
+        })
+        if (useIntelligentRouting) {
+            recordIntelligentDispatch("antigravity", entry.accountId, sessionKey, request.model)
+        }
+        accountState.cursor = index
+        return result
+    }
+
     if (lastError) {
         throw lastError
+    }
+
+    if (hasRateLimited) {
+        throw new UpstreamError("antigravity", 429, `All accounts for model "${request.model}" are currently rate-limited.`)
     }
 
     throw new RoutingError(`No account routing entries available for model "${request.model}"`, 400)
 }
 
-export async function createRoutedCompletion(request: RoutedRequest) {
+function prepareRoutedRequest(request: RoutedRequest): { normalizedModel: string; normalizedRequest: RoutedRequest; config: RoutingConfig } {
     const normalizedModel = normalizeOfficialModelId(request.model)
     if (isHiddenCodexModel(normalizedModel)) {
         throw new RoutingError("Model is not available", 400)
     }
     const normalizedRequest = normalizedModel === request.model ? request : { ...request, model: normalizedModel }
     const config = loadRoutingConfig()
+    return { normalizedModel, normalizedRequest, config }
+}
+
+export async function createRoutedCompletion(request: RoutedRequest) {
+    const { normalizedModel, normalizedRequest, config } = prepareRoutedRequest(request)
     const activeFlow = resolveActiveFlowSelection(config)
     if (activeFlow) {
         return createFlowCompletionWithEntries(normalizedRequest, activeFlow.entries, activeFlow.flowKey)
     }
+    if (!isOfficialModel(normalizedModel)) await ensureProviderModelsSynced()
     if (isOfficialModel(normalizedModel)) {
-        const accountEntries = resolveAccountEntries(config, normalizedModel)
-        return createAccountCompletionWithEntries(normalizedRequest, accountEntries)
+        const accountEntries = resolveAccountRoutingEntries(config, normalizedModel)
+        const useIntelligent = isCacheAwareRoutingEnabled() || (config.accountRouting?.smartSwitch ?? false)
+        return createAccountCompletionWithEntries(normalizedRequest, accountEntries, useIntelligent)
     }
 
     const flowSelection = resolveFlowSelection(config, normalizedRequest.model)
@@ -752,7 +976,7 @@ export async function createRoutedCompletion(request: RoutedRequest) {
 
 async function* createFlowCompletionStreamWithEntries(request: RoutedRequest, entries: RoutingEntry[], flowKey?: string): AsyncGenerator<string, void, unknown> {
     let lastError: Error | null = null
-    const flowState = flowKey ? getFlowStickyState(flowKey, entries.length) : null
+    const flowState = flowKey ? getStickyCursorState(flowStickyStates, flowKey, entries.length) : null
     const startIndex = flowState?.cursor ?? 0
 
     async function* streamEntry(entry: RoutingEntry): AsyncGenerator<string, void, unknown> {
@@ -761,7 +985,7 @@ async function* createFlowCompletionStreamWithEntries(request: RoutedRequest, en
             setRequestLogContext({ model: entry.modelId, provider: "antigravity", account: entry.accountId, routeTag: "fr" })
             yield* createChatCompletionStreamWithOptions({ ...request, model: entry.modelId }, {
                 accountId,
-                allowRotation: accountId ? false : true,
+                allowRotation: !accountId,
                 routeTag: "fr",
             })
             return
@@ -776,31 +1000,11 @@ async function* createFlowCompletionStreamWithEntries(request: RoutedRequest, en
 
         const startTime = Date.now()
         const completion = await createHostedProviderCompletion(entry.provider, account, entry.modelId, request)
-
         if (!completion) {
             throw new Error("Empty completion")
         }
 
-        yield buildMessageStart(request.model)
-        let blockIndex = 0
-        for (const block of completion.contentBlocks) {
-            if (block.type === "tool_use") {
-                yield buildContentBlockStart(blockIndex, "tool_use", { id: block.id!, name: block.name! })
-                const inputText = JSON.stringify(block.input || {})
-                yield buildInputJsonDelta(blockIndex, inputText)
-                yield buildContentBlockStop(blockIndex)
-                blockIndex++
-                continue
-            }
-
-            yield buildContentBlockStart(blockIndex, "text")
-            yield buildTextDelta(blockIndex, block.text || "")
-            yield buildContentBlockStop(blockIndex)
-            blockIndex++
-        }
-        yield buildMessageDelta(completion.stopReason || "end_turn", completion.usage)
-        yield buildMessageStop()
-
+        yield* emitHostedCompletionAsSse(request.model, completion)
         recordProviderUsage(entry.modelId, completion)
 
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
@@ -821,23 +1025,7 @@ async function* createFlowCompletionStreamWithEntries(request: RoutedRequest, en
             return
         } catch (error) {
             lastError = error as Error
-            if (entry.provider === "antigravity" && isAccountUnavailableError(error)) {
-                continue
-            }
-            if (error instanceof UpstreamError && shouldFallbackOnUpstream(entry, error)) {
-                const shouldAdvance = shouldAdvanceCursorOnError(entry, error)
-                if (shouldAdvance) {
-                    applyFlowRateLimit(entry, error, request.model)
-                    if (flowState && index === startIndex) {
-                        advanceFlowCursor(flowState, entries, startIndex)
-                    }
-                }
-                continue
-            }
-            if (isTransientTransportError(error)) {
-                if (entry.provider !== "antigravity") {
-                    authStore.markRateLimited(entry.provider, entry.accountId, 500, (error as Error).message)
-                }
+            if (handleFlowEntryError(entry, error, request.model, flowState, entries, index, startIndex)) {
                 continue
             }
             throw error
@@ -845,27 +1033,7 @@ async function* createFlowCompletionStreamWithEntries(request: RoutedRequest, en
     }
 
     if (!lastError && entries.length > 0) {
-        const fallbackIndex = flowState?.cursor ?? 0
-        let entry: RoutingEntry | null = null
-        for (let offset = 0; offset < entries.length; offset++) {
-            const index = (fallbackIndex + offset) % entries.length
-            const candidate = entries[index]
-            if (shouldSkipFlowEntry(candidate, entries.length)) {
-                continue
-            }
-            entry = candidate
-            break
-        }
-        if (!entry) {
-            const cursorEntry = entries[fallbackIndex]
-            if (cursorEntry.provider === "codex") {
-                const support = isCodexModelSupportedForAccount(cursorEntry.accountId, cursorEntry.modelId)
-                if (support === false) {
-                    throw new RoutingError("No routing entries available", 400)
-                }
-            }
-            entry = cursorEntry
-        }
+        const entry = selectFallbackFlowEntry(entries, flowState?.cursor ?? 0)
         yield* streamEntry(entry)
         return
     }
@@ -877,22 +1045,39 @@ async function* createFlowCompletionStreamWithEntries(request: RoutedRequest, en
     throw new RoutingError("No routing entries available", 400)
 }
 
-async function* createAccountCompletionStreamWithEntries(request: RoutedRequest, entries: AccountRoutingEntry[]): AsyncGenerator<string, void, unknown> {
+async function* createAccountCompletionStreamWithEntries(
+    request: RoutedRequest,
+    entries: AccountRoutingEntry[],
+    useIntelligentRouting: boolean = false
+): AsyncGenerator<string, void, unknown> {
     let lastError: Error | null = null
-    const accountState = getAccountStickyState(request.model, entries.length)
-    const startIndex = accountState?.cursor ?? 0
+    const { orderedEntries, sessionKey, accountState } = orderAccountEntriesForRequest(
+        entries,
+        request,
+        useIntelligentRouting
+    )
+    let inFlightEntry: { entry: AccountRoutingEntry; index: number } | null = null
+    let hasRateLimited = false
 
-    for (let offset = 0; offset < entries.length; offset++) {
-        const index = (startIndex + offset) % entries.length
-        const entry = entries[index]
+    for (const { entry, originalIndex: index } of orderedEntries) {
         try {
             if (entry.provider === "antigravity") {
                 if (entry.accountId === "auto") {
                     throw new RoutingError(`Account routing entry for "${request.model}" cannot use auto without smart switch expansion`, 400)
                 }
+                if (isAntigravityModelSupportedForAccount(entry.accountId, request.model) === false) {
+                    advanceAccountCursor(accountState, entries.length, index)
+                    continue
+                }
                 const isLimited = accountManager.isAccountRateLimited(entry.accountId) || isRouterRateLimited("antigravity", entry.accountId)
-                if (isLimited) continue
-                if (entries.length > 1 && accountManager.isAccountInFlight(entry.accountId)) continue
+                if (isLimited) {
+                    hasRateLimited = true
+                    continue
+                }
+                if (entries.length > 1 && accountManager.isAccountInFlight(entry.accountId)) {
+                    if (!inFlightEntry) inFlightEntry = { entry, index }
+                    continue
+                }
                 const accountDisplay = getAccountDisplay("antigravity", entry.accountId)
                 setRequestLogContext({ model: request.model, provider: "antigravity", account: accountDisplay, routeTag: "ar" })
                 yield* createChatCompletionStreamWithOptions({ ...request, model: request.model }, {
@@ -900,11 +1085,15 @@ async function* createAccountCompletionStreamWithEntries(request: RoutedRequest,
                     allowRotation: false,
                     routeTag: "ar",
                 })
+                if (useIntelligentRouting) {
+                    recordIntelligentDispatch("antigravity", entry.accountId, sessionKey, request.model)
+                }
                 accountState.cursor = index
                 return
             }
 
             if (authStore.isRateLimited(entry.provider, entry.accountId)) {
+                hasRateLimited = true
                 continue
             }
 
@@ -925,32 +1114,15 @@ async function* createAccountCompletionStreamWithEntries(request: RoutedRequest,
 
             const startTime = Date.now()
             const completion = await createHostedProviderCompletion(entry.provider, account, request.model, request)
-
             if (!completion) {
                 throw new Error("Empty completion")
             }
 
-            yield buildMessageStart(request.model)
-            let blockIndex = 0
-            for (const block of completion.contentBlocks) {
-                if (block.type === "tool_use") {
-                    yield buildContentBlockStart(blockIndex, "tool_use", { id: block.id!, name: block.name! })
-                    const inputText = JSON.stringify(block.input || {})
-                    yield buildInputJsonDelta(blockIndex, inputText)
-                    yield buildContentBlockStop(blockIndex)
-                    blockIndex++
-                    continue
-                }
-
-                yield buildContentBlockStart(blockIndex, "text")
-                yield buildTextDelta(blockIndex, block.text || "")
-                yield buildContentBlockStop(blockIndex)
-                blockIndex++
+            yield* emitHostedCompletionAsSse(request.model, completion)
+            recordProviderUsage(request.model, completion, entry.provider, entry.accountId)
+            if (useIntelligentRouting) {
+                recordIntelligentDispatch(entry.provider, entry.accountId, sessionKey, request.model)
             }
-            yield buildMessageDelta(completion.stopReason || "end_turn", completion.usage)
-            yield buildMessageStop()
-
-            recordProviderUsage(request.model, completion)
 
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
             console.log(formatSuccessLine({ elapsed, model: request.model, provider: entry.provider, account: accountDisplay, routeTag: "ar" }))
@@ -958,67 +1130,53 @@ async function* createAccountCompletionStreamWithEntries(request: RoutedRequest,
             return
         } catch (error) {
             lastError = error as Error
-            if (entry.provider === "antigravity" && isAccountUnavailableError(error)) {
-                advanceAccountCursor(accountState, entries.length, index)
-                continue
-            }
-            if (error instanceof UpstreamError && shouldFallbackOnUpstream(entry, error)) {
-                const shouldAdvance = shouldAdvanceCursorOnError(entry, error)
-                if (shouldAdvance) {
-                    if (entry.provider === "antigravity") {
-                        if (error.status !== 404 && error.status !== 401 && error.status !== 403) {
-                            const cooldownMs = error.status >= 500 ? ANTIGRAVITY_SERVER_ERROR_COOLDOWN_MS : DEFAULT_ROUTER_COOLDOWN_MS
-                            accountManager.markRateLimitedFromError(
-                                entry.accountId,
-                                error.status,
-                                error.body,
-                                error.retryAfter,
-                                request.model,
-                                { maxDurationMs: cooldownMs }
-                            )
-                            markRouterRateLimited("antigravity", entry.accountId, cooldownMs)
-                        }
-                    } else {
-                        authStore.markRateLimited(entry.provider, entry.accountId, error.status, error.body, error.retryAfter)
-                    }
-                    advanceAccountCursor(accountState, entries.length, index)
-                }
-                continue
-            }
-            if (isTransientTransportError(error)) {
-                if (entry.provider !== "antigravity") {
-                    authStore.markRateLimited(entry.provider, entry.accountId, 500, (error as Error).message)
-                    advanceAccountCursor(accountState, entries.length, index)
-                }
+            if (handleAccountEntryError(entry, error, request.model, accountState, entries.length, index)) {
                 continue
             }
             throw error
         }
     }
 
+    if (inFlightEntry && inFlightEntry.entry.provider === "antigravity") {
+        const { entry, index } = inFlightEntry
+        const accountDisplay = getAccountDisplay("antigravity", entry.accountId)
+        setRequestLogContext({ model: request.model, provider: "antigravity", account: accountDisplay, routeTag: "ar" })
+        yield* createChatCompletionStreamWithOptions({ ...request, model: request.model }, {
+            accountId: entry.accountId,
+            allowRotation: false,
+            routeTag: "ar",
+        })
+        if (useIntelligentRouting) {
+            recordIntelligentDispatch("antigravity", entry.accountId, sessionKey, request.model)
+        }
+        accountState.cursor = index
+        return
+    }
+
     if (lastError) {
         throw lastError
+    }
+
+    if (hasRateLimited) {
+        throw new UpstreamError("antigravity", 429, `All accounts for model "${request.model}" are currently rate-limited.`)
     }
 
     throw new RoutingError(`No account routing entries available for model "${request.model}"`, 400)
 }
 
 export async function* createRoutedCompletionStream(request: RoutedRequest): AsyncGenerator<string, void, unknown> {
-    const normalizedModel = normalizeOfficialModelId(request.model)
-    if (isHiddenCodexModel(normalizedModel)) {
-        throw new RoutingError("Model is not available", 400)
-    }
-    const normalizedRequest = normalizedModel === request.model ? request : { ...request, model: normalizedModel }
-    const config = loadRoutingConfig()
+    const { normalizedModel, normalizedRequest, config } = prepareRoutedRequest(request)
     const activeFlow = resolveActiveFlowSelection(config)
     if (activeFlow) {
         yield* createFlowCompletionStreamWithEntries(normalizedRequest, activeFlow.entries, activeFlow.flowKey)
         return
     }
 
+    if (!isOfficialModel(normalizedModel)) await ensureProviderModelsSynced()
     if (isOfficialModel(normalizedModel)) {
-        const accountEntries = resolveAccountEntries(config, normalizedModel)
-        yield* createAccountCompletionStreamWithEntries(normalizedRequest, accountEntries)
+        const accountEntries = resolveAccountRoutingEntries(config, normalizedModel)
+        const useIntelligent = isCacheAwareRoutingEnabled() || (config.accountRouting?.smartSwitch ?? false)
+        yield* createAccountCompletionStreamWithEntries(normalizedRequest, accountEntries, useIntelligent)
         return
     }
 
