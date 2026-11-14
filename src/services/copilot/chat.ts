@@ -491,9 +491,12 @@ export async function createCopilotCompletion(
     return toProviderCompletion(data, account.id)
 }
 
+const COPILOT_MODEL_SYNC_TIMEOUT_MS = 8_000
+const DEFAULT_INSECURE_FETCH_TIMEOUT_MS = 120_000
+
 export async function listCopilotModelsForAccount(account: ProviderAccount, signal?: AbortSignal): Promise<CopilotModelInfo[]> {
-    const { token: apiToken, capiBaseUrl } = await getCopilotApiTokenInfo(account, signal)
-    return fetchCopilotModels(apiToken, capiBaseUrl, signal)
+    const { token: apiToken, capiBaseUrl } = await getCopilotApiTokenInfo(account, signal, COPILOT_MODEL_SYNC_TIMEOUT_MS)
+    return fetchCopilotModels(apiToken, capiBaseUrl, signal, COPILOT_MODEL_SYNC_TIMEOUT_MS)
 }
 
 export async function getCopilotApiToken(account: ProviderAccount, signal?: AbortSignal): Promise<string> {
@@ -501,7 +504,11 @@ export async function getCopilotApiToken(account: ProviderAccount, signal?: Abor
     return info.token
 }
 
-async function getCopilotApiTokenInfo(account: ProviderAccount, signal?: AbortSignal): Promise<{ token: string; capiBaseUrl: string }> {
+async function getCopilotApiTokenInfo(
+    account: ProviderAccount,
+    signal?: AbortSignal,
+    timeoutMs?: number
+): Promise<{ token: string; capiBaseUrl: string }> {
     throwIfAborted(signal)
     const cached = tokenCache.get(account.id)
     if (cached && cached.expiresAt > Date.now()) {
@@ -516,6 +523,7 @@ async function getCopilotApiTokenInfo(account: ProviderAccount, signal?: AbortSi
             "X-GitHub-Api-Version": "2022-11-28",
         },
         signal,
+        timeoutMs,
     })
 
     const data = response.data as CopilotTokenResponse
@@ -546,7 +554,12 @@ function mapFinishReason(reason?: string | null): string {
     return reason
 }
 
-async function fetchCopilotModels(apiToken: string, capiBaseUrl: string = DEFAULT_CAPI_BASE_URL, signal?: AbortSignal): Promise<CopilotModelInfo[]> {
+async function fetchCopilotModels(
+    apiToken: string,
+    capiBaseUrl: string = DEFAULT_CAPI_BASE_URL,
+    signal?: AbortSignal,
+    timeoutMs?: number
+): Promise<CopilotModelInfo[]> {
     throwIfAborted(signal)
     const cached = modelsCache.get(apiToken)
     if (cached && cached.expiresAt > Date.now()) {
@@ -558,6 +571,7 @@ async function fetchCopilotModels(apiToken: string, capiBaseUrl: string = DEFAUL
             method: "GET",
             headers: getCopilotChatHeaders(apiToken),
             signal,
+            timeoutMs,
         })
 
         if (response.status < 200 || response.status >= 300) {
@@ -584,7 +598,7 @@ type InsecureResponse = { status: number; data: any; text: string }
 
 async function fetchInsecureJson(
     url: string,
-    options: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal }
+    options: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal; timeoutMs?: number }
 ): Promise<InsecureResponse> {
     throwIfAborted(options.signal)
     const target = new URL(url)
@@ -594,11 +608,19 @@ async function fetchInsecureJson(
         ...(options.headers || {}),
     }
     const agent = COPILOT_INSECURE_AGENT
+    const timeoutMs = options.timeoutMs ?? DEFAULT_INSECURE_FETCH_TIMEOUT_MS
 
     return new Promise((resolve, reject) => {
         let settled = false
         let req: ReturnType<typeof https.request>
-        const cleanup = () => options.signal?.removeEventListener("abort", onAbort)
+        let timer: ReturnType<typeof setTimeout> | null = null
+        const cleanup = () => {
+            options.signal?.removeEventListener("abort", onAbort)
+            if (timer) {
+                clearTimeout(timer)
+                timer = null
+            }
+        }
         const resolveOnce = (value: InsecureResponse) => {
             if (settled) return
             settled = true
@@ -638,8 +660,22 @@ async function fetchInsecureJson(
                     try { data = JSON.parse(text) } catch { }
                     resolveOnce({ status: res.statusCode || 0, data, text })
                 })
+                res.on("error", (err) => rejectOnce(err))
             }
         )
+
+        if (timeoutMs > 0) {
+            timer = setTimeout(() => {
+                const timeoutErr = new Error(`Request timeout after ${timeoutMs}ms: ${url}`)
+                try { req.destroy(timeoutErr) } catch { }
+                rejectOnce(timeoutErr)
+            }, timeoutMs)
+            req.setTimeout(timeoutMs, () => {
+                const timeoutErr = new Error(`Socket timeout after ${timeoutMs}ms: ${url}`)
+                try { req.destroy(timeoutErr) } catch { }
+                rejectOnce(timeoutErr)
+            })
+        }
 
         req.on("error", (err) => {
             if (options.signal?.aborted || isAbortError(err)) {

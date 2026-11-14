@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test"
 import { mkdtempSync, mkdirSync, rmSync } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
-import { clearDynamicCodexModels, clearDynamicCopilotModels } from "~/services/routing/models"
+import { clearDynamicCodexModels, clearDynamicCopilotModels, getProviderModels } from "~/services/routing/models"
 import type { ProviderAccount } from "~/services/auth/types"
 
 type Provider = "antigravity" | "codex" | "copilot"
@@ -255,4 +255,21 @@ test("routing config has no codex models when codex sync fails", async () => {
     expect(res.status).toBe(200)
     expect(codexSyncedWithAccountIds.length).toBe(1)
     expect(data.models.codex.some((model: { id: string }) => model.id === "gpt-5.3-codex")).toBe(false)
+})
+
+test("syncProviderModels does not deadlock when a copilot account sync hangs", async () => {
+    addCopilotAccount("hanging-account", "2026-01-01T00:00:00.000Z")
+    syncMode = "slow"
+    syncDelayMs = 5_000
+    remoteModels = [{ id: "copilot-auto", name: "Copilot - Auto" }]
+
+    const mod = await import(`../src/routes/routing/route.ts?${Date.now()}-${Math.random()}`)
+    const t0 = Date.now()
+    await mod.syncProviderModels(t0, 1000, 100)
+    expect(Date.now() - t0).toBeLessThan(1000)
+
+    syncMode = "success"
+    syncDelayMs = 0
+    await mod.syncProviderModels(t0 + 61_000, 1000, 100)
+    expect(getProviderModels("copilot").some((model) => model.id === "copilot-auto")).toBe(true)
 })

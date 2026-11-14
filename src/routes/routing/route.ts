@@ -31,12 +31,15 @@ export const routingRouter = new Hono()
 
 const SYNC_TTL_MS = 60_000
 const SYNC_TIMEOUT_MS = 800
+const PER_ACCOUNT_SYNC_TIMEOUT_MS = 10_000
+const MAX_SYNC_FLIGHT_MS = 20_000
 const QUOTA_TIMEOUT_MS = 1200
 const QUOTA_TTL_MS = 15_000
 
 interface ProviderSyncState {
     lastSyncAt: number
     inFlight: Promise<void> | null
+    inFlightStartedAt: number
 }
 
 const syncStates = new Map<AuthProvider, ProviderSyncState>()
@@ -44,7 +47,7 @@ const syncStates = new Map<AuthProvider, ProviderSyncState>()
 function getSyncState(provider: AuthProvider): ProviderSyncState {
     let state = syncStates.get(provider)
     if (!state) {
-        state = { lastSyncAt: 0, inFlight: null }
+        state = { lastSyncAt: 0, inFlight: null, inFlightStartedAt: 0 }
         syncStates.set(provider, state)
     }
     return state
@@ -145,7 +148,8 @@ function triggerProviderSync(
     displayName: string,
     accounts: ProviderAccount[],
     now: number,
-    fetchModelsForAccount: (account: ProviderAccount) => Promise<ProviderModelOption[]>
+    fetchModelsForAccount: (account: ProviderAccount) => Promise<ProviderModelOption[]>,
+    perAccountTimeoutMs: number = PER_ACCOUNT_SYNC_TIMEOUT_MS
 ): Promise<void> | null {
     const state = getSyncState(provider)
     if (accounts.length === 0) {
@@ -155,28 +159,42 @@ function triggerProviderSync(
         return state.inFlight
     }
 
+    if (state.inFlight && now - state.inFlightStartedAt > MAX_SYNC_FLIGHT_MS) {
+        consola.warn(`[routing] ${displayName} sync exceeded ${MAX_SYNC_FLIGHT_MS}ms; resetting stuck in-flight state`)
+        state.inFlight = null
+        state.inFlightStartedAt = 0
+    }
+
     if (now - state.lastSyncAt > SYNC_TTL_MS && !state.inFlight) {
         state.lastSyncAt = now
-        state.inFlight = (async () => {
+        state.inFlightStartedAt = now
+        let currentFlight: Promise<void>
+        currentFlight = (async () => {
             const mergedModels = new Map<string, ProviderModelOption>()
             try {
                 for (const account of accounts) {
-                    try {
-                        const dynamicModels = await fetchModelsForAccount(account)
-                        if (dynamicModels.length === 0) {
-                            clearDynamicProviderModelsForAccount(provider, account.id)
-                            continue
-                        }
-                        setDynamicProviderModelsForAccount(provider, account.id, dynamicModels)
-                        for (const model of dynamicModels) {
-                            if (!mergedModels.has(model.id)) mergedModels.set(model.id, model)
-                        }
-                        consola.debug(`[routing] ${displayName} models synced (${dynamicModels.length}) from ${account.id}`)
-                    } catch (error) {
-                        const message = error instanceof Error ? error.message : String(error)
+                    const outcome = await settleWithTimeout(
+                        fetchModelsForAccount(account),
+                        perAccountTimeoutMs
+                    )
+                    if (!outcome.ok) {
+                        const message = outcome.timedOut
+                            ? `timeout after ${perAccountTimeoutMs}ms`
+                            : (outcome.error?.message || "sync failed")
                         clearDynamicProviderModelsForAccount(provider, account.id)
                         consola.debug(`[routing] ${displayName} models sync skipped ${account.id}: ${message}`)
+                        continue
                     }
+                    const dynamicModels = outcome.value || []
+                    if (dynamicModels.length === 0) {
+                        clearDynamicProviderModelsForAccount(provider, account.id)
+                        continue
+                    }
+                    setDynamicProviderModelsForAccount(provider, account.id, dynamicModels)
+                    for (const model of dynamicModels) {
+                        if (!mergedModels.has(model.id)) mergedModels.set(model.id, model)
+                    }
+                    consola.debug(`[routing] ${displayName} models synced (${dynamicModels.length}) from ${account.id}`)
                 }
             } catch (error) {
                 const message = error instanceof Error ? error.message : String(error)
@@ -188,9 +206,13 @@ function triggerProviderSync(
                     clearDynamicProviderModels(provider)
                     consola.debug(`[routing] ${displayName} models sync unavailable; using static fallback`)
                 }
-                state.inFlight = null
+                if (state.inFlight === currentFlight) {
+                    state.inFlight = null
+                    state.inFlightStartedAt = 0
+                }
             }
         })()
+        state.inFlight = currentFlight
     }
 
     return state.inFlight
@@ -217,7 +239,11 @@ function copilotModelOptions(remote: CopilotModelInfo[]): ProviderModelOption[] 
  * Refreshes the online model list of every provider with accounts (TTL-throttled).
  * Used by the routing panel and by /v1/models so exposed models match what each account really has.
  */
-export async function syncProviderModels(now: number = Date.now(), timeoutMs: number = SYNC_TIMEOUT_MS): Promise<void> {
+export async function syncProviderModels(
+    now: number = Date.now(),
+    timeoutMs: number = SYNC_TIMEOUT_MS,
+    perAccountTimeoutMs: number = PER_ACCOUNT_SYNC_TIMEOUT_MS
+): Promise<void> {
     accountManager.load()
     const antigravityAccounts = listAccountsInOrder("antigravity")
     const codexAccounts = listAccountsInOrder("codex")
@@ -230,11 +256,12 @@ export async function syncProviderModels(now: number = Date.now(), timeoutMs: nu
         triggerProviderSync("grok", "Grok", grokAccounts, now, async (account) => {
             const remote = await listGrokModelsForAccount(account)
             return normalizeRemoteModels("Grok", remote.map(m => ({ id: m.id, name: (m as { name?: string }).name })))
-        }),
+        }, perAccountTimeoutMs),
         triggerProviderSync("copilot", "Copilot", copilotAccounts, now, async (account) => {
             const remote = await listCopilotModelsForAccount(account)
             return copilotModelOptions(remote)
-        }),        triggerProviderSync("codex", "Codex", codexAccounts, now, (account) => listCodexModelsForAccount(account)),
+        }, perAccountTimeoutMs),
+        triggerProviderSync("codex", "Codex", codexAccounts, now, (account) => listCodexModelsForAccount(account), perAccountTimeoutMs),
         triggerProviderSync("antigravity", "Antigravity", antigravityAccounts, now, async (account) => {
             const active = await accountManager.getAccountById(account.id)
             if (!active) return []
@@ -243,18 +270,18 @@ export async function syncProviderModels(now: number = Date.now(), timeoutMs: nu
                 id,
                 label: `Antigravity - ${id}`,
             }))
-        }),
+        }, perAccountTimeoutMs),
         triggerProviderSync("zed", "Zed", zedAccounts, now, async (account) => {
             const remote = await listZedModelsForAccount(account)
             return normalizeRemoteModels("Zed", remote.map(model => ({
                 id: model.id,
                 name: model.display_name || model.id,
             })))
-        }),
+        }, perAccountTimeoutMs),
         triggerProviderSync("kiro", "Kiro", kiroAccounts, now, async (account) => {
             const remote = await listKiroModelsForAccount(account)
             return normalizeRemoteModels("Kiro", remote)
-        }),
+        }, perAccountTimeoutMs),
     ].filter((p): p is Promise<void> => p !== null)
 
     if (activeSyncs.length > 0) {
