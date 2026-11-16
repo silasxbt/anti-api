@@ -218,18 +218,33 @@ function triggerProviderSync(
     return state.inFlight
 }
 
+function copilotModelLimits(model: CopilotModelInfo): Pick<ProviderModelOption, "maxInputTokens" | "maxOutputTokens"> {
+    const limits = model.capabilities?.limits
+    if (!limits) return {}
+    const out: Pick<ProviderModelOption, "maxInputTokens" | "maxOutputTokens"> = {}
+    const rawInput = limits.max_context_window_tokens ?? limits.max_prompt_tokens
+    if (typeof rawInput === "number" && Number.isFinite(rawInput) && rawInput > 0) {
+        out.maxInputTokens = Math.floor(rawInput)
+    }
+    if (typeof limits.max_output_tokens === "number" && Number.isFinite(limits.max_output_tokens) && limits.max_output_tokens > 0) {
+        out.maxOutputTokens = Math.floor(limits.max_output_tokens)
+    }
+    return out
+}
+
 /** Copilot models as the account really has them, plus per-effort variants when the model advertises reasoning effort. */
 function copilotModelOptions(remote: CopilotModelInfo[]): ProviderModelOption[] {
     const options: ProviderModelOption[] = []
     for (const model of remote) {
         const name = model.name?.trim() || model.id
-        options.push({ id: model.id, label: `Copilot - ${name}` })
+        const limits = copilotModelLimits(model)
+        options.push({ id: model.id, label: `Copilot - ${name}`, ...limits })
         const efforts = getCopilotReasoningEfforts(model).filter(e => e === "low" || e === "medium" || e === "high")
         for (const effort of efforts) {
-            options.push({ id: `${model.id}-${effort}`, label: `Copilot - ${name} (${effort})` })
+            options.push({ id: `${model.id}-${effort}`, label: `Copilot - ${name} (${effort})`, ...limits })
         }
         if (model.id === "copilot-auto" || (efforts.includes("high") && !options.some(o => o.id === `${model.id}-thinking`))) {
-            options.push({ id: `${model.id}-thinking`, label: `Copilot - ${name} (thinking)` })
+            options.push({ id: `${model.id}-thinking`, label: `Copilot - ${name} (thinking)`, ...limits })
         }
     }
     return options

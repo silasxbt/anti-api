@@ -15,7 +15,16 @@ const accountsByProvider: Record<Provider, ProviderAccount[]> = {
 
 let syncMode: "success" | "error" | "slow" = "success"
 let syncDelayMs = 0
-let remoteModels: Array<{ id: string; name?: string; model_picker_enabled?: boolean }> = []
+let remoteModels: Array<{
+    id: string
+    name?: string
+    model_picker_enabled?: boolean
+    capabilities?: {
+        type?: string
+        limits?: { max_context_window_tokens?: number; max_prompt_tokens?: number; max_output_tokens?: number }
+        supports?: { reasoning_effort?: string[] | boolean }
+    }
+}> = []
 const syncedWithAccountIds: string[] = []
 let codexSyncMode: "success" | "error" = "success"
 let codexRemoteModels: Array<{ id: string; label: string }> = []
@@ -272,4 +281,31 @@ test("syncProviderModels does not deadlock when a copilot account sync hangs", a
     syncDelayMs = 0
     await mod.syncProviderModels(t0 + 61_000, 1000, 100)
     expect(getProviderModels("copilot").some((model) => model.id === "copilot-auto")).toBe(true)
+})
+
+test("syncProviderModels preserves context limits on copilot-auto and its variants", async () => {
+    addCopilotAccount("copilot-limits", "2026-01-01T00:00:00.000Z")
+    remoteModels = [
+        {
+            id: "copilot-auto",
+            name: "Auto",
+            model_picker_enabled: true,
+            capabilities: {
+                type: "chat",
+                limits: { max_context_window_tokens: 1050000, max_prompt_tokens: 922000, max_output_tokens: 128000 },
+                supports: { reasoning_effort: ["low", "medium", "high"] },
+            },
+        },
+    ]
+
+    const mod = await import(`../src/routes/routing/route.ts?${Date.now()}-${Math.random()}`)
+    await mod.syncProviderModels(Date.now() + 120_000, 1000, 100)
+
+    const all = getProviderModels("copilot", { includeAllVariants: true })
+    const auto = all.find((m: { id: string }) => m.id === "copilot-auto")
+    const autoThinking = all.find((m: { id: string }) => m.id === "copilot-auto-thinking")
+    expect(auto?.maxInputTokens).toBe(1050000)
+    expect(auto?.maxOutputTokens).toBe(128000)
+    expect(autoThinking?.maxInputTokens).toBe(1050000)
+    expect(autoThinking?.maxOutputTokens).toBe(128000)
 })

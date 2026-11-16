@@ -99,3 +99,73 @@ test("separateThinkingModels controls whether auto tiers are exposed as distinct
     clearDynamicCopilotModels()
 })
 
+test("normalizeCopilotModels propagates backing GPT 1M limits to copilot-auto on free/edu accounts", () => {
+    const remote = [
+        {
+            id: "claude-opus-5.5",
+            name: "Claude Opus 5.5",
+            model_picker_enabled: false,
+            policy: { state: "disabled" },
+            capabilities: { type: "chat", limits: { max_context_window_tokens: 1000000, max_output_tokens: 128000 } },
+        },
+        {
+            id: "gpt-4.1",
+            name: "GPT-4.1",
+            model_picker_enabled: false,
+            policy: { state: "enabled" },
+            capabilities: { type: "chat", limits: { max_context_window_tokens: 128000, max_prompt_tokens: 128000, max_output_tokens: 16384 } },
+        },
+        {
+            id: "gpt-5.6-luna",
+            name: "GPT-5.6 Luna",
+            model_picker_enabled: false,
+            policy: { state: "enabled" },
+            supported_endpoints: ["/responses"],
+            capabilities: { type: "chat", limits: { max_context_window_tokens: 1050000, max_prompt_tokens: 922000, max_output_tokens: 128000 } },
+        },
+        {
+            id: "mai-code-1.1-flash",
+            name: "MAI-Code-1.1-Flash",
+            model_picker_enabled: false,
+            policy: { state: "enabled" },
+            capabilities: { type: "chat", limits: { max_context_window_tokens: 256000, max_output_tokens: 128000 } },
+        },
+    ]
+
+    const models = normalizeCopilotModels(remote as any)
+    expect(models.map((m: { id: string }) => m.id)).toEqual(["copilot-auto"])
+    expect(models[0].capabilities?.limits).toEqual({
+        max_context_window_tokens: 1050000,
+        max_prompt_tokens: 922000,
+        max_output_tokens: 128000,
+    })
+})
+
+test("normalizeCopilotModels falls back to enabled GPT /responses model when gpt-5.6-luna is disabled", () => {
+    const remote = [
+        {
+            id: "gpt-5.6-luna",
+            name: "GPT-5.6 Luna",
+            model_picker_enabled: false,
+            policy: { state: "disabled" },
+            supported_endpoints: ["/responses"],
+            capabilities: { type: "chat", limits: { max_context_window_tokens: 1050000, max_output_tokens: 128000 } },
+        },
+        {
+            id: "gpt-6-luna",
+            name: "GPT-6 Luna",
+            model_picker_enabled: false,
+            policy: { state: "enabled" },
+            supported_endpoints: ["/responses"],
+            capabilities: { type: "chat", limits: { max_context_window_tokens: 1000000, max_prompt_tokens: 872000, max_output_tokens: 128000 } },
+        },
+    ]
+
+    const models = normalizeCopilotModels(remote as any)
+    expect(models[0].capabilities?.limits).toEqual({
+        max_context_window_tokens: 1000000,
+        max_prompt_tokens: 872000,
+        max_output_tokens: 128000,
+    })
+})
+

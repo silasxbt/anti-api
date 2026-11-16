@@ -30,6 +30,13 @@ interface CopilotTokenResponse {
 /** Copilot advertises low/medium/high and, per model, none/xhigh/max. */
 export type CopilotReasoningEffort = string
 
+export interface CopilotModelLimits {
+    max_context_window_tokens?: number
+    max_prompt_tokens?: number
+    max_output_tokens?: number
+    max_non_streaming_output_tokens?: number
+}
+
 export interface CopilotModelInfo {
     id: string
     name?: string
@@ -39,6 +46,7 @@ export interface CopilotModelInfo {
     supported_endpoints?: string[]
     capabilities?: {
         type?: string
+        limits?: CopilotModelLimits
         supports?: {
             reasoning_effort?: string[] | boolean
             tool_calls?: boolean
@@ -67,6 +75,67 @@ function isInternalCopilotModel(id: string): boolean {
         lower.includes("trajectory")
 }
 
+function getPositiveLimit(value: unknown): number | undefined {
+    return typeof value === "number" && Number.isFinite(value) && value > 0
+        ? Math.floor(value)
+        : undefined
+}
+
+function sanitizeCopilotLimits(limits?: CopilotModelLimits): CopilotModelLimits | undefined {
+    if (!limits) return undefined
+    const maxContextWindow = getPositiveLimit(limits.max_context_window_tokens)
+    const maxPrompt = getPositiveLimit(limits.max_prompt_tokens)
+    const maxOutput = getPositiveLimit(limits.max_output_tokens)
+    const maxNonStreamingOutput = getPositiveLimit(limits.max_non_streaming_output_tokens)
+    if (!maxContextWindow && !maxPrompt && !maxOutput && !maxNonStreamingOutput) {
+        return undefined
+    }
+    return {
+        ...(maxContextWindow ? { max_context_window_tokens: maxContextWindow } : {}),
+        ...(maxPrompt ? { max_prompt_tokens: maxPrompt } : {}),
+        ...(maxOutput ? { max_output_tokens: maxOutput } : {}),
+        ...(maxNonStreamingOutput ? { max_non_streaming_output_tokens: maxNonStreamingOutput } : {}),
+    }
+}
+
+const COPILOT_AUTO_PREFERRED_BACKING_ID = "gpt-5.6-luna"
+
+function resolveCopilotAutoLimits(models: CopilotModelInfo[]): CopilotModelLimits | undefined {
+    const candidates = models
+        .map(model => ({ model, limits: sanitizeCopilotLimits(model.capabilities?.limits) }))
+        .filter((entry): entry is { model: CopilotModelInfo; limits: CopilotModelLimits } => {
+            const id = entry.model?.id?.trim()
+            if (!id || id === COPILOT_AUTO_MODEL_ID || id === "auto") return false
+            if (entry.model.capabilities?.type && entry.model.capabilities.type !== "chat") return false
+            if (isInternalCopilotModel(id)) return false
+            if (entry.model.policy?.state === "disabled") return false
+            return Boolean(entry.limits?.max_context_window_tokens || entry.limits?.max_prompt_tokens)
+        })
+
+    if (candidates.length === 0) return undefined
+
+    const score = (m: CopilotModelInfo): number => {
+        const isEnabled = m.policy?.state === "enabled" || m.model_picker_enabled === true
+        const isGpt = m.id.toLowerCase().startsWith("gpt-")
+        const usesResponses = m.supported_endpoints?.includes("/responses") ?? false
+        if (m.id === COPILOT_AUTO_PREFERRED_BACKING_ID) return 4
+        if (isEnabled && isGpt && usesResponses) return 3
+        if (isEnabled && isGpt) return 2
+        if (isEnabled) return 1
+        return 0
+    }
+
+    candidates.sort((a, b) => {
+        const tierDiff = score(b.model) - score(a.model)
+        if (tierDiff !== 0) return tierDiff
+        const ctxA = a.limits.max_context_window_tokens ?? a.limits.max_prompt_tokens ?? 0
+        const ctxB = b.limits.max_context_window_tokens ?? b.limits.max_prompt_tokens ?? 0
+        return ctxB - ctxA
+    })
+
+    return candidates[0].limits
+}
+
 /**
  * Normalizes live models discovered from GitHub Copilot.
  * - Always includes copilot-auto (with low/medium/high reasoning effort variants).
@@ -75,6 +144,7 @@ function isInternalCopilotModel(id: string): boolean {
  */
 export function normalizeCopilotModels(models: CopilotModelInfo[]): CopilotModelInfo[] {
     const deduped = new Map<string, CopilotModelInfo>()
+    const autoLimits = resolveCopilotAutoLimits(models)
 
     // Always include the Auto model
     deduped.set(COPILOT_AUTO_MODEL_ID, {
@@ -83,6 +153,7 @@ export function normalizeCopilotModels(models: CopilotModelInfo[]): CopilotModel
         model_picker_enabled: true,
         capabilities: {
             type: "chat",
+            ...(autoLimits ? { limits: autoLimits } : {}),
             supports: {
                 reasoning_effort: ["low", "medium", "high"],
                 tool_calls: true,
