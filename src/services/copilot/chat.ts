@@ -7,6 +7,31 @@ import type { ClaudeMessage, ClaudeTool } from "~/lib/translator"
 import { toOpenAIMessages, toOpenAITools } from "~/services/providers/openai-adapter"
 import { createAbortError, isAbortError, throwIfAborted } from "~/lib/stream-cancellation"
 import { safeErrorMessage } from "~/lib/redaction"
+import {
+    chatCompletionToResponsesObject,
+    chatPayloadToResponses,
+    chatSseToEvents,
+    claudeMessagesToResponsesInput,
+    claudeToolsToResponsesTools,
+    extractChatUsage,
+    extractResponsesPromptText,
+    extractResponsesUsage,
+    readTextStream,
+    reportUsage,
+    responseObjectToChatCompletion,
+    responsesObjectToCompletion,
+    responsesPayloadToChat,
+    responsesSseToEvents,
+    responsesSseToOpenAIChatSse,
+    sseEventBlocks,
+    tapSseUsage,
+    yieldAll,
+    type DirectOptions,
+    type DirectResult,
+} from "~/lib/direct-stream"
+import type { RoutedStreamEvent } from "~/lib/stream-events"
+import { eventsToResponsesSse, generateResponseId } from "~/routes/responses/translator"
+import type { ResponsesCreateRequest } from "~/routes/responses/types"
 
 const COPILOT_INSECURE_TLS = process.env.ANTI_API_COPILOT_INSECURE_TLS === "1"
 const COPILOT_INSECURE_AGENT = COPILOT_INSECURE_TLS ? new https.Agent({ rejectUnauthorized: false }) : undefined
@@ -429,6 +454,36 @@ function toProviderCompletion(data: OpenAIResponse, accountId: string) {
     }
 }
 
+function extractClaudePromptText(messages: ClaudeMessage[]): string {
+    const lastUser = [...messages].reverse().find(m => m.role === "user")
+    let promptText = ""
+    if (typeof lastUser?.content === "string") {
+        promptText = lastUser.content
+    } else if (Array.isArray(lastUser?.content)) {
+        promptText = lastUser.content.filter(p => p.type === "text").map(p => (p as any).text).join(" ")
+    }
+    return promptText.trim() || "Hello"
+}
+
+function buildCopilotResponsesBodyFromClaude(
+    model: string,
+    messages: ClaudeMessage[],
+    tools?: ClaudeTool[],
+    maxTokens?: number,
+    effort?: string
+): Record<string, any> {
+    const { instructions, input } = claudeMessagesToResponsesInput(messages)
+    const responsesTools = claudeToolsToResponsesTools(tools)
+    return {
+        model,
+        input,
+        ...(instructions ? { instructions } : {}),
+        ...(responsesTools && responsesTools.length > 0 ? { tools: responsesTools } : {}),
+        ...(maxTokens ? { max_output_tokens: maxTokens } : {}),
+        ...(effort ? { reasoning: { effort, summary: "auto" } } : {}),
+    }
+}
+
 export async function createCopilotCompletion(
     account: ProviderAccount,
     model: string,
@@ -445,125 +500,613 @@ export async function createCopilotCompletion(
 
     const resolved = resolveCopilotModel(available, model)
 
-    // Handle Copilot Auto mode (via POST /auto + /responses)
+    let targetModel = resolved.id
+    let sessionToken: string | undefined
+    let useResponses = false
+    let autoEffort: string | undefined
+
     if (resolved.isAuto) {
-        let tier: "efficiency" | "balance" | "intelligence" = "balance"
-        let effectiveEffort: CopilotReasoningEffort = "medium"
-
-        if (resolved.tier) {
-            tier = resolved.tier
-            effectiveEffort = resolved.effort || (tier === "efficiency" ? "low" : tier === "intelligence" ? "high" : "medium")
-        } else if (reasoningEffort === "low") {
-            tier = "efficiency"
-            effectiveEffort = "low"
-        } else if (reasoningEffort === "high" || reasoningEffort === "xhigh" || reasoningEffort === "max") {
-            tier = "intelligence"
-            effectiveEffort = "high"
-        } else if (reasoningEffort === "medium") {
-            tier = "balance"
-            effectiveEffort = "medium"
+        const { tier, effort } = resolveAutoTier(resolved, reasoningEffort)
+        autoEffort = effort
+        const negotiated = await negotiateCopilotAuto(
+            capiBaseUrl,
+            apiToken,
+            extractClaudePromptText(messages),
+            tier,
+            signal
+        )
+        if (negotiated) {
+            targetModel = negotiated.modelId
+            sessionToken = negotiated.sessionToken
+            useResponses = negotiated.supportsResponses
+        } else {
+            targetModel = "gpt-4o"
+            useResponses = false
         }
+    } else {
+        const info = available.find(m => m.id === resolved.id)
+        const endpoints = info?.supported_endpoints
+        useResponses = Array.isArray(endpoints) && endpoints.includes("/responses") && !endpoints.includes("/chat/completions")
+    }
 
-        // Get user prompt text for /auto negotiation
-        const lastUser = [...messages].reverse().find(m => m.role === "user")
-        let promptText = ""
-        if (typeof lastUser?.content === "string") {
-            promptText = lastUser.content
-        } else if (Array.isArray(lastUser?.content)) {
-            promptText = lastUser.content.filter(p => p.type === "text").map(p => (p as any).text).join(" ")
-        }
-        if (!promptText.trim()) promptText = "Hello"
-
-        // 1. Negotiate model and session token with Copilot /auto
-        const autoResponse = await fetchInsecureJson(`${capiBaseUrl}/auto`, {
-            method: "POST",
-            headers: getCopilotChatHeaders(apiToken),
-            body: JSON.stringify({
-                prompt: promptText.slice(0, 1000),
-                tier,
-            }),
-            signal,
-        })
-
-        if (autoResponse.status >= 200 && autoResponse.status < 300 && autoResponse.data?.session_token) {
-            const sessionToken = autoResponse.data.session_token
-            const selectedModel = autoResponse.data.selected_model
-            const selectedModelId = selectedModel?.id || "gpt-5.6-luna"
-            const supportsResponses = selectedModel?.supported_endpoints?.includes("/responses") ?? true
-
-            if (supportsResponses) {
-                // 2. Call modern /responses endpoint with Copilot-Session-Token
-                const openAiMessages = toOpenAIMessages(messages)
-                const openAiTools = toOpenAITools(tools)
-                const responsesTools = openAiTools?.map(t => ({
-                    type: "function",
-                    name: t.function.name,
-                    description: t.function.description,
-                    parameters: t.function.parameters,
-                }))
-
-                const requestBody = {
-                    model: selectedModelId,
-                    input: toResponsesInput(openAiMessages),
-                    ...(responsesTools && responsesTools.length > 0 ? { tools: responsesTools } : {}),
-                    ...(maxTokens ? { max_output_tokens: maxTokens } : {}),
-                    reasoning: { effort: effectiveEffort, summary: "auto" },
-                }
-
-                const response = await fetchInsecureJson(`${capiBaseUrl}/responses`, {
-                    method: "POST",
-                    headers: {
-                        ...getCopilotChatHeaders(apiToken, sessionToken),
-                        "Openai-Intent": "conversation-panel",
-                    },
-                    body: JSON.stringify(requestBody),
-                    signal,
-                })
-
-                if (response.status < 200 || response.status >= 300) {
-                    consola.error(`Copilot /responses error ${response.status} for ${selectedModelId}`)
-                    throw new UpstreamError("copilot", response.status, response.text, undefined)
-                }
-
-                const openAiResp = buildCompletionFromResponses(response.data)
-                return toProviderCompletion(openAiResp, account.id)
-            }
+    if (useResponses) {
+        const info = available.find(m => m.id === targetModel)
+        const supported = info ? getCopilotReasoningEfforts(info) : []
+        const rawEffort = autoEffort ?? resolved.effort ?? reasoningEffort
+        const effectiveEffort = autoEffort || (rawEffort && supported.includes(rawEffort) ? rawEffort : undefined)
+        const requestBody = buildCopilotResponsesBodyFromClaude(targetModel, messages, tools, maxTokens, effectiveEffort)
+        const response = await postCopilotJson(
+            `${capiBaseUrl}/responses`,
+            { ...getCopilotChatHeaders(apiToken, sessionToken), "Openai-Intent": "conversation-panel" },
+            requestBody,
+            signal
+        )
+        authStore.markSuccess("copilot", account.id)
+        const completion = responsesObjectToCompletion(response.data)
+        return {
+            contentBlocks: completion.contentBlocks as any[],
+            stopReason: completion.stopReason || "end_turn",
+            usage: {
+                inputTokens: completion.usage?.inputTokens ?? 0,
+                outputTokens: completion.usage?.outputTokens ?? 0,
+                cacheReadTokens: completion.usage?.cacheReadTokens ?? 0,
+            },
         }
     }
 
-    // Standard completion (for specific user-selected Pro models or fallback)
-    const mappedModel = resolved.id === COPILOT_AUTO_MODEL_ID ? "gpt-4o" : resolved.id
-    const info = available.find(m => m.id === mappedModel)
+    const info = available.find(m => m.id === targetModel)
     const supported = info ? getCopilotReasoningEfforts(info) : []
     const effort = resolved.effort ?? reasoningEffort
     const effectiveEffort = effort && supported.includes(effort) ? effort : undefined
 
     const requestBody = {
-        model: mappedModel,
+        model: targetModel,
         messages: toOpenAIMessages(messages),
         tools: toOpenAITools(tools),
         max_tokens: maxTokens,
         ...(effectiveEffort ? { reasoning_effort: effectiveEffort } : {}),
     }
 
-    const response = await fetchInsecureJson(`${capiBaseUrl}/chat/completions`, {
-        method: "POST",
-        headers: getCopilotChatHeaders(apiToken),
-        body: JSON.stringify(requestBody),
-        signal,
-    })
-
-    if (response.status < 200 || response.status >= 300) {
-        consola.error(`Copilot error ${response.status} for model ${mappedModel}`)
-        throw new UpstreamError("copilot", response.status, response.text, undefined)
-    }
+    const response = await postCopilotJson(
+        `${capiBaseUrl}/chat/completions`,
+        getCopilotChatHeaders(apiToken, sessionToken),
+        requestBody,
+        signal
+    )
 
     const data = response.data as OpenAIResponse
     return toProviderCompletion(data, account.id)
 }
 
+/**
+ * Live 1-hop event stream for `/v1/messages` (and non-direct paths) on Copilot.
+ */
+export async function* createCopilotEventStream(
+    account: ProviderAccount,
+    model: string,
+    messages: ClaudeMessage[],
+    tools?: ClaudeTool[],
+    maxTokens?: number,
+    reasoningEffort?: CopilotReasoningEffort,
+    signal?: AbortSignal,
+    options?: DirectOptions
+): AsyncGenerator<RoutedStreamEvent, void, unknown> {
+    throwIfAborted(signal)
+    const { token: apiToken, capiBaseUrl } = await getCopilotApiTokenInfo(account, signal)
+    const available = await fetchCopilotModels(apiToken, capiBaseUrl, signal)
+    throwIfAborted(signal)
+
+    const resolved = resolveCopilotModel(available, model)
+
+    let targetModel = resolved.id
+    let sessionToken: string | undefined
+    let useResponses = false
+    let autoEffort: string | undefined
+
+    if (resolved.isAuto) {
+        const { tier, effort } = resolveAutoTier(resolved, reasoningEffort)
+        autoEffort = effort
+        const negotiated = await negotiateCopilotAuto(
+            capiBaseUrl,
+            apiToken,
+            extractClaudePromptText(messages),
+            tier,
+            signal
+        )
+        if (negotiated) {
+            targetModel = negotiated.modelId
+            sessionToken = negotiated.sessionToken
+            useResponses = negotiated.supportsResponses
+        } else {
+            targetModel = "gpt-4o"
+            useResponses = false
+        }
+    } else {
+        const info = available.find(m => m.id === resolved.id)
+        const endpoints = info?.supported_endpoints
+        useResponses = Array.isArray(endpoints) && endpoints.includes("/responses") && !endpoints.includes("/chat/completions")
+    }
+
+    if (useResponses) {
+        const info = available.find(m => m.id === targetModel)
+        const supported = info ? getCopilotReasoningEfforts(info) : []
+        const rawEffort = autoEffort ?? resolved.effort ?? reasoningEffort
+        const effectiveEffort = autoEffort || (rawEffort && supported.includes(rawEffort) ? rawEffort : undefined)
+        const requestBody = {
+            ...buildCopilotResponsesBodyFromClaude(targetModel, messages, tools, maxTokens, effectiveEffort),
+            stream: true,
+        }
+        const response = await postCopilotStream(
+            `${capiBaseUrl}/responses`,
+            { ...getCopilotChatHeaders(apiToken, sessionToken), "Openai-Intent": "conversation-panel" },
+            requestBody,
+            signal
+        )
+        authStore.markSuccess("copilot", account.id)
+        const blocks = tapSseUsage(sseEventBlocks(response.stream), extractResponsesUsage, options?.onUsage)
+        yield* responsesSseToEvents(blocks, model, "copilot")
+        return
+    }
+
+    const info = available.find(m => m.id === targetModel)
+    const supported = info ? getCopilotReasoningEfforts(info) : []
+    const effort = resolved.effort ?? reasoningEffort
+    const effectiveEffort = effort && supported.includes(effort) ? effort : undefined
+
+    const requestBody = {
+        model: targetModel,
+        messages: toOpenAIMessages(messages),
+        tools: toOpenAITools(tools),
+        max_tokens: maxTokens,
+        stream: true,
+        stream_options: { include_usage: true },
+        ...(effectiveEffort ? { reasoning_effort: effectiveEffort } : {}),
+    }
+
+    const response = await postCopilotStream(
+        `${capiBaseUrl}/chat/completions`,
+        getCopilotChatHeaders(apiToken, sessionToken),
+        requestBody,
+        signal
+    )
+    authStore.markSuccess("copilot", account.id)
+    const blocks = tapSseUsage(sseEventBlocks(response.stream), extractChatUsage, options?.onUsage)
+    yield* chatSseToEvents(blocks, model)
+}
+
 const COPILOT_MODEL_SYNC_TIMEOUT_MS = 8_000
 const DEFAULT_INSECURE_FETCH_TIMEOUT_MS = 120_000
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000
+
+// ---------------------------------------------------------------------------
+// Native "direct" pass-throughs (no Anthropic/OpenAI re-translation)
+// ---------------------------------------------------------------------------
+
+type AutoTier = "efficiency" | "balance" | "intelligence"
+
+function resolveAutoTier(
+    resolved: { effort?: CopilotReasoningEffort; tier?: AutoTier },
+    requestedEffort?: unknown
+): { tier: AutoTier; effort: CopilotReasoningEffort } {
+    if (resolved.tier) {
+        return {
+            tier: resolved.tier,
+            effort: resolved.effort || (resolved.tier === "efficiency" ? "low" : resolved.tier === "intelligence" ? "high" : "medium"),
+        }
+    }
+    if (requestedEffort === "low") return { tier: "efficiency", effort: "low" }
+    if (requestedEffort === "high" || requestedEffort === "xhigh" || requestedEffort === "max") {
+        return { tier: "intelligence", effort: "high" }
+    }
+    return { tier: "balance", effort: "medium" }
+}
+
+function throwCopilotUpstream(status: number, body: string, headers?: Record<string, string | string[] | undefined>): never {
+    const retryAfter = headers?.["retry-after"]
+    throw new UpstreamError("copilot", status, body, Array.isArray(retryAfter) ? retryAfter[0] : retryAfter)
+}
+
+async function postCopilotJson(
+    url: string,
+    headers: Record<string, string>,
+    body: unknown,
+    signal?: AbortSignal
+): Promise<{ status: number; data: any }> {
+    const response = await fetchInsecureJson(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal,
+    })
+    if (response.status < 200 || response.status >= 300) {
+        consola.error(`Copilot error ${response.status} for ${url.replace(/^https?:\/\/[^/]+/, "")}`)
+        throwCopilotUpstream(response.status, response.text)
+    }
+    return { status: response.status, data: response.data }
+}
+
+async function postCopilotStream(
+    url: string,
+    headers: Record<string, string>,
+    body: unknown,
+    signal?: AbortSignal
+): Promise<{ status: number; stream: AsyncGenerator<string, void, unknown> }> {
+    const response = await fetchInsecureStream(url, {
+        method: "POST",
+        headers: { ...headers, Accept: "text/event-stream" },
+        body: JSON.stringify(body),
+        signal,
+    })
+    if (response.status < 200 || response.status >= 300) {
+        const text = await readTextStream(response.stream)
+        throwIfAborted(signal)
+        consola.error(`Copilot stream error ${response.status} for ${url.replace(/^https?:\/\/[^/]+/, "")}`)
+        throwCopilotUpstream(response.status, text, response.headers)
+    }
+    return response
+}
+
+async function negotiateCopilotAuto(
+    capiBaseUrl: string,
+    apiToken: string,
+    promptText: string,
+    tier: AutoTier,
+    signal?: AbortSignal
+): Promise<{ sessionToken: string; modelId: string; supportsResponses: boolean } | null> {
+    const response = await fetchInsecureJson(`${capiBaseUrl}/auto`, {
+        method: "POST",
+        headers: getCopilotChatHeaders(apiToken),
+        body: JSON.stringify({ prompt: (promptText.trim() ? promptText : "Hello").slice(0, 1000), tier }),
+        signal,
+    })
+    const sessionToken = response.data?.session_token
+    if (response.status < 200 || response.status >= 300 || !sessionToken) return null
+    const selected = response.data?.selected_model
+    return {
+        sessionToken,
+        modelId: selected?.id || "gpt-5.6-luna",
+        supportsResponses: selected?.supported_endpoints?.includes("/responses") ?? true,
+    }
+}
+
+/**
+ * POST a Responses payload to a Copilot `/responses` endpoint, streaming SSE through untouched when `payload.stream`.
+ */
+async function forwardCopilotResponses(
+    capiBaseUrl: string,
+    headers: Record<string, string>,
+    body: Record<string, any>,
+    resolvedModel: string,
+    accountId: string,
+    signal: AbortSignal | undefined,
+    options?: DirectOptions
+): Promise<DirectResult> {
+    const url = `${capiBaseUrl}/responses`
+    if (body.stream) {
+        const response = await postCopilotStream(url, headers, body, signal)
+        authStore.markSuccess("copilot", accountId)
+        return {
+            kind: "sse",
+            status: response.status,
+            resolvedModel,
+            stream: tapSseUsage(sseEventBlocks(response.stream), extractResponsesUsage, options?.onUsage),
+        }
+    }
+    const response = await postCopilotJson(url, headers, body, signal)
+    authStore.markSuccess("copilot", accountId)
+    const usage = extractResponsesUsage(response.data)
+    reportUsage(usage, options?.onUsage)
+    return { kind: "json", status: response.status, data: response.data, resolvedModel, usage }
+}
+
+/** Adapt a Responses payload onto `/chat/completions` in one hop (live streaming when requested). */
+async function adaptResponsesToCopilotChat(
+    capiBaseUrl: string,
+    headers: Record<string, string>,
+    payload: Record<string, any>,
+    chatModel: string,
+    effort: string | undefined,
+    accountId: string,
+    signal: AbortSignal | undefined,
+    options?: DirectOptions
+): Promise<DirectResult> {
+    const chatBody = responsesPayloadToChat(payload, chatModel)
+    if (effort && !chatBody.reasoning_effort) chatBody.reasoning_effort = effort
+
+    if (payload.stream === true) {
+        chatBody.stream = true
+        chatBody.stream_options = { include_usage: true }
+        const response = await postCopilotStream(`${capiBaseUrl}/chat/completions`, headers, chatBody, signal)
+        authStore.markSuccess("copilot", accountId)
+        const blocks = tapSseUsage(sseEventBlocks(response.stream), extractChatUsage, options?.onUsage)
+        const events = chatSseToEvents(blocks, payload.model || chatModel)
+        return {
+            kind: "sse",
+            status: response.status,
+            resolvedModel: chatModel,
+            stream: eventsToResponsesSse(events, {
+                id: generateResponseId(),
+                model: payload.model || chatModel,
+                payload: payload as ResponsesCreateRequest,
+            }),
+        }
+    }
+
+    const response = await postCopilotJson(`${capiBaseUrl}/chat/completions`, headers, chatBody, signal)
+    authStore.markSuccess("copilot", accountId)
+    const usage = extractChatUsage(response.data)
+    reportUsage(usage, options?.onUsage)
+    const data = chatCompletionToResponsesObject(response.data, chatModel)
+    return { kind: "json", status: response.status, data, resolvedModel: chatModel, usage }
+}
+
+/**
+ * Native OpenAI Responses pass-through to Copilot.
+ * - `copilot-auto*`: negotiate `/auto`, then forward to `/responses` with the session token
+ *   (or adapt onto `/chat/completions` if the selected model lacks `/responses`).
+ * - Other models: forward to `/responses` when supported, otherwise adapt to `/chat/completions`.
+ */
+export async function createCopilotResponsesDirect(
+    account: ProviderAccount,
+    model: string,
+    payload: Record<string, any>,
+    signal?: AbortSignal,
+    options?: DirectOptions
+): Promise<DirectResult> {
+    throwIfAborted(signal)
+    const { token: apiToken, capiBaseUrl } = await getCopilotApiTokenInfo(account, signal)
+    const available = await fetchCopilotModels(apiToken, capiBaseUrl, signal)
+    throwIfAborted(signal)
+
+    const resolved = resolveCopilotModel(available, model)
+    const requestedEffort = payload.reasoning?.effort
+
+    if (resolved.isAuto) {
+        const { tier, effort } = resolveAutoTier(resolved, requestedEffort)
+        const negotiated = await negotiateCopilotAuto(
+            capiBaseUrl,
+            apiToken,
+            extractResponsesPromptText(payload.input),
+            tier,
+            signal
+        )
+
+        if (negotiated) {
+            const headers = {
+                ...getCopilotChatHeaders(apiToken, negotiated.sessionToken),
+                "Openai-Intent": "conversation-panel",
+            }
+            if (negotiated.supportsResponses) {
+                const body = {
+                    ...payload,
+                    model: negotiated.modelId,
+                    reasoning: { effort, summary: "auto", ...(payload.reasoning || {}) },
+                }
+                return forwardCopilotResponses(capiBaseUrl, headers, body, negotiated.modelId, account.id, signal, options)
+            }
+            return adaptResponsesToCopilotChat(capiBaseUrl, headers, payload, negotiated.modelId, effort, account.id, signal, options)
+        }
+
+        // /auto unavailable: same fallback as createCopilotCompletion.
+        return adaptResponsesToCopilotChat(capiBaseUrl, getCopilotChatHeaders(apiToken), payload, "gpt-4o", undefined, account.id, signal, options)
+    }
+
+    const info = available.find(m => m.id === resolved.id)
+    const endpoints = info?.supported_endpoints
+    const supportsResponses = Array.isArray(endpoints) && endpoints.includes("/responses")
+    const supportedEfforts = info ? getCopilotReasoningEfforts(info) : []
+    const effort = typeof requestedEffort === "string" ? requestedEffort : resolved.effort
+    const effectiveEffort = effort && supportedEfforts.includes(effort) ? effort : undefined
+
+    if (supportsResponses) {
+        const body: Record<string, any> = { ...payload, model: resolved.id }
+        if (effectiveEffort && !payload.reasoning?.effort) {
+            body.reasoning = { ...(payload.reasoning || {}), effort: effectiveEffort }
+        }
+        return forwardCopilotResponses(
+            capiBaseUrl,
+            { ...getCopilotChatHeaders(apiToken), "Openai-Intent": "conversation-panel" },
+            body,
+            resolved.id,
+            account.id,
+            signal,
+            options
+        )
+    }
+    return adaptResponsesToCopilotChat(
+        capiBaseUrl,
+        getCopilotChatHeaders(apiToken),
+        payload,
+        resolved.id,
+        effectiveEffort,
+        account.id,
+        signal,
+        options
+    )
+}
+
+function extractChatPromptText(messages: unknown): string {
+    if (!Array.isArray(messages)) return ""
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i]
+        if (!msg || typeof msg !== "object" || msg.role !== "user") continue
+        if (typeof msg.content === "string" && msg.content.trim()) return msg.content
+        if (Array.isArray(msg.content)) {
+            const text = msg.content
+                .map((p: any) => (typeof p?.text === "string" ? p.text : ""))
+                .filter(Boolean)
+                .join(" ")
+                .trim()
+            if (text) return text
+        }
+    }
+    return ""
+}
+
+async function adaptChatToCopilotResponses(
+    capiBaseUrl: string,
+    headers: Record<string, string>,
+    payload: Record<string, any>,
+    responsesModel: string,
+    effort: string | undefined,
+    accountId: string,
+    signal: AbortSignal | undefined,
+    options?: DirectOptions
+): Promise<DirectResult> {
+    const respBody = chatPayloadToResponses(payload, responsesModel)
+    if (effort && !respBody.reasoning?.effort) {
+        respBody.reasoning = { effort, summary: "auto", ...(respBody.reasoning || {}) }
+    }
+    const direct = await forwardCopilotResponses(
+        capiBaseUrl,
+        { ...headers, "Openai-Intent": "conversation-panel" },
+        respBody,
+        responsesModel,
+        accountId,
+        signal,
+        options
+    )
+    if (direct.kind === "sse") {
+        return {
+            kind: "sse",
+            status: direct.status,
+            resolvedModel: direct.resolvedModel,
+            stream: responsesSseToOpenAIChatSse(direct.stream, payload.model || responsesModel, {
+                includeUsage: payload.stream_options?.include_usage === true,
+                provider: "copilot",
+            }),
+        }
+    }
+    return {
+        kind: "json",
+        status: direct.status,
+        resolvedModel: direct.resolvedModel,
+        data: responseObjectToChatCompletion(direct.data, payload.model || responsesModel),
+        usage: direct.usage,
+    }
+}
+
+/**
+ * Direct-first OpenAI Chat Completions pass-through to Copilot:
+ * - Native `/chat/completions` models (and `/auto` when it picks one): 0 conversions, raw pass-through.
+ * - `copilot-auto` (when `/auto` picks a `/responses` model) or `/responses`-only models: 1-hop Chat <-> Responses with live SSE.
+ */
+export async function createCopilotChatDirect(
+    account: ProviderAccount,
+    model: string,
+    payload: Record<string, any>,
+    signal?: AbortSignal,
+    options?: DirectOptions
+): Promise<DirectResult | null> {
+    throwIfAborted(signal)
+    const { token: apiToken, capiBaseUrl } = await getCopilotApiTokenInfo(account, signal)
+    const available = await fetchCopilotModels(apiToken, capiBaseUrl, signal)
+    throwIfAborted(signal)
+
+    const resolved = resolveCopilotModel(available, model)
+    if (resolved.isAuto) {
+        const requestedEffort = payload.reasoning_effort ?? payload.reasoning?.effort
+        const { tier, effort } = resolveAutoTier(resolved, requestedEffort)
+        const negotiated = await negotiateCopilotAuto(
+            capiBaseUrl,
+            apiToken,
+            extractChatPromptText(payload.messages),
+            tier,
+            signal
+        )
+        if (negotiated) {
+            const headers = getCopilotChatHeaders(apiToken, negotiated.sessionToken)
+            if (negotiated.supportsResponses) {
+                return adaptChatToCopilotResponses(capiBaseUrl, headers, payload, negotiated.modelId, effort, account.id, signal, options)
+            }
+            const body: Record<string, any> = { ...payload, model: negotiated.modelId }
+            if (body.stream) {
+                body.stream_options = { include_usage: true, ...(payload.stream_options || {}) }
+                const response = await postCopilotStream(`${capiBaseUrl}/chat/completions`, headers, body, signal)
+                authStore.markSuccess("copilot", account.id)
+                return {
+                    kind: "sse",
+                    status: response.status,
+                    resolvedModel: negotiated.modelId,
+                    stream: tapSseUsage(sseEventBlocks(response.stream), extractChatUsage, options?.onUsage),
+                }
+            }
+            const response = await postCopilotJson(`${capiBaseUrl}/chat/completions`, headers, body, signal)
+            authStore.markSuccess("copilot", account.id)
+            const usage = extractChatUsage(response.data)
+            reportUsage(usage, options?.onUsage)
+            return { kind: "json", status: response.status, data: response.data, resolvedModel: negotiated.modelId, usage }
+        }
+        // /auto unavailable: fall back to gpt-4o directly on /chat/completions
+        const fallbackBody: Record<string, any> = { ...payload, model: "gpt-4o" }
+        const fallbackHeaders = getCopilotChatHeaders(apiToken)
+        if (fallbackBody.stream) {
+            fallbackBody.stream_options = { include_usage: true, ...(payload.stream_options || {}) }
+            const response = await postCopilotStream(`${capiBaseUrl}/chat/completions`, fallbackHeaders, fallbackBody, signal)
+            authStore.markSuccess("copilot", account.id)
+            return {
+                kind: "sse",
+                status: response.status,
+                resolvedModel: "gpt-4o",
+                stream: tapSseUsage(sseEventBlocks(response.stream), extractChatUsage, options?.onUsage),
+            }
+        }
+        const response = await postCopilotJson(`${capiBaseUrl}/chat/completions`, fallbackHeaders, fallbackBody, signal)
+        authStore.markSuccess("copilot", account.id)
+        const usage = extractChatUsage(response.data)
+        reportUsage(usage, options?.onUsage)
+        return { kind: "json", status: response.status, data: response.data, resolvedModel: "gpt-4o", usage }
+    }
+
+    const info = available.find(m => m.id === resolved.id)
+    const endpoints = info?.supported_endpoints
+    const supportedEfforts = info ? getCopilotReasoningEfforts(info) : []
+    const requestedEffort = payload.reasoning_effort ?? payload.reasoning?.effort
+    const effort = typeof requestedEffort === "string" ? requestedEffort : resolved.effort
+    const effectiveEffort = effort && supportedEfforts.includes(effort) ? effort : undefined
+
+    if (Array.isArray(endpoints) && endpoints.includes("/responses") && !endpoints.includes("/chat/completions")) {
+        return adaptChatToCopilotResponses(
+            capiBaseUrl,
+            getCopilotChatHeaders(apiToken),
+            payload,
+            resolved.id,
+            effectiveEffort,
+            account.id,
+            signal,
+            options
+        )
+    }
+
+    const body: Record<string, any> = { ...payload, model: resolved.id }
+    if (effectiveEffort) {
+        body.reasoning_effort = effectiveEffort
+    } else {
+        delete body.reasoning_effort
+    }
+
+    const url = `${capiBaseUrl}/chat/completions`
+    const headers = getCopilotChatHeaders(apiToken)
+
+    if (body.stream) {
+        // Ask for the final usage chunk so usage can be recorded; callers' own stream_options win.
+        body.stream_options = { include_usage: true, ...(payload.stream_options || {}) }
+        const response = await postCopilotStream(url, headers, body, signal)
+        authStore.markSuccess("copilot", account.id)
+        return {
+            kind: "sse",
+            status: response.status,
+            resolvedModel: resolved.id,
+            stream: tapSseUsage(sseEventBlocks(response.stream), extractChatUsage, options?.onUsage),
+        }
+    }
+
+    const response = await postCopilotJson(url, headers, body, signal)
+    authStore.markSuccess("copilot", account.id)
+    const usage = extractChatUsage(response.data)
+    reportUsage(usage, options?.onUsage)
+    return { kind: "json", status: response.status, data: response.data, resolvedModel: resolved.id, usage }
+}
 
 export async function listCopilotModelsForAccount(account: ProviderAccount, signal?: AbortSignal): Promise<CopilotModelInfo[]> {
     const { token: apiToken, capiBaseUrl } = await getCopilotApiTokenInfo(account, signal, COPILOT_MODEL_SYNC_TIMEOUT_MS)
@@ -753,6 +1296,146 @@ async function fetchInsecureJson(
                 rejectOnce(createAbortError())
             } else {
                 rejectOnce(err)
+            }
+        })
+
+        if (options.body) {
+            req.write(options.body)
+        }
+        req.end()
+    })
+}
+
+type InsecureStreamResponse = {
+    status: number
+    headers: Record<string, string | string[] | undefined>
+    /** Decoded UTF-8 text chunks as they arrive. Throws an abort error if `signal` fires. */
+    stream: AsyncGenerator<string, void, unknown>
+}
+
+/**
+ * Streaming counterpart of fetchInsecureJson (Node https, honours COPILOT_INSECURE_AGENT).
+ * Resolves as soon as response headers arrive. `timeoutMs` bounds connect + time-to-headers;
+ * `idleTimeoutMs` bounds silence between body chunks.
+ */
+async function fetchInsecureStream(
+    url: string,
+    options: {
+        method?: string
+        headers?: Record<string, string>
+        body?: string
+        signal?: AbortSignal
+        timeoutMs?: number
+        idleTimeoutMs?: number
+    }
+): Promise<InsecureStreamResponse> {
+    throwIfAborted(options.signal)
+    const target = new URL(url)
+    const headers = {
+        "User-Agent": "anti-api/1.0",
+        ...(options.headers || {}),
+    }
+    const timeoutMs = options.timeoutMs ?? DEFAULT_INSECURE_FETCH_TIMEOUT_MS
+    const idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS
+    const signal = options.signal
+
+    return new Promise<InsecureStreamResponse>((resolve, reject) => {
+        let settled = false
+        let req: ReturnType<typeof https.request>
+        let responseRef: import("http").IncomingMessage | null = null
+        let headerTimer: ReturnType<typeof setTimeout> | null = null
+        let idleTimer: ReturnType<typeof setTimeout> | null = null
+
+        const clearTimers = () => {
+            if (headerTimer) { clearTimeout(headerTimer); headerTimer = null }
+            if (idleTimer) { clearTimeout(idleTimer); idleTimer = null }
+        }
+        const cleanup = () => {
+            signal?.removeEventListener("abort", onAbort)
+            clearTimers()
+        }
+        const fail = (error: unknown) => {
+            try { responseRef?.destroy() } catch { }
+            try { req.destroy() } catch { }
+            if (!settled) {
+                settled = true
+                cleanup()
+                reject(error)
+            }
+        }
+        const armIdle = () => {
+            if (idleTimeoutMs <= 0) return
+            if (idleTimer) clearTimeout(idleTimer)
+            idleTimer = setTimeout(() => {
+                const err = new Error(`Stream idle timeout after ${idleTimeoutMs}ms: ${url}`)
+                try { responseRef?.destroy(err) } catch { }
+                try { req.destroy(err) } catch { }
+            }, idleTimeoutMs)
+        }
+        const onAbort = () => {
+            const err = createAbortError()
+            try { responseRef?.destroy(err) } catch { }
+            try { req.destroy(err) } catch { }
+            if (!settled) {
+                settled = true
+                cleanup()
+                reject(err)
+            }
+        }
+
+        signal?.addEventListener("abort", onAbort, { once: true })
+
+        req = https.request(
+            {
+                hostname: target.hostname,
+                port: target.port || 443,
+                path: `${target.pathname}${target.search}`,
+                method: options.method || "POST",
+                headers,
+                agent: COPILOT_INSECURE_AGENT,
+            },
+            (res) => {
+                if (settled) {
+                    res.destroy()
+                    return
+                }
+                settled = true
+                responseRef = res
+                if (headerTimer) { clearTimeout(headerTimer); headerTimer = null }
+                res.setEncoding("utf8")
+                res.once("close", cleanup)
+                armIdle()
+
+                async function* body(): AsyncGenerator<string, void, unknown> {
+                    try {
+                        for await (const chunk of res) {
+                            armIdle()
+                            yield chunk as string
+                        }
+                    } catch (error) {
+                        if (signal?.aborted || isAbortError(error)) throw createAbortError()
+                        throw error
+                    } finally {
+                        cleanup()
+                        if (!res.destroyed) res.destroy()
+                    }
+                }
+
+                resolve({ status: res.statusCode || 0, headers: res.headers, stream: body() })
+            }
+        )
+
+        if (timeoutMs > 0) {
+            headerTimer = setTimeout(() => {
+                fail(new Error(`Request timeout after ${timeoutMs}ms: ${url}`))
+            }, timeoutMs)
+        }
+
+        req.on("error", (err) => {
+            if (signal?.aborted || isAbortError(err)) {
+                fail(createAbortError())
+            } else {
+                fail(err)
             }
         })
 

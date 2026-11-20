@@ -48,8 +48,9 @@ export function getCacheReadTokens(usage: Partial<CompletionUsage> | undefined):
 }
 
 export interface ContentBlock {
-    type: "text" | "tool_use"
+    type: "text" | "tool_use" | "thinking"
     text?: string
+    thinking?: string
     id?: string
     name?: string
     input?: any

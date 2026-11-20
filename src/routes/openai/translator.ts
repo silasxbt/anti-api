@@ -484,6 +484,34 @@ export function translateTools(tools?: OpenAITool[]): ClaudeTool[] | undefined {
     })
 }
 
+export function extractOpenAIReasoningEffort(payload: {
+    reasoning_effort?: string
+    reasoning?: { effort?: string }
+}): ReasoningEffort | undefined {
+    const raw = (payload.reasoning_effort ?? payload.reasoning?.effort)?.trim().toLowerCase()
+    if (!raw) return undefined
+    if (raw === "xhigh" || raw === "max" || raw === "high") return "high"
+    if (raw === "medium") return "medium"
+    if (raw === "low" || raw === "minimal") return "low"
+    return undefined
+}
+
+export function translateOpenAIToolChoice(
+    toolChoice: unknown
+): { type: "auto" | "any" | "tool" | "none"; name?: string } | undefined {
+    if (toolChoice === undefined || toolChoice === null) return undefined
+    if (typeof toolChoice === "string") {
+        if (toolChoice === "auto") return { type: "auto" }
+        if (toolChoice === "none") return { type: "none" }
+        if (toolChoice === "required") return { type: "any" }
+        return undefined
+    }
+    if (isRecord(toolChoice) && toolChoice.type === "function" && isRecord(toolChoice.function) && typeof toolChoice.function.name === "string" && toolChoice.function.name) {
+        return { type: "tool", name: toolChoice.function.name }
+    }
+    return undefined
+}
+
 export function mapStopReason(anthropicReason: string): "stop" | "length" | "tool_calls" | "content_filter" | null {
     switch (anthropicReason) {
         case "end_turn": return "stop"
@@ -536,4 +564,157 @@ export function buildStreamChunk(
     }
 
     return JSON.stringify(chunk)
+}
+
+export function completionToOpenAIChatObject(
+    completion: {
+        contentBlocks: Array<{
+            type: string
+            text?: string
+            thinking?: string
+            id?: string
+            name?: string
+            input?: any
+            thought_signature?: string
+            thoughtSignature?: string
+        }>
+        stopReason: string | null
+        usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number }
+    },
+    model: string,
+    id: string = generateChatId()
+): Record<string, any> {
+    let textContent = ""
+    let reasoningContent = ""
+    const toolCalls: any[] = []
+
+    for (const block of completion.contentBlocks || []) {
+        if (block.type === "text") {
+            textContent += block.text || ""
+        } else if (block.type === "thinking") {
+            reasoningContent += block.thinking || block.text || ""
+        } else if (block.type === "tool_use") {
+            toolCalls.push({
+                id: block.id,
+                name: block.name,
+                input: block.input,
+                thought_signature: block.thought_signature || block.thoughtSignature,
+            })
+        }
+    }
+
+    const message: any = { role: "assistant", content: toolCalls.length > 0 ? null : textContent }
+    if (reasoningContent) {
+        message.reasoning_content = reasoningContent
+    }
+    if (toolCalls.length > 0) {
+        message.tool_calls = toolCalls.map((tc) => ({
+            id: tc.id,
+            type: "function",
+            function: { name: tc.name, arguments: JSON.stringify(tc.input ?? {}) },
+            ...(tc.thought_signature ? { thought_signature: tc.thought_signature } : {}),
+        }))
+    }
+
+    const cacheReadTokens = completion.usage?.cacheReadTokens || 0
+    const inputTokens = (completion.usage?.inputTokens || 0) + cacheReadTokens
+    const outputTokens = completion.usage?.outputTokens || 0
+
+    return {
+        id,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{ index: 0, message, finish_reason: mapStopReason(completion.stopReason || "end_turn") }],
+        usage: {
+            prompt_tokens: inputTokens,
+            completion_tokens: outputTokens,
+            total_tokens: inputTokens + outputTokens,
+            prompt_tokens_details: { cached_tokens: cacheReadTokens },
+        },
+    }
+}
+
+export async function* eventsToOpenAIChatSse(
+    events: AsyncIterable<import("~/lib/stream-events").RoutedStreamEvent>,
+    model: string,
+    options: { id?: string; includeUsage?: boolean } = {}
+): AsyncGenerator<string, void, unknown> {
+    const chatId = options.id || generateChatId()
+    let sentRole = false
+    const accumulatedToolCalls: any[] = []
+    let streamInputTokens = 0
+    let streamCacheReadTokens = 0
+    let streamOutputTokens = 0
+
+    const frame = (data: string) => `data: ${data}\n\n`
+
+    for await (const event of events) {
+        if (event.type === "start") {
+            if (!sentRole) {
+                sentRole = true
+                yield frame(buildStreamChunk(chatId, model, undefined, "assistant"))
+            }
+            continue
+        }
+
+        if (!sentRole) {
+            sentRole = true
+            yield frame(buildStreamChunk(chatId, model, undefined, "assistant"))
+        }
+
+        if (event.type === "thinking_delta") {
+            if (event.text) {
+                yield frame(buildStreamChunk(chatId, model, undefined, undefined, undefined, undefined, event.text))
+            }
+            continue
+        }
+
+        if (event.type === "text_delta") {
+            if (event.text) {
+                yield frame(buildStreamChunk(chatId, model, event.text))
+            }
+            continue
+        }
+
+        if (event.type === "tool_call") {
+            accumulatedToolCalls.push({
+                id: event.id,
+                name: event.name,
+                input: event.input ?? {},
+                ...(event.thoughtSignature ? { thought_signature: event.thoughtSignature, thoughtSignature: event.thoughtSignature } : {}),
+            })
+            continue
+        }
+
+        if (event.type === "finish") {
+            streamInputTokens = event.usage?.inputTokens ?? 0
+            streamCacheReadTokens = event.usage?.cacheReadTokens ?? 0
+            streamOutputTokens = event.usage?.outputTokens ?? 0
+
+            if (accumulatedToolCalls.length > 0) {
+                yield frame(buildStreamChunk(chatId, model, undefined, undefined, "tool_use", accumulatedToolCalls))
+            }
+            yield frame(buildStreamChunk(chatId, model, undefined, undefined, event.stopReason || "end_turn"))
+        }
+    }
+
+    if (options.includeUsage) {
+        const promptTokens = streamInputTokens + streamCacheReadTokens
+        yield frame(JSON.stringify({
+            id: chatId,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [],
+            usage: {
+                prompt_tokens: promptTokens,
+                completion_tokens: streamOutputTokens,
+                total_tokens: promptTokens + streamOutputTokens,
+                prompt_tokens_details: { cached_tokens: streamCacheReadTokens },
+            },
+        }))
+    }
+
+    yield frame("[DONE]")
 }

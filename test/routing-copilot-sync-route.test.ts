@@ -5,12 +5,15 @@ import { join } from "path"
 import { clearDynamicCodexModels, clearDynamicCopilotModels, getProviderModels } from "~/services/routing/models"
 import type { ProviderAccount } from "~/services/auth/types"
 
-type Provider = "antigravity" | "codex" | "copilot"
+type Provider = "antigravity" | "codex" | "copilot" | "zed" | "kiro" | "grok"
 
 const accountsByProvider: Record<Provider, ProviderAccount[]> = {
     antigravity: [],
     codex: [],
     copilot: [],
+    zed: [],
+    kiro: [],
+    grok: [],
 }
 
 let syncMode: "success" | "error" | "slow" = "success"
@@ -33,18 +36,20 @@ let tempHome: string | null = null
 let prevHome: string | undefined
 let prevProfile: string | undefined
 
+const realStore = await import("../src/services/auth/store")
 mock.module("~/services/auth/store", () => ({
+    ...realStore,
     authStore: {
         listAccounts: (provider?: Provider) => {
             if (!provider) {
-                return [...accountsByProvider.antigravity, ...accountsByProvider.codex, ...accountsByProvider.copilot]
+                return Object.values(accountsByProvider).flat()
             }
-            return [...accountsByProvider[provider]]
+            return [...(accountsByProvider[provider] || [])]
         },
         listSummaries: (provider?: Provider) => {
             const accounts = provider
-                ? accountsByProvider[provider]
-                : [...accountsByProvider.antigravity, ...accountsByProvider.codex, ...accountsByProvider.copilot]
+                ? (accountsByProvider[provider] || [])
+                : Object.values(accountsByProvider).flat()
             return accounts.map(account => ({
                 id: account.id,
                 provider: account.provider,
@@ -87,7 +92,9 @@ mock.module("~/services/quota-aggregator", () => ({
     getAggregatedQuota: async () => null,
 }))
 
+const realCopilot = await import("../src/services/copilot/chat")
 mock.module("~/services/copilot/chat", () => ({
+    ...realCopilot,
     createCopilotCompletion: async () => ({ contentBlocks: [], stopReason: "end_turn", usage: {} }),
     getCopilotReasoningEfforts: () => [],
     listCopilotModelsForAccount: async (account: ProviderAccount) => {
@@ -102,7 +109,9 @@ mock.module("~/services/copilot/chat", () => ({
     },
 }))
 
+const realCodex = await import("../src/services/codex/chat")
 mock.module("~/services/codex/chat", () => ({
+    ...realCodex,
     createCodexCompletion: async () => ({ contentBlocks: [], stopReason: "end_turn", usage: {} }),
     listCodexModelsForAccount: async (account: ProviderAccount) => {
         codexSyncedWithAccountIds.push(account.id)

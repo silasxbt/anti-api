@@ -7,13 +7,17 @@ export interface OpenAIChatCompletionRequest {
     messages: OpenAIMessage[]
     stream?: boolean
     max_tokens?: number
+    max_completion_tokens?: number
     stream_options?: { include_usage?: boolean }
     temperature?: number
     top_p?: number
     tools?: OpenAITool[]
-    reasoning_effort?: "low" | "medium" | "high"
+    tool_choice?: unknown
+    parallel_tool_calls?: boolean
+    response_format?: unknown
+    reasoning_effort?: string
     reasoning?: {
-        effort?: "low" | "medium" | "high"
+        effort?: string
     }
 }
 

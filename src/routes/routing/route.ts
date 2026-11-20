@@ -168,7 +168,7 @@ function triggerProviderSync(
     if (now - state.lastSyncAt > SYNC_TTL_MS && !state.inFlight) {
         state.lastSyncAt = now
         state.inFlightStartedAt = now
-        let currentFlight: Promise<void>
+        let currentFlight: Promise<void> | null = null
         currentFlight = (async () => {
             const mergedModels = new Map<string, ProviderModelOption>()
             try {

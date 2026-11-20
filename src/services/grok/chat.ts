@@ -21,6 +21,22 @@ import type { ClaudeMessage, ClaudeTool } from "~/lib/translator"
 import { toOpenAIMessages, toOpenAIResponsesContent, toOpenAITools } from "~/services/providers/openai-adapter"
 import { createAbortError, isAbortError, sleepWithAbort, throwIfAborted } from "~/lib/stream-cancellation"
 import { safeErrorMessage } from "~/lib/redaction"
+import {
+    chatPayloadToResponses,
+    claudeMessagesToResponsesInput,
+    claudeToolsToResponsesTools,
+    extractResponsesUsage,
+    normalizeResponsesInput,
+    readResponseText,
+    reportUsage,
+    responseObjectToChatCompletion,
+    responseObjectToSseEvents,
+    responsesObjectToCompletion,
+    responsesSseToOpenAIChatSse,
+    yieldAll,
+    type DirectOptions,
+    type DirectResult,
+} from "~/lib/direct-stream"
 
 const GROK_API_BASE = process.env.ANTI_API_GROK_BASE_URL || "https://cli-chat-proxy.grok.com/v1"
 const RESPONSES_PATH = "/responses"
@@ -304,24 +320,19 @@ async function requestResponsesCompletion(
     messages: ClaudeMessage[],
     tools?: ClaudeTool[],
     signal?: AbortSignal
-): Promise<OpenAIResponse> {
+): Promise<{
+    contentBlocks: Array<{ type: "tool_use"; id: string; name: string; input: any } | { type: "text"; text: string } | { type: "thinking"; thinking: string }>
+    stopReason: string
+    usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number }
+}> {
     throwIfAborted(signal)
-    const systemMessage = messages.find(m => (m.role as string) === "system")
-    const instructions = systemMessage && typeof systemMessage.content === "string"
-        ? systemMessage.content
-        : "You are a helpful assistant. Please respond to the user's query."
-
-    const openAITools = toOpenAITools(tools)
-    const responsesTools = openAITools?.map(t => ({
-        type: "function" as const,
-        name: t.function.name,
-        description: t.function.description,
-        parameters: t.function.parameters,
-    }))
+    const { instructions: extractedInstructions, input } = claudeMessagesToResponsesInput(messages)
+    const instructions = extractedInstructions || "You are a helpful assistant. Please respond to the user's query."
+    const responsesTools = claudeToolsToResponsesTools(tools)
 
     const requestBody: Record<string, unknown> = {
         model,
-        input: toGrokResponsesInput(toOpenAIMessages(messages)),
+        input,
         instructions,
         stream: false,
         store: false,
@@ -351,7 +362,16 @@ async function requestResponsesCompletion(
                 throw lastError
             }
             const data = text ? JSON.parse(text) : {}
-            return buildCompletionFromResponses(data)
+            const completion = responsesObjectToCompletion(data)
+            return {
+                contentBlocks: completion.contentBlocks as any[],
+                stopReason: completion.stopReason || "end_turn",
+                usage: {
+                    inputTokens: completion.usage?.inputTokens ?? 0,
+                    outputTokens: completion.usage?.outputTokens ?? 0,
+                    cacheReadTokens: completion.usage?.cacheReadTokens ?? 0,
+                },
+            }
         } catch (error) {
             lastError = error
             if (signal?.aborted || isAbortError(error)) {
@@ -381,11 +401,12 @@ export async function createGrokCompletion(
     const effectiveAccount = await refreshGrokAccountIfNeeded(account)
     throwIfAborted(signal)
 
-    let completion: OpenAIResponse | undefined
+    type GrokCompletion = Awaited<ReturnType<typeof requestResponsesCompletion>>
+    let completion: GrokCompletion | undefined
     let refreshedOnce = false
     let lastError: unknown
 
-    const attempt = async (): Promise<OpenAIResponse> => {
+    const attempt = async (): Promise<GrokCompletion> => {
         try {
             const result = await requestResponsesCompletion(effectiveAccount, model, messages, tools, signal)
             markGrokModelSupported(effectiveAccount.id, model)
@@ -452,37 +473,199 @@ export async function createGrokCompletion(
         throw new UpstreamError(GROK_PROVIDER, 500, "Empty completion")
     }
 
-    const choice = completion.choices?.[0]
-    const content = choice?.message?.content || ""
-    const toolCalls = choice?.message?.tool_calls || []
-
-    const contentBlocks: Array<
-        { type: "tool_use"; id: string; name: string; input: any } | { type: "text"; text: string }
-    > = []
-    if (toolCalls.length > 0) {
-        for (const call of toolCalls) {
-            contentBlocks.push({
-                type: "tool_use",
-                id: call.id || `tool_${crypto.randomUUID().slice(0, 8)}`,
-                name: call.function?.name || "tool",
-                input: safeParse(call.function?.arguments),
-            })
-        }
-    }
-    if (content) {
-        contentBlocks.push({ type: "text", text: content })
-    }
-
     authStore.markSuccess(GROK_PROVIDER, effectiveAccount.id)
 
     return {
-        contentBlocks,
-        stopReason: toolCalls.length > 0 ? "tool_use" : mapFinishReason(choice?.finish_reason),
-        usage: {
-            inputTokens: completion.usage?.prompt_tokens || 0,
-            outputTokens: completion.usage?.completion_tokens || 0,
-        },
+        contentBlocks: completion.contentBlocks,
+        stopReason: completion.stopReason,
+        usage: completion.usage,
         resolvedModel: model,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native Responses pass-through
+// ---------------------------------------------------------------------------
+
+const GROK_DEFAULT_INSTRUCTIONS = "You are a helpful assistant. Please respond to the user's query."
+
+function buildGrokResponsesBody(model: string, payload: Record<string, any>): Record<string, any> {
+    const body: Record<string, any> = { ...payload }
+    body.model = model
+    body.input = normalizeResponsesInput(payload.input)
+    if (!(typeof body.instructions === "string" && body.instructions.trim())) {
+        body.instructions = GROK_DEFAULT_INSTRUCTIONS
+    }
+    // The upstream is called non-streaming; streaming callers get a clean SSE replay of the result.
+    body.stream = false
+    body.store = false
+    return body
+}
+
+async function requestGrokResponsesJson(
+    account: ProviderAccount,
+    requestBody: Record<string, any>,
+    signal?: AbortSignal
+): Promise<{ status: number; data: any }> {
+    throwIfAborted(signal)
+    const url = `${GROK_API_BASE}${RESPONSES_PATH}`
+    const headers = getGrokHeaders(account.accessToken, "application/json")
+    const bodyText = JSON.stringify(requestBody)
+
+    let lastError: unknown
+    for (let attempt = 0; attempt <= GROK_MAX_RETRIES; attempt++) {
+        throwIfAborted(signal)
+        try {
+            const response = await fetch(url, { method: "POST", headers, body: bodyText, signal })
+            const text = await readResponseText(response)
+            throwIfAborted(signal)
+            if (!response.ok) {
+                lastError = new UpstreamError(GROK_PROVIDER, response.status, text, response.headers.get("retry-after") || undefined)
+                if (isRetryableStatus(response.status) && attempt < GROK_MAX_RETRIES) {
+                    await sleepWithAbort(getRetryDelay(attempt), signal)
+                    continue
+                }
+                consola.error(`Grok error ${response.status}`)
+                throw lastError
+            }
+            let data: any
+            try {
+                data = text ? JSON.parse(text) : {}
+            } catch {
+                throw new UpstreamError(GROK_PROVIDER, 502, "Grok returned a non-JSON response")
+            }
+            return { status: response.status, data }
+        } catch (error) {
+            lastError = error
+            if (signal?.aborted || isAbortError(error)) throw createAbortError()
+            if (error instanceof UpstreamError) throw error
+            if (attempt < GROK_MAX_RETRIES) {
+                await sleepWithAbort(getRetryDelay(attempt), signal)
+                continue
+            }
+            throw error
+        }
+    }
+    throw lastError || new UpstreamError(GROK_PROVIDER, 500, "Grok request failed")
+}
+
+/**
+ * Native OpenAI Responses pass-through to Grok (xAI CLI proxy).
+ * The upstream is always called non-streaming; with `payload.stream` the finished response is replayed
+ * as a well-formed Responses SSE event sequence.
+ */
+export async function createGrokResponsesDirect(
+    account: ProviderAccount,
+    model: string,
+    payload: Record<string, any>,
+    signal?: AbortSignal,
+    options?: DirectOptions
+): Promise<DirectResult> {
+    throwIfAborted(signal)
+    const effectiveAccount = await refreshGrokAccountIfNeeded(account)
+    throwIfAborted(signal)
+
+    const requestBody = buildGrokResponsesBody(model, payload)
+
+    const attempt = async () => {
+        try {
+            const result = await requestGrokResponsesJson(effectiveAccount, requestBody, signal)
+            markGrokModelSupported(effectiveAccount.id, model)
+            return result
+        } catch (error) {
+            if (error instanceof UpstreamError && isGrokUnsupportedModelError(error)) {
+                markGrokModelUnsupported(effectiveAccount.id, model)
+            }
+            throw error
+        }
+    }
+
+    let result: { status: number; data: any }
+    try {
+        result = await attempt()
+    } catch (error) {
+        if (signal?.aborted || isAbortError(error)) throw createAbortError()
+        if (!(error instanceof UpstreamError && isAuthStatus(error))) throw error
+
+        let recovered: { status: number; data: any } | undefined
+        let lastError: unknown = error
+        // Re-reading another CLI credential store is opt-in.
+        if (process.env.ANTI_API_IMPORT_GROK_ON_AUTH_FAILURE === "1") {
+            try {
+                const imported = await importGrokAuthSources()
+                const updated = imported.accounts.find(acc => acc.id === effectiveAccount.id || (acc.email && acc.email === effectiveAccount.email))
+                if (updated?.accessToken && updated.accessToken !== effectiveAccount.accessToken) {
+                    effectiveAccount.accessToken = updated.accessToken
+                    if (updated.refreshToken) effectiveAccount.refreshToken = updated.refreshToken
+                    if (updated.expiresAt) effectiveAccount.expiresAt = updated.expiresAt
+                    recovered = await attempt()
+                }
+            } catch (importError) {
+                throwIfAborted(signal)
+                lastError = importError
+            }
+        }
+        if (!recovered && effectiveAccount.refreshToken) {
+            try {
+                const refreshed = await refreshGrokAccessToken(effectiveAccount.refreshToken, getGrokClientId(effectiveAccount))
+                effectiveAccount.accessToken = refreshed.accessToken
+                if (refreshed.refreshToken) effectiveAccount.refreshToken = refreshed.refreshToken
+                if (refreshed.expiresIn) effectiveAccount.expiresAt = Date.now() + refreshed.expiresIn * 1000
+                authStore.saveAccount(effectiveAccount)
+                recovered = await attempt()
+            } catch (retryError) {
+                if (signal?.aborted || isAbortError(retryError)) throw createAbortError()
+                lastError = retryError
+            }
+        }
+        if (!recovered) throw lastError
+        result = recovered
+    }
+
+    authStore.markSuccess(GROK_PROVIDER, effectiveAccount.id)
+    const usage = extractResponsesUsage(result.data)
+    reportUsage(usage, options?.onUsage)
+
+    if (payload.stream === true) {
+        return {
+            kind: "sse",
+            status: result.status,
+            resolvedModel: model,
+            stream: yieldAll(responseObjectToSseEvents(result.data)),
+        }
+    }
+    return { kind: "json", status: result.status, data: result.data, resolvedModel: model, usage }
+}
+
+/**
+ * 1-hop OpenAI Chat Completions adapter over Grok's `/responses` endpoint.
+ */
+export async function createGrokChatDirect(
+    account: ProviderAccount,
+    model: string,
+    payload: Record<string, any>,
+    signal?: AbortSignal,
+    options?: DirectOptions
+): Promise<DirectResult> {
+    const respPayload = chatPayloadToResponses(payload, model)
+    const direct = await createGrokResponsesDirect(account, model, respPayload, signal, options)
+    if (direct.kind === "sse") {
+        return {
+            kind: "sse",
+            status: direct.status,
+            resolvedModel: direct.resolvedModel,
+            stream: responsesSseToOpenAIChatSse(direct.stream, payload.model || model, {
+                includeUsage: payload.stream_options?.include_usage === true,
+                provider: "grok",
+            }),
+        }
+    }
+    return {
+        kind: "json",
+        status: direct.status,
+        resolvedModel: direct.resolvedModel,
+        data: responseObjectToChatCompletion(direct.data, payload.model || model),
+        usage: direct.usage,
     }
 }
 

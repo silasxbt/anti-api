@@ -19,6 +19,10 @@ mock.module("~/services/antigravity/chat", () => ({
     createChatCompletionStreamWithOptions: async function* () {
         yield ""
     },
+    createAntigravityEventStreamWithOptions: async function* () {
+        yield { type: "start" as const, model: "mock" }
+        yield { type: "finish" as const, stopReason: "end_turn" as const }
+    },
 }))
 
 mock.module("~/services/antigravity/account-manager", () => ({
@@ -30,16 +34,23 @@ mock.module("~/services/antigravity/account-manager", () => ({
     },
 }))
 
+const realCodex = await import("../src/services/codex/chat")
 mock.module("~/services/codex/chat", () => ({
+    ...realCodex,
     createCodexCompletion: async () => ({ contentBlocks: [], stopReason: "end_turn", usage: {} }),
+    createCodexResponsesDirect: async () => ({ kind: "json" as const, status: 200, data: {}, resolvedModel: "mock" }),
     isCodexInsecureTlsEnabled: () => false,
     listCodexModelsForAccount: async () => [],
     isCodexModelSupportedForAccount: () => undefined,
     isCodexUnsupportedModelError: () => false,
 }))
 
+const realCopilot = await import("../src/services/copilot/chat")
 mock.module("~/services/copilot/chat", () => ({
+    ...realCopilot,
     createCopilotCompletion: async () => ({ contentBlocks: [], stopReason: "end_turn", usage: {} }),
+    createCopilotResponsesDirect: async () => ({ kind: "json" as const, status: 200, data: {}, resolvedModel: "mock" }),
+    createCopilotChatDirect: async () => null,
     getCopilotReasoningEfforts: () => [],
     isCopilotInsecureTlsEnabled: () => false,
     listCopilotModelsForAccount: async () => [],

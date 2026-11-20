@@ -8,6 +8,26 @@ import type { ClaudeMessage, ClaudeTool } from "~/lib/translator"
 import { toOpenAIMessages, toOpenAIResponsesContent, toOpenAITools } from "~/services/providers/openai-adapter"
 import { createAbortError, isAbortError, sleepWithAbort, throwIfAborted } from "~/lib/stream-cancellation"
 import { safeErrorMessage } from "~/lib/redaction"
+import {
+    chatPayloadToResponses,
+    claudeMessagesToResponsesInput,
+    claudeToolsToResponsesTools,
+    extractResponsesUsage,
+    normalizeResponsesInput,
+    parseSseJson,
+    readResponseText,
+    reportUsage,
+    responseObjectToChatCompletion,
+    responsesObjectToCompletion,
+    responsesSseToEvents,
+    responsesSseToOpenAIChatSse,
+    sseEventBlocks,
+    tapSseUsage,
+    yieldAll,
+    type DirectOptions,
+    type DirectResult,
+} from "~/lib/direct-stream"
+import type { RoutedStreamEvent } from "~/lib/stream-events"
 
 const CODEX_API_BASE = "https://chatgpt.com/backend-api/codex"
 const CHAT_COMPLETIONS_PATH = "/chat/completions"
@@ -766,32 +786,18 @@ async function requestResponsesCompletion(
     model: string,
     messages: ClaudeMessage[],
     tools?: ClaudeTool[],
-    maxTokens?: number,
+    _maxTokens?: number,
     reasoningEffort?: CodexReasoningEffort,
     signal?: AbortSignal
 ): Promise<{ completion: OpenAIResponse; model: string }> {
     throwIfAborted(signal)
-    // CLIProxyAPI format: Codex Responses API requires specific fields
-    // Extract system message as instructions, or use default
-    const systemMessage = messages.find(m => (m.role as string) === "system")
-    const instructions = systemMessage?.content
-        ? (typeof systemMessage.content === "string" ? systemMessage.content : "You are a helpful assistant.")
-        : "You are a helpful assistant. Please respond to the user's query."
-
-    // Convert tools to ChatGPT Responses API format (flat, not nested)
-    // OpenAI format: {type: "function", function: {name, description, parameters}}
-    // Responses API format: {type: "function", name, description, parameters}
-    const openAITools = toOpenAITools(tools)
-    const responsesTools = openAITools?.map(t => ({
-        type: "function" as const,
-        name: t.function.name,
-        description: t.function.description,
-        parameters: t.function.parameters,
-    }))
+    const { instructions: extractedInstructions, input } = claudeMessagesToResponsesInput(messages)
+    const instructions = extractedInstructions || "You are a helpful assistant. Please respond to the user's query."
+    const responsesTools = claudeToolsToResponsesTools(tools)
 
     const requestBody = {
         model,
-        input: toCodexResponsesInput(toOpenAIMessages(messages)),
+        input,
         tools: responsesTools,
         instructions,
         stream: true,
@@ -1071,6 +1077,359 @@ export async function createCodexCompletion(
         },
         resolvedModel,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Native Responses pass-through
+// ---------------------------------------------------------------------------
+
+const CODEX_DEFAULT_INSTRUCTIONS = "You are a helpful assistant. Please respond to the user's query."
+/** Parameters the ChatGPT Codex backend rejects. */
+const CODEX_UNSUPPORTED_PARAMS = ["max_output_tokens", "max_tool_calls", "temperature", "top_p", "user", "metadata", "truncation"]
+
+/** Decode a fetch body into text chunks; cancels the upstream read when the consumer stops or `signal` aborts. */
+async function* readBodyText(
+    body: ReadableStream<Uint8Array>,
+    signal?: AbortSignal
+): AsyncGenerator<string, void, unknown> {
+    const reader = body.getReader()
+    const decoder = new TextDecoder()
+    try {
+        while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            if (value) {
+                const text = decoder.decode(value, { stream: true })
+                if (text) yield text
+            }
+        }
+        const tail = decoder.decode()
+        if (tail) yield tail
+    } catch (error) {
+        if (signal?.aborted || isAbortError(error)) throw createAbortError()
+        throw error
+    } finally {
+        try { await reader.cancel() } catch { }
+    }
+}
+
+function buildCodexResponsesBody(model: string, payload: Record<string, any>): Record<string, any> {
+    const body: Record<string, any> = { ...payload }
+    for (const key of CODEX_UNSUPPORTED_PARAMS) delete body[key]
+
+    body.model = model
+    body.input = normalizeResponsesInput(payload.input).map(item =>
+        item && typeof item === "object" && item.type === "message" && item.role === "system"
+            ? { ...item, role: "developer" }
+            : item
+    )
+    body.instructions = typeof payload.instructions === "string" && payload.instructions.trim()
+        ? payload.instructions
+        : CODEX_DEFAULT_INSTRUCTIONS
+    body.store = false
+    // The backend only serves SSE; non-streaming callers get the collected response object.
+    body.stream = true
+    const include = Array.isArray(payload.include) ? payload.include : []
+    body.include = include.includes("reasoning.encrypted_content") ? include : [...include, "reasoning.encrypted_content"]
+    if (body.reasoning && typeof body.reasoning === "object") {
+        const effort = normalizeReasoningEffort(body.reasoning.effort)
+        body.reasoning = { summary: "auto", ...body.reasoning, ...(effort ? { effort } : {}) }
+        if (!effort && body.reasoning.effort !== undefined) body.reasoning.effort = resolveReasoningEffort()
+    } else {
+        body.reasoning = { effort: resolveReasoningEffort(), summary: "auto" }
+    }
+    return body
+}
+
+/**
+ * POST to the Codex /responses endpoint and resolve once response headers are OK, with the SSE body as a lazy
+ * text stream. Retries transient failures; with ANTI_API_CODEX_INSECURE_TLS it falls back to a buffered insecure request.
+ */
+async function openCodexResponsesStream(
+    account: ProviderAccount,
+    requestBody: Record<string, any>,
+    signal?: AbortSignal
+): Promise<AsyncGenerator<string, void, unknown>> {
+    const url = `${CODEX_API_BASE}${RESPONSES_PATH}`
+    const headers = getCodexHeaders(account.accessToken, account.id)
+    const bodyText = JSON.stringify(requestBody)
+
+    let lastError: unknown
+    for (let attempt = 0; attempt <= CODEX_MAX_RETRIES; attempt++) {
+        throwIfAborted(signal)
+        try {
+            const response = await fetchWithOptionalTls(url, { method: "POST", headers, body: bodyText, signal })
+            if (!response.ok) {
+                const text = await readResponseText(response)
+                lastError = new UpstreamError("codex", response.status, text, response.headers.get("retry-after") || undefined)
+                if (isRetryableStatus(response.status) && attempt < CODEX_MAX_RETRIES) {
+                    await sleepWithAbort(getRetryDelay(attempt), signal)
+                    continue
+                }
+                consola.error(`Codex error ${response.status}`)
+                throw lastError
+            }
+            if (!response.body) {
+                throw new UpstreamError("codex", 502, "Codex returned an empty response body")
+            }
+            return readBodyText(response.body, signal)
+        } catch (error) {
+            lastError = error
+            if (signal?.aborted || isAbortError(error)) throw createAbortError()
+            if (error instanceof UpstreamError) throw error
+            if (!CODEX_INSECURE_TLS && isCertificateError(error)) throw new Error(CODEX_TLS_HINT)
+            if (CODEX_INSECURE_TLS && shouldRetryInsecure(error)) {
+                const insecure = await fetchInsecureJson(url, { method: "POST", headers, body: bodyText, signal })
+                if (insecure.status < 200 || insecure.status >= 300) {
+                    lastError = new UpstreamError("codex", insecure.status, insecure.text)
+                    if (isRetryableStatus(insecure.status) && attempt < CODEX_MAX_RETRIES) {
+                        await sleepWithAbort(getRetryDelay(attempt), signal)
+                        continue
+                    }
+                    consola.error(`Codex error ${insecure.status}`)
+                    throw lastError
+                }
+                return yieldAll([insecure.text])
+            }
+            if (attempt < CODEX_MAX_RETRIES) {
+                await sleepWithAbort(getRetryDelay(attempt), signal)
+                continue
+            }
+            throw error
+        }
+    }
+    throw lastError || new UpstreamError("codex", 500, "Codex request failed")
+}
+
+/** Collect a Codex SSE stream into the final Responses object (filling `output` from item.done events if needed). */
+async function collectCodexResponse(blocks: AsyncIterable<string>): Promise<any> {
+    let created: any = null
+    let terminal: any = null
+    let terminalType = ""
+    const items = new Map<number, any>()
+
+    for await (const block of blocks) {
+        const event = parseSseJson(block)
+        if (!event || typeof event !== "object") continue
+        switch (event.type) {
+            case "response.created":
+                created = event.response ?? created
+                break
+            case "response.output_item.done":
+                if (typeof event.output_index === "number" && event.item) items.set(event.output_index, event.item)
+                break
+            case "response.completed":
+            case "response.incomplete":
+            case "response.failed":
+                terminal = event.response ?? event
+                terminalType = event.type
+                break
+            case "error":
+                throw new UpstreamError("codex", 502, JSON.stringify(event))
+        }
+    }
+
+    if (!terminal) {
+        throw new UpstreamError("codex", 502, "Codex stream ended without a terminal response event")
+    }
+    if (terminalType === "response.failed") {
+        throw new UpstreamError("codex", 502, JSON.stringify(terminal.error ?? terminal))
+    }
+    const response = { ...(created || {}), ...terminal }
+    if (!Array.isArray(response.output) || response.output.length === 0) {
+        response.output = Array.from(items.entries()).sort((a, b) => a[0] - b[0]).map(([, item]) => item)
+    }
+    return response
+}
+
+/** Run `attempt`; on a 401/403 refresh credentials once (same sources/order as createCodexCompletion) and retry. */
+async function withCodexAuthRecovery<T>(
+    account: ProviderAccount,
+    signal: AbortSignal | undefined,
+    attempt: () => Promise<T>
+): Promise<T> {
+    try {
+        return await attempt()
+    } catch (error) {
+        if (signal?.aborted || isAbortError(error)) throw createAbortError()
+        if (!(error instanceof UpstreamError && isAuthStatus(error) && account.refreshToken)) throw error
+
+        const applyTokens = (source: { accessToken: string; refreshToken?: string; expiresAt?: number }) => {
+            account.accessToken = source.accessToken
+            if (source.refreshToken) account.refreshToken = source.refreshToken
+            if (source.expiresAt) account.expiresAt = source.expiresAt
+        }
+        const findImported = async () => {
+            if (process.env.ANTI_API_IMPORT_CODEX_ON_AUTH_FAILURE !== "1") return undefined
+            const imported = await importCodexAuthSources()
+            return imported.accounts.find(acc =>
+                acc.id === account.id || (acc.email && acc.email === account.email)
+            )
+        }
+
+        let imported: Awaited<ReturnType<typeof findImported>>
+        try {
+            imported = await findImported()
+        } catch {
+            throwIfAborted(signal)
+        }
+        if (imported?.accessToken && imported.accessToken !== account.accessToken) {
+            applyTokens(imported)
+            return attempt()
+        }
+
+        try {
+            const refreshed = await refreshCodexAccessToken(account.refreshToken, account.authSource)
+            account.accessToken = refreshed.accessToken
+            if (refreshed.refreshToken) account.refreshToken = refreshed.refreshToken
+            if (refreshed.expiresIn) account.expiresAt = Date.now() + refreshed.expiresIn * 1000
+            authStore.saveAccount(account)
+        } catch (refreshError) {
+            if (signal?.aborted || isAbortError(refreshError)) throw createAbortError()
+            if (!isRefreshTokenReuseError(refreshError)) throw refreshError
+            account.refreshToken = undefined
+            authStore.saveAccount(account)
+            const latest = authStore.getAccount("codex", account.id)
+            if (latest?.accessToken && latest.accessToken !== account.accessToken) {
+                applyTokens(latest)
+                if (latest.refreshToken) account.refreshToken = latest.refreshToken
+                return attempt()
+            }
+            throw new UpstreamError("codex", 401, (refreshError as Error).message)
+        }
+        return attempt()
+    }
+}
+
+/**
+ * Native OpenAI Responses pass-through to the ChatGPT Codex backend.
+ * `payload.stream` → upstream SSE forwarded untouched (re-framed on event boundaries);
+ * otherwise the SSE is collected into the final Responses JSON object.
+ */
+export async function createCodexResponsesDirect(
+    account: ProviderAccount,
+    model: string,
+    payload: Record<string, any>,
+    signal?: AbortSignal,
+    options?: DirectOptions
+): Promise<DirectResult> {
+    throwIfAborted(signal)
+    const effectiveAccount = await refreshCodexAccountIfNeeded(account)
+    throwIfAborted(signal)
+
+    const wantsStream = payload.stream === true
+    const requestBody = buildCodexResponsesBody(model, payload)
+
+    const open = async () => {
+        try {
+            const text = await openCodexResponsesStream(effectiveAccount, requestBody, signal)
+            markCodexModelSupported(effectiveAccount.id, model)
+            return text
+        } catch (error) {
+            if (error instanceof UpstreamError && isCodexUnsupportedModelError(error)) {
+                markCodexModelUnsupported(effectiveAccount.id, model)
+            }
+            throw error
+        }
+    }
+
+    const text = await withCodexAuthRecovery(effectiveAccount, signal, open)
+    authStore.markSuccess("codex", effectiveAccount.id)
+
+    const blocks = sseEventBlocks(text)
+    if (wantsStream) {
+        return {
+            kind: "sse",
+            status: 200,
+            resolvedModel: model,
+            stream: tapSseUsage(blocks, extractResponsesUsage, options?.onUsage),
+        }
+    }
+
+    const data = await collectCodexResponse(blocks)
+    const usage = extractResponsesUsage(data)
+    reportUsage(usage, options?.onUsage)
+    return { kind: "json", status: 200, data, resolvedModel: model, usage }
+}
+
+/**
+ * 1-hop OpenAI Chat Completions adapter over Codex's native `/responses` SSE endpoint.
+ * Streams live when `payload.stream === true`.
+ */
+export async function createCodexChatDirect(
+    account: ProviderAccount,
+    model: string,
+    payload: Record<string, any>,
+    signal?: AbortSignal,
+    options?: DirectOptions
+): Promise<DirectResult> {
+    const respPayload = chatPayloadToResponses(payload, model)
+    const direct = await createCodexResponsesDirect(account, model, respPayload, signal, options)
+    if (direct.kind === "sse") {
+        return {
+            kind: "sse",
+            status: direct.status,
+            resolvedModel: direct.resolvedModel,
+            stream: responsesSseToOpenAIChatSse(direct.stream, payload.model || model, {
+                includeUsage: payload.stream_options?.include_usage === true,
+                provider: "codex",
+            }),
+        }
+    }
+    return {
+        kind: "json",
+        status: direct.status,
+        resolvedModel: direct.resolvedModel,
+        data: responseObjectToChatCompletion(direct.data, payload.model || model),
+        usage: direct.usage,
+    }
+}
+
+/**
+ * Live 1-hop event stream for `/v1/messages` on Codex.
+ */
+export async function* createCodexEventStream(
+    account: ProviderAccount,
+    model: string,
+    messages: ClaudeMessage[],
+    tools?: ClaudeTool[],
+    _maxTokens?: number,
+    reasoningEffort?: CodexReasoningEffort,
+    signal?: AbortSignal,
+    options?: DirectOptions
+): AsyncGenerator<RoutedStreamEvent, void, unknown> {
+    const { instructions, input } = claudeMessagesToResponsesInput(messages)
+    const responsesTools = claudeToolsToResponsesTools(tools)
+    const respPayload: Record<string, any> = {
+        model,
+        input,
+        ...(instructions ? { instructions } : {}),
+        ...(responsesTools && responsesTools.length > 0 ? { tools: responsesTools } : {}),
+        ...(reasoningEffort ? { reasoning: { effort: reasoningEffort, summary: "auto" } } : {}),
+        stream: true,
+    }
+    const direct = await createCodexResponsesDirect(account, model, respPayload, signal, options)
+    if (direct.kind === "sse") {
+        yield* responsesSseToEvents(direct.stream, model, "codex")
+        return
+    }
+    const completion = responsesObjectToCompletion(direct.data)
+    yield { type: "start", model }
+    for (const block of completion.contentBlocks) {
+        if (block.type === "thinking" && block.thinking) {
+            yield { type: "thinking_delta", text: block.thinking }
+        } else if (block.type === "text" && block.text !== undefined) {
+            yield { type: "text_delta", text: block.text }
+        } else if (block.type === "tool_use") {
+            yield {
+                type: "tool_call",
+                id: block.id || `call_${crypto.randomUUID().slice(0, 8)}`,
+                name: block.name || "tool",
+                input: block.input || {},
+            }
+        }
+    }
+    yield { type: "finish", stopReason: (completion.stopReason as any) || "end_turn", usage: completion.usage }
 }
 
 function safeParse(value: string | undefined): any {

@@ -9,6 +9,7 @@ import consola from "consola"
 
 import { messageRoutes } from "./routes/messages/route"
 import { openaiRoutes } from "./routes/openai/route"
+import { responsesRoutes } from "./routes/responses/route"
 import { audioRoutes } from "./routes/audio/route"
 import { authRouter } from "./routes/auth/route"
 import { remoteRouter } from "./routes/remote/route"
@@ -859,13 +860,9 @@ server.post("/v1/embeddings", (c) => c.json({
     error: { type: "not_supported", message: "Embeddings not supported" }
 }, 501))
 
-// Responses 端点 - 占位（OpenAI Responses API）
-server.post("/responses", (c) => c.json({
-    error: { type: "not_supported", message: "Responses API not supported" }
-}, 501))
-server.post("/v1/responses", (c) => c.json({
-    error: { type: "not_supported", message: "Responses API not supported" }
-}, 501))
+// Responses 端点 (OpenAI Responses API)
+server.route("/responses", responsesRoutes)
+server.route("/v1/responses", responsesRoutes)
 
 // 健康检查
 server.get("/health", (c) => c.json({
@@ -879,6 +876,8 @@ export function createPublicServer(token: string | null = getPublicGatewayToken(
     app.get("/health", (c) => c.json({ status: "ok" }))
     const publicPaths = [
         "/v1/chat/completions",
+        "/v1/responses",
+        "/responses",
         "/v1/messages",
         "/v1beta/messages",
         "/messages",
@@ -904,6 +903,8 @@ export function createPublicServer(token: string | null = getPublicGatewayToken(
     }
 
     app.route("/v1/chat/completions", openaiRoutes)
+    app.route("/v1/responses", responsesRoutes)
+    app.route("/responses", responsesRoutes)
     app.route("/v1/audio", audioRoutes)
     app.route("/audio", audioRoutes)
     app.route("/v1/messages", messageRoutes)

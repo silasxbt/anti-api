@@ -31,6 +31,9 @@ mock.module("~/services/antigravity/chat", () => ({
     createChatCompletionStreamWithOptions: async function* () {
         throw new UpstreamError("antigravity", upstreamStatus, upstreamBody)
     },
+    createAntigravityEventStreamWithOptions: async function* () {
+        throw new UpstreamError("antigravity", upstreamStatus, upstreamBody)
+    },
     isAntigravityModelSupportedForAccount: () => true,
     markAntigravityModelUnsupported: () => { },
 }))
@@ -56,14 +59,21 @@ mock.module("~/services/antigravity/account-manager", () => ({
     },
 }))
 
+const realCodex = await import("../src/services/codex/chat")
 mock.module("~/services/codex/chat", () => ({
+    ...realCodex,
     createCodexCompletion: async () => ({ contentBlocks: [], stopReason: "end_turn", usage: {} }),
+    createCodexResponsesDirect: async () => ({ kind: "json" as const, status: 200, data: {}, resolvedModel: "mock" }),
     isCodexModelSupportedForAccount: () => undefined,
     isCodexUnsupportedModelError: () => false,
 }))
 
+const realCopilot = await import("../src/services/copilot/chat")
 mock.module("~/services/copilot/chat", () => ({
+    ...realCopilot,
     createCopilotCompletion: async () => ({ contentBlocks: [], stopReason: "end_turn", usage: {} }),
+    createCopilotResponsesDirect: async () => ({ kind: "json" as const, status: 200, data: {}, resolvedModel: "mock" }),
+    createCopilotChatDirect: async () => null,
     getCopilotReasoningEfforts: () => [],
 }))
 

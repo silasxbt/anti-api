@@ -10,18 +10,8 @@ import { getDataDir, ensureDataDir } from "~/lib/data-dir"
 import { getAccessToken } from "./oauth"
 import { accountManager } from "./account-manager"
 import { state } from "~/lib/state"
-import {
-    type ClaudeMessage,
-    type ClaudeTool,
-    buildMessageStart,
-    buildContentBlockStart,
-    buildTextDelta,
-    buildThinkingDelta,
-    buildInputJsonDelta,
-    buildContentBlockStop,
-    buildMessageDelta,
-    buildMessageStop,
-} from "~/lib/translator"
+import { type ClaudeMessage, type ClaudeTool } from "~/lib/translator"
+import { formatAnthropicSse, normalizeStopReason, type RoutedStreamEvent } from "~/lib/stream-events"
 import { determineRetryStrategy, applyRetryDelay, parseRetryDelay } from "~/lib/retry"
 import { RequestValidationError, UpstreamError } from "~/lib/error"
 import { cleanJsonSchemaForGemini } from "~/lib/json-schema-cleaner"
@@ -811,8 +801,9 @@ export async function claudeToAntigravity(
     const imageBudget = createImageInputBudget(messages)
     const contents = []
     for (const msg of messages) {
+        const rawRole = msg.role as string
         contents.push({
-            role: msg.role === "assistant" ? "model" : msg.role,
+            role: rawRole === "assistant" ? "model" : rawRole === "system" ? "user" : rawRole,
             parts: await buildAntigravityParts(msg.content, toolIdToName, { signal, imageBudget, model }),
         })
     }
@@ -1695,10 +1686,21 @@ export async function* createChatCompletionStream(request: ChatRequest): AsyncGe
     yield* createChatCompletionStreamWithOptions(request)
 }
 
-export async function* createChatCompletionStreamWithOptions(
+export function createChatCompletionStreamWithOptions(
     request: ChatRequest,
     options: { accountId?: string; allowRotation?: boolean; routeTag?: string } = {}
 ): AsyncGenerator<string, void, unknown> {
+    return formatAnthropicSse(createAntigravityEventStreamWithOptions(request, options), request.model)
+}
+
+/**
+ * Typed direct event stream: parses Google's v1internal SSE and yields
+ * RoutedStreamEvent objects without building Anthropic SSE strings.
+ */
+export async function* createAntigravityEventStreamWithOptions(
+    request: ChatRequest,
+    options: { accountId?: string; allowRotation?: boolean; routeTag?: string } = {}
+): AsyncGenerator<RoutedStreamEvent, void, unknown> {
     const sessionKey = computeSessionKey(request.messages)
     const { accessToken, accountId, projectId, releaseAccountLock } = await resolveAntigravityAccount(
         request.model,
@@ -1732,20 +1734,29 @@ export async function* createChatCompletionStreamWithOptions(
             sessionKey
         )
 
-        let blockIndex = 0
         let hasToolUse = false
+        let hasText = false
         let outputTokens = 0
         let streamInputTokens = 0
         let streamCacheReadTokens = 0
-        let textBlockStarted = false
-        let thinkingBlockStarted = false
         let latestThoughtSignature: string | undefined
-
-        yield buildMessageStart(request.model)
-
         let latestFinishReason: string | undefined
 
-        for await (const chunkStr of sseStream) {
+        // Pull the first upstream chunk before yielding "start" so pre-stream
+        // HTTP/429/404 errors surface before the caller commits SSE headers.
+        const firstChunkResult = await sseStream.next()
+        yield { type: "start", model: request.model }
+
+        async function* remainingChunks(): AsyncGenerator<string, void, unknown> {
+            if (!firstChunkResult.done) {
+                yield firstChunkResult.value
+                for await (const item of sseStream) {
+                    yield item
+                }
+            }
+        }
+
+        for await (const chunkStr of remainingChunks()) {
             let chunk: any
             try {
                 chunk = JSON.parse(chunkStr)
@@ -1778,43 +1789,15 @@ export async function* createChatCompletionStreamWithOptions(
                 const thoughtText = typeof part.thought === "string" ? part.thought : (isThought ? (part.text || "") : "")
 
                 if (isThought && thoughtText) {
-                    if (textBlockStarted) {
-                        yield buildContentBlockStop(blockIndex)
-                        blockIndex++
-                        textBlockStarted = false
-                    }
-                    if (!thinkingBlockStarted) {
-                        yield buildContentBlockStart(blockIndex, "thinking")
-                        thinkingBlockStarted = true
-                    }
-                    yield buildThinkingDelta(blockIndex, thoughtText)
+                    yield { type: "thinking_delta", text: thoughtText }
                     continue
                 }
 
                 if (part.text) {
-                    if (thinkingBlockStarted) {
-                        yield buildContentBlockStop(blockIndex)
-                        blockIndex++
-                        thinkingBlockStarted = false
-                    }
-                    if (!textBlockStarted) {
-                        yield buildContentBlockStart(blockIndex, "text")
-                        textBlockStarted = true
-                    }
-                    yield buildTextDelta(blockIndex, part.text)
+                    hasText = true
+                    yield { type: "text_delta", text: part.text }
                 }
                 if (part.functionCall) {
-                    if (thinkingBlockStarted) {
-                        yield buildContentBlockStop(blockIndex)
-                        blockIndex++
-                        thinkingBlockStarted = false
-                    }
-                    if (textBlockStarted) {
-                        yield buildContentBlockStop(blockIndex)
-                        blockIndex++
-                        textBlockStarted = false
-                    }
-
                     hasToolUse = true
                     const toolId = part.functionCall.id || generateToolUseId()
                     const rawArgs = part.functionCall.args
@@ -1828,17 +1811,14 @@ export async function* createChatCompletionStreamWithOptions(
                         thoughtSignatureCache.set("latest", signature)
                     }
 
-                    yield buildContentBlockStart(blockIndex, "tool_use", {
+                    yield {
+                        type: "tool_call",
                         id: toolId,
                         name: part.functionCall.name,
+                        input: parsedArgs && typeof parsedArgs === "object" ? parsedArgs : { value: parsedArgs },
+                        rawArguments: rawArgs ? (typeof rawArgs === "string" ? rawArgs : (JSON.stringify(rawArgs) || "{}")) : undefined,
                         thoughtSignature: signature,
-                    })
-                    if (rawArgs) {
-                        const partialJson = typeof rawArgs === "string" ? rawArgs : (JSON.stringify(rawArgs) || "{}")
-                        yield buildInputJsonDelta(blockIndex, partialJson)
                     }
-                    yield buildContentBlockStop(blockIndex)
-                    blockIndex++
                 }
             }
 
@@ -1855,25 +1835,15 @@ export async function* createChatCompletionStreamWithOptions(
             }
         }
 
-        if (thinkingBlockStarted) {
-            yield buildContentBlockStop(blockIndex)
-        }
-        if (textBlockStarted) {
-            yield buildContentBlockStop(blockIndex)
-        }
-
         if (!hasToolUse && request.toolChoice?.type === "tool") {
             consola.warn(`Tool choice "${request.toolChoice.name || "unknown"}" requested but no tool_use returned`)
         }
         const stopReason = mapGoogleFinishReason(latestFinishReason, hasToolUse)
-        if (!textBlockStarted && !hasToolUse) {
+        if (!hasText && !hasToolUse) {
             if (stopReason === "content_filter") {
-                yield buildContentBlockStart(blockIndex, "text")
-                yield buildTextDelta(blockIndex, "Response filtered by upstream content policy.")
-                yield buildContentBlockStop(blockIndex)
+                yield { type: "text_delta", text: "Response filtered by upstream content policy." }
             } else if (stopReason === "max_tokens") {
-                yield buildContentBlockStart(blockIndex, "text")
-                yield buildContentBlockStop(blockIndex)
+                yield { type: "text_delta", text: "" }
             } else {
                 throw new UpstreamError(
                     "antigravity",
@@ -1884,12 +1854,15 @@ export async function* createChatCompletionStreamWithOptions(
                 )
             }
         }
-        yield buildMessageDelta(stopReason, {
-            inputTokens: streamInputTokens,
-            cacheReadTokens: streamCacheReadTokens,
-            outputTokens,
-        })
-        yield buildMessageStop()
+        yield {
+            type: "finish",
+            stopReason: normalizeStopReason(stopReason),
+            usage: {
+                inputTokens: streamInputTokens,
+                cacheReadTokens: streamCacheReadTokens,
+                outputTokens,
+            },
+        }
 
         recordAntigravityUsage(accountId, request.model, streamInputTokens, outputTokens, streamCacheReadTokens)
     } finally {

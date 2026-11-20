@@ -25,13 +25,17 @@ mock.module("~/services/antigravity/account-manager", () => ({
     },
 }))
 
+const realCopilot = await import("../src/services/copilot/chat")
 mock.module("~/services/copilot/chat", () => ({
+    ...realCopilot,
     createCopilotCompletion: async () => ({ contentBlocks: [], stopReason: "end_turn", usage: {} }),
     getCopilotReasoningEfforts: () => [],
     listCopilotModelsForAccount: async (_account: ProviderAccount) => [],
 }))
 
+const realCodex = await import("../src/services/codex/chat")
 mock.module("~/services/codex/chat", () => ({
+    ...realCodex,
     createCodexCompletion: async () => ({ contentBlocks: [], stopReason: "end_turn", usage: {} }),
     listCodexModelsForAccount: async (_account: ProviderAccount) => [],
     isCodexModelSupportedForAccount: () => undefined,
