@@ -5,7 +5,59 @@ import { getAntigravityModelName } from "~/services/antigravity/chat"
 import { normalizeOfficialModelId } from "~/services/routing/router"
 import { mapModel } from "~/routes/openai/translator"
 
-test("buildAntigravityBars handles separate Argon quota group correctly", () => {
+test("buildAntigravityBars omits argon bar when upstream merged Argon into Gemini Models", () => {
+    const summary = {
+        groups: [
+            {
+                displayName: "Gemini Models",
+                description: "Models within this group: Gemini 4 Neon, Gemini 4 Carbon, Gemini 4 Argon, Gemini 4 Hydrogen, Gemini 3.8 Flash",
+                buckets: [
+                    {
+                        bucketId: "gemini-weekly",
+                        window: "weekly",
+                        remainingFraction: 0.85,
+                        resetTime: "2026-10-20T00:00:00Z",
+                    },
+                    {
+                        bucketId: "gemini-5h",
+                        window: "5h",
+                        remainingFraction: 0.95,
+                        resetTime: "2026-10-16T22:00:00Z",
+                    },
+                ],
+            },
+            {
+                displayName: "Claude and GPT models",
+                buckets: [
+                    {
+                        bucketId: "3p-weekly",
+                        window: "weekly",
+                        remainingFraction: 0.40,
+                        resetTime: "2026-10-22T12:00:00Z",
+                    },
+                    {
+                        bucketId: "3p-5h",
+                        window: "5h",
+                        remainingFraction: 0.70,
+                        resetTime: "2026-10-16T23:00:00Z",
+                    },
+                ],
+            },
+        ],
+    }
+
+    const bars = buildAntigravityBars({}, summary)
+    expect(bars.map(b => b.key)).toEqual([
+        "gemini_week",
+        "gemini_5h",
+        "claude_gpt_week",
+        "claude_gpt_5h",
+    ])
+    expect(bars.find(b => b.key === "gemini_week")?.percentage).toBe(85)
+    expect(bars.find(b => b.key === "claude_gpt_week")?.percentage).toBe(40)
+})
+
+test("buildAntigravityBars still parses legacy separate Argon quota group if present", () => {
     const summary = {
         groups: [
             {
@@ -58,7 +110,7 @@ test("buildAntigravityBars handles separate Argon quota group correctly", () => 
 
     const bars = buildAntigravityBars({}, summary)
 
-    // Verify all 5 bars are present
+    // Verify all 5 bars are present when upstream explicitly sends argon
     expect(bars.map(b => b.key)).toEqual([
         "gemini_week",
         "gemini_5h",
@@ -146,9 +198,15 @@ test("buildAntigravityBars fallback with model dictionary", () => {
     }
 
     const bars = buildAntigravityBars(models, null)
-    const argonWeek = bars.find(b => b.key === "argon_week")!
-    expect(argonWeek.percentage).toBe(55)
-    expect(argonWeek.resetTime).toBe("2026-10-23T00:00:00Z")
+    expect(bars.map(b => b.key)).toEqual([
+        "gemini_week",
+        "gemini_5h",
+        "claude_gpt_week",
+        "claude_gpt_5h",
+    ])
+    const gemini5h = bars.find(b => b.key === "gemini_5h")!
+    expect(gemini5h.percentage).toBe(55)
+    expect(gemini5h.resetTime).toBe("2026-10-16T21:00:00Z")
 })
 
 test("model catalog parses and aliases Gemini 4 Argon", () => {

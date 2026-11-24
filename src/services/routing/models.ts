@@ -35,6 +35,7 @@ export function isInternalAntigravityModel(id: string): boolean {
         lower.startsWith("chat_") ||
         lower.includes("tiered") ||
         lower.includes("extra-low") ||
+        lower.endsWith("-sonar") ||
         lower.endsWith("-disabled")
 }
 

@@ -12,8 +12,10 @@
 export type ModelFamily =
     | "claude-opus"
     | "claude-sonnet"
-    | "gemini-argon"
+    | "gemini-neon"
+    | "gemini-carbon"
     | "gemini-hydrogen"
+    | "gemini-argon"
     | "gemini-pro"
     | "gemini-flash"
     | "gemini-flash-lite"
@@ -34,8 +36,10 @@ interface ParsedModel {
 const FAMILIES: ModelFamily[] = [
     "claude-opus",
     "claude-sonnet",
-    "gemini-argon",
+    "gemini-neon",
+    "gemini-carbon",
     "gemini-hydrogen",
+    "gemini-argon",
     "gemini-pro",
     "gemini-flash",
     "gemini-flash-lite",
@@ -46,8 +50,10 @@ const FAMILIES: ModelFamily[] = [
 const VARIANT_PREFERENCE: Record<ModelFamily, string[]> = {
     "claude-opus": ["thinking", "high", "medium", "low", ""],
     "claude-sonnet": ["", "medium", "high", "low", "thinking"],
-    "gemini-argon": ["xhigh", "high", "thinking", "medium", "", "low"],
+    "gemini-neon": ["xhigh", "high", "thinking", "medium", "", "low"],
+    "gemini-carbon": ["xhigh", "high", "thinking", "medium", "", "low"],
     "gemini-hydrogen": ["xhigh", "high", "thinking", "medium", "", "low"],
+    "gemini-argon": ["xhigh", "high", "thinking", "medium", "", "low"],
     "gemini-pro": ["high", "agent", "", "low"],
     "gemini-flash": ["medium", "", "high", "low"],
     "gemini-flash-lite": ["", "low"],
@@ -90,6 +96,44 @@ export function parseModelId(id: string): ParsedModel | null {
         }
     }
 
+    // Gemini Neon (e.g. gemini-4-neon, gemini-4-neon-xhigh).
+    m = lower.match(/^gemini-(?:(\d{1,2}(?:\.\d{1,2})?)-)?neon(?:-(xhigh|high|medium|low|thinking))?$/)
+    if (m) {
+        return {
+            id,
+            family: "gemini-neon",
+            version: m[1] ? toVersion(m[1]) : [4],
+            variant: m[2] || "",
+        }
+    }
+    if (lower === "neon") {
+        return {
+            id,
+            family: "gemini-neon",
+            version: [4],
+            variant: "",
+        }
+    }
+
+    // Gemini Carbon (e.g. gemini-4-carbon, gemini-4-carbon-high).
+    m = lower.match(/^gemini-(?:(\d{1,2}(?:\.\d{1,2})?)-)?carbon(?:-(xhigh|high|medium|low|thinking))?$/)
+    if (m) {
+        return {
+            id,
+            family: "gemini-carbon",
+            version: m[1] ? toVersion(m[1]) : [4],
+            variant: m[2] || "",
+        }
+    }
+    if (lower === "carbon") {
+        return {
+            id,
+            family: "gemini-carbon",
+            version: [4],
+            variant: "",
+        }
+    }
+
     // Gemini Hydrogen (e.g. gemini-4-hydrogen, gemini-4-hydrogen-xhigh).
     // Upstream exposes it only as thinking-level variants, never a bare ID.
     m = lower.match(/^gemini-(?:(\d{1,2}(?:\.\d{1,2})?)-)?hydrogen(?:-(xhigh|high|medium|low|thinking))?$/)
@@ -99,6 +143,14 @@ export function parseModelId(id: string): ParsedModel | null {
             family: "gemini-hydrogen",
             version: m[1] ? toVersion(m[1]) : [4],
             variant: m[2] || "",
+        }
+    }
+    if (lower === "hydrogen") {
+        return {
+            id,
+            family: "gemini-hydrogen",
+            version: [4],
+            variant: "",
         }
     }
 
@@ -165,17 +217,16 @@ export function parseModelId(id: string): ParsedModel | null {
 }
 
 /** Antigravity quota buckets: each one is shared by a group of model families. */
-export type QuotaPool = "gemini" | "claude_gpt" | "argon"
+export type QuotaPool = "gemini" | "claude_gpt"
 
 const FAMILY_QUOTA_POOL: Record<ModelFamily, QuotaPool> = {
     "claude-opus": "claude_gpt",
     "claude-sonnet": "claude_gpt",
     "gpt-oss": "claude_gpt",
-    "gemini-argon": "argon",
-    // Hydrogen currently shares the Gemini buckets upstream (no dedicated group in
-    // retrieveUserQuotaSummary yet). If Google ever splits it into its own bucket,
-    // move it to its own pool and handle it like argon in buildAntigravityBars.
+    "gemini-neon": "gemini",
+    "gemini-carbon": "gemini",
     "gemini-hydrogen": "gemini",
+    "gemini-argon": "gemini",
     "gemini-pro": "gemini",
     "gemini-flash": "gemini",
     "gemini-flash-lite": "gemini",
@@ -184,7 +235,6 @@ const FAMILY_QUOTA_POOL: Record<ModelFamily, QuotaPool> = {
 /** Which quota bucket a model draws from, or null for models outside the tracked families (images, internal, ...). */
 export function quotaPoolForModel(id: string): QuotaPool | null {
     const lower = id.trim().toLowerCase()
-    if (lower === "argon") return "argon"
     if (lower in FAMILY_QUOTA_POOL) return FAMILY_QUOTA_POOL[lower as ModelFamily] // bare family alias, e.g. "claude-opus"
     const parsed = parseModelId(lower)
     return parsed ? FAMILY_QUOTA_POOL[parsed.family] : null
@@ -299,6 +349,12 @@ export function buildCatalog(ids: string[]): AntigravityCatalog {
         aliases.set(family, target.id) // stable alias, e.g. "claude-opus"
         if (family === "gemini-argon") {
             aliases.set("argon", target.id)
+        } else if (family === "gemini-neon") {
+            aliases.set("neon", target.id)
+        } else if (family === "gemini-carbon") {
+            aliases.set("carbon", target.id)
+        } else if (family === "gemini-hydrogen") {
+            aliases.set("hydrogen", target.id)
         }
 
         for (const member of current) {

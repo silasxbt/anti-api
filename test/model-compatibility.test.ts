@@ -117,6 +117,51 @@ test("Gemini 4 Hydrogen parses as its own family and stays hidden behind the cle
     expect(allModels).toContain("gemini-4-hydrogen-xhigh")
 })
 
+test("Gemini 4 Neon & Carbon parse into Gemini pool and internal -sonar model is hidden", () => {
+    clearAllDynamicAntigravityModelsByAccount()
+    setDynamicAntigravityModels(
+        [
+            "gemini-4-neon-xhigh",
+            "gemini-4-neon-high",
+            "gemini-4-neon-medium",
+            "gemini-4-neon-low",
+            "gemini-4-carbon-high",
+            "gemini-4-carbon-medium",
+            "gemini-4-carbon-low",
+            "gemini-4-argon-high",
+            "gemini-4-hydrogen-sonar",
+        ].map(id => ({ id, label: id }))
+    )
+
+    expect(parseModelId("gemini-4-neon-xhigh")?.family).toBe("gemini-neon")
+    expect(parseModelId("gemini-4-carbon-high")?.family).toBe("gemini-carbon")
+    expect(quotaPoolForModel("gemini-4-neon")).toBe("gemini")
+    expect(quotaPoolForModel("gemini-4-carbon")).toBe("gemini")
+    expect(quotaPoolForModel("gemini-4-argon")).toBe("gemini")
+
+    const catalog = buildCatalog([
+        "gemini-4-neon-xhigh",
+        "gemini-4-neon-high",
+        "gemini-4-carbon-high",
+        "gemini-4-carbon-medium",
+    ])
+    expect(catalog.base.map(m => m.id)).toEqual(["gemini-4-neon", "gemini-4-carbon"])
+    expect(catalog.aliases.get("gemini-4-neon")).toBe("gemini-4-neon-xhigh")
+    expect(catalog.aliases.get("neon")).toBe("gemini-4-neon-xhigh")
+    expect(catalog.aliases.get("gemini-4-carbon")).toBe("gemini-4-carbon-high")
+    expect(catalog.aliases.get("carbon")).toBe("gemini-4-carbon-high")
+
+    const baseOnly = getProviderModels("antigravity", { includeAllVariants: false }).map(m => m.id)
+    expect(baseOnly).toContain("gemini-4-neon")
+    expect(baseOnly).toContain("gemini-4-carbon")
+    expect(baseOnly).not.toContain("gemini-4-neon-xhigh")
+    expect(baseOnly).not.toContain("gemini-4-carbon-high")
+    expect(baseOnly).not.toContain("gemini-4-hydrogen-sonar")
+
+    const allModels = getProviderModels("antigravity", { includeAllVariants: true }).map(m => m.id)
+    expect(allModels).not.toContain("gemini-4-hydrogen-sonar")
+})
+
 afterAll(() => {
     clearAllDynamicAntigravityModelsByAccount()
     clearDynamicAntigravityModels()

@@ -11,6 +11,10 @@ import {
 
 test("Gemini 3.1 generation config omits legacy safety settings and caps output", async () => {
     expect(buildGenerationConfig("gemini-3.1-pro-low", 100000)).toEqual({ maxOutputTokens: 65536 })
+    expect(buildGenerationConfig("gemini-4-neon-xhigh", 300000)).toEqual({ maxOutputTokens: 262144 })
+    expect(buildGenerationConfig("gemini-4-carbon-high", 300000)).toEqual({ maxOutputTokens: 262144 })
+    expect(buildGenerationConfig("gemini-4-hydrogen-xhigh", 300000)).toEqual({ maxOutputTokens: 262144 })
+    expect(buildGenerationConfig("claude-opus-5-5-high", 200000)).toEqual({ maxOutputTokens: 128000 })
     const request = await claudeToAntigravity("gemini-3.1-pro-low", [{ role: "user", content: "hello" }], undefined, undefined, 100000)
     expect(request.request.generationConfig).toEqual({ maxOutputTokens: 65536 })
     expect(request.request.safetySettings).toBeUndefined()

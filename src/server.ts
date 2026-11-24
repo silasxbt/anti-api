@@ -473,7 +473,7 @@ server.get("/api/models-catalog", async (c: any) => {
                 return bars.length === 0 || bars.every(b => (b.percentage ?? 0) > 0 && !b.disabled)
             })
         }
-        for (const pool of ["claude_gpt", "gemini", "argon"] as const) {
+        for (const pool of ["claude_gpt", "gemini"] as const) {
             if (!hasAvailableForBarPrefix(pool)) exhaustedPools.add(pool)
         }
     }

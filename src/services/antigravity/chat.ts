@@ -111,6 +111,23 @@ function identity(...ids: string[]): Array<[string, string]> {
 }
 
 const MODEL_MAPPING: Record<string, string> = Object.fromEntries([
+    // Gemini 4 Neon / Carbon / Hydrogen (variants resolve via catalog, tier aliases mapped explicitly)
+    ...aliasesTo("gemini-4-neon-xhigh", "gemini-4-neon-thinking", "gemini-neon-thinking"),
+    ...["xhigh", "high", "medium", "low"].flatMap(v => [
+        ...identity(`gemini-4-neon-${v}`),
+        ...aliasesTo(`gemini-4-neon-${v}`, `gemini-neon-${v}`),
+    ]),
+    ...aliasesTo("gemini-4-carbon-high", "gemini-4-carbon-thinking", "gemini-carbon-thinking"),
+    ...["high", "medium", "low"].flatMap(v => [
+        ...identity(`gemini-4-carbon-${v}`),
+        ...aliasesTo(`gemini-4-carbon-${v}`, `gemini-carbon-${v}`),
+    ]),
+    ...aliasesTo("gemini-4-hydrogen-xhigh", "gemini-4-hydrogen-thinking", "gemini-hydrogen-thinking"),
+    ...["xhigh", "high", "medium", "low"].flatMap(v => [
+        ...identity(`gemini-4-hydrogen-${v}`),
+        ...aliasesTo(`gemini-4-hydrogen-${v}`, `gemini-hydrogen-${v}`),
+    ]),
+
     // Gemini 4 Argon
     ...aliasesTo("gemini-4-argon-medium", "gemini-4-argon", "gemini-argon", "argon"),
     ...aliasesTo("gemini-4-argon-high", "gemini-4-argon-thinking", "gemini-argon-thinking"),
@@ -781,9 +798,16 @@ function isGemini31Model(model: string): boolean {
            model.includes("argon")
 }
 
+function getModelOutputLimit(model: string): number {
+    if (/^gemini-4(?:\.\d+)?-(?:hydrogen|neon|carbon)/i.test(model)) return 262144
+    if (/^claude-(?:opus|sonnet)-5-5/i.test(model)) return 128000
+    if (/^gpt-oss-/i.test(model)) return 32768
+    return isGemini31Model(model) ? 65536 : 64000
+}
+
 /** Keep generation settings within the limits accepted by each native model family. */
 export function buildGenerationConfig(model: string, maxTokens?: number): Record<string, unknown> {
-    const modelLimit = isGemini31Model(model) ? 65536 : 64000
+    const modelLimit = getModelOutputLimit(model)
     const requested = Number.isFinite(maxTokens) ? Math.floor(maxTokens as number) : modelLimit
     const maxOutputTokens = Math.max(1, Math.min(requested, modelLimit))
     return { maxOutputTokens }

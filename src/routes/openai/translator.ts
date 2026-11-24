@@ -41,6 +41,9 @@ function constantRule(match: string[], id: string): EffortRule {
 }
 
 const EFFORT_RULES: EffortRule[] = [
+    tieredRule(["gemini-4-neon", "gemini-neon", "neon"], "gemini-4-neon", "gemini-4-neon"),
+    tieredRule(["gemini-4-carbon", "gemini-carbon", "carbon"], "gemini-4-carbon", "gemini-4-carbon"),
+    tieredRule(["gemini-4-hydrogen", "gemini-hydrogen", "hydrogen"], "gemini-4-hydrogen", "gemini-4-hydrogen"),
     tieredRule(["gemini-4-argon", "gemini-argon", "argon"], "gemini-4-argon", "gemini-4-argon"),
     tieredRule(["gemini-3-8-flash", "gemini-3-8-flash-preview"], "gemini-3.8-flash", "gemini-3.8-flash-medium"),
     tieredRule(["gemini-3-7-flash"], "gemini-3.7-flash", "gemini-3.7-flash-medium"),

@@ -508,7 +508,6 @@ export function getPlanPooledBarEstimate(
 function primaryBarKeyForModel(provider: string, model?: string): string {
     if (provider === "antigravity") {
         const pool: QuotaPool = (model ? quotaPoolForModel(model) : null) || "claude_gpt"
-        if (pool === "argon") return "argon_week"
         if (pool === "gemini") return "gemini_week"
         return "claude_gpt_week"
     }
@@ -1013,14 +1012,6 @@ function selectRelevantBarsForModel(
 
     if (provider === "antigravity") {
         const pool: QuotaPool = (model ? quotaPoolForModel(model) : null) || "claude_gpt"
-        if (pool === "argon") {
-            const week = findBar("argon_week", "weekly argon")
-            const fiveH = findBar("argon_5h", "5hr argon")
-            return {
-                primary: week ? { bar: week, windowHours: WINDOW_HOURS_WEEKLY } : undefined,
-                secondary5h: fiveH ? { bar: fiveH, windowHours: WINDOW_HOURS_5H } : undefined,
-            }
-        }
         if (pool === "gemini") {
             const week = findBar("gemini_week", "weekly gemini")
             const fiveH = findBar("gemini_5h", "5hr gemini")

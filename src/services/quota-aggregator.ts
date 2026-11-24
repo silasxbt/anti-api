@@ -605,9 +605,11 @@ export function buildAntigravityBars(
             toBar("gemini_5h", "5hr gemini", g5h, 100),
             toBar("claude_gpt_week", "weekly claude gpt", cWeekly, 0),
             toBar("claude_gpt_5h", "5hr claude gpt", c5h, 0),
-            toBar("argon_week", "weekly argon", aWeekly, 0),
         ]
 
+        if (aWeekly) {
+            result.push(toBar("argon_week", "weekly argon", aWeekly, 0))
+        }
         if (a5h) {
             result.push(toBar("argon_5h", "5hr argon", a5h, 0))
         }
@@ -616,22 +618,18 @@ export function buildAntigravityBars(
     }
 
     const idsInPool = (pool: QuotaPool) => Object.keys(models).filter(id => quotaPoolForModel(id) === pool)
-    const argonIds = idsInPool("argon")
     const claudeGptIds = idsInPool("claude_gpt")
     const geminiIds = idsInPool("gemini")
 
     const geminiRaw = buildMergedBar("gemini", "gemini", models, geminiIds)
     const claudeGptRaw = buildMergedBar("claude_gpt", "claude_gpt", models, claudeGptIds)
-    const argonRaw = buildMergedBar("argon", "argon", models, argonIds)
 
     const now = Date.now()
     const isGeminiWeekly = geminiRaw.resetTime ? (Date.parse(geminiRaw.resetTime) - now > 12 * 3600 * 1000) : false
     const isClaudeWeekly = claudeGptRaw.resetTime ? (Date.parse(claudeGptRaw.resetTime) - now > 12 * 3600 * 1000) : true
-    const hasArgonModels = argonIds.length > 0
 
     const geminiFrac = geminiRaw.rawFraction ?? geminiRaw.percentage / 100
     const claudeGptFrac = claudeGptRaw.rawFraction ?? claudeGptRaw.percentage / 100
-    const argonFrac = argonRaw.rawFraction ?? argonRaw.percentage / 100
     const geminiWeekly: AccountBar = {
         key: "gemini_week",
         label: "weekly gemini",
@@ -660,20 +658,12 @@ export function buildAntigravityBars(
         rawFraction: !isClaudeWeekly ? claudeGptFrac : (claudeGptFrac <= 0 ? 0 : 1),
         resetTime: !isClaudeWeekly ? claudeGptRaw.resetTime : undefined,
     }
-    const argonWeekly: AccountBar = {
-        key: "argon_week",
-        label: "weekly argon",
-        percentage: hasArgonModels ? argonRaw.percentage : 0,
-        rawFraction: hasArgonModels ? argonFrac : 0,
-        resetTime: hasArgonModels ? argonRaw.resetTime : undefined,
-    }
 
     return [
         geminiWeekly,
         gemini5h,
         claudeGptWeekly,
         claudeGpt5h,
-        argonWeekly,
     ]
 }
 

@@ -29,22 +29,22 @@ describe("Intelligent Routing Scorer", () => {
         registerQuotaRefreshTrigger(null)
     })
 
-    test("heavily prioritizes 50% Argon resetting in 5h over 100% Argon resetting in 168h", () => {
-        // Account A: 50% Argon left, resetting in 5 hours
+    test("heavily prioritizes 50% Gemini resetting in 5h over 100% Gemini resetting in 168h", () => {
+        // Account A: 50% Gemini left, resetting in 5 hours
         syncIntelligentQuotaCache("antigravity", "acc-expiring-50", [
             {
-                key: "argon_week",
-                label: "weekly argon",
+                key: "gemini_week",
+                label: "weekly gemini",
                 percentage: 50,
                 resetTime: new Date(baseNow + 5 * HOUR_MS).toISOString(),
             },
         ])
 
-        // Account B: 100% Argon left, resetting in 160 hours (nearly full 7-day window)
+        // Account B: 100% Gemini left, resetting in 160 hours (nearly full 7-day window)
         syncIntelligentQuotaCache("antigravity", "acc-fresh-100", [
             {
-                key: "argon_week",
-                label: "weekly argon",
+                key: "gemini_week",
+                label: "weekly gemini",
                 percentage: 100,
                 resetTime: new Date(baseNow + 160 * HOUR_MS).toISOString(),
             },
@@ -143,21 +143,21 @@ describe("Intelligent Routing Scorer", () => {
     })
 
     test("distributes load across accounts when quota and reset time are close", () => {
-        // Account 1: 80% Argon, resets in 100h
+        // Account 1: 80% Gemini, resets in 100h
         syncIntelligentQuotaCache("antigravity", "acc-close-1", [
             {
-                key: "argon_week",
-                label: "weekly argon",
+                key: "gemini_week",
+                label: "weekly gemini",
                 percentage: 80,
                 resetTime: new Date(baseNow + 100 * HOUR_MS).toISOString(),
             },
         ])
 
-        // Account 2: 82% Argon, resets in 104h
+        // Account 2: 82% Gemini, resets in 104h
         syncIntelligentQuotaCache("antigravity", "acc-close-2", [
             {
-                key: "argon_week",
-                label: "weekly argon",
+                key: "gemini_week",
+                label: "weekly gemini",
                 percentage: 82,
                 resetTime: new Date(baseNow + 104 * HOUR_MS).toISOString(),
             },
@@ -232,10 +232,10 @@ describe("Intelligent Routing Scorer", () => {
         expect(coldRanked[0].entry.accountId).toBe("acc-urgent")
     })
 
-    test("isolates quota pools by requested model family (argon vs claude_gpt vs gemini)", () => {
-        // Account 1: 0% Argon, 90% Claude/GPT
-        syncIntelligentQuotaCache("antigravity", "acc-no-argon", [
-            { key: "argon_week", label: "weekly argon", percentage: 0 },
+    test("isolates quota pools by requested model family (claude_gpt vs gemini)", () => {
+        // Account 1: 0% Gemini, 90% Claude/GPT
+        syncIntelligentQuotaCache("antigravity", "acc-no-gemini", [
+            { key: "gemini_week", label: "weekly gemini", percentage: 0 },
             {
                 key: "claude_gpt_week",
                 label: "weekly claude gpt",
@@ -244,11 +244,11 @@ describe("Intelligent Routing Scorer", () => {
             },
         ])
 
-        // Account 2: 50% Argon, 0% Claude/GPT
-        syncIntelligentQuotaCache("antigravity", "acc-has-argon", [
+        // Account 2: 50% Gemini, 0% Claude/GPT
+        syncIntelligentQuotaCache("antigravity", "acc-has-gemini", [
             {
-                key: "argon_week",
-                label: "weekly argon",
+                key: "gemini_week",
+                label: "weekly gemini",
                 percentage: 50,
                 resetTime: new Date(baseNow + 48 * HOUR_MS).toISOString(),
             },
@@ -256,36 +256,36 @@ describe("Intelligent Routing Scorer", () => {
         ])
 
         const candidates = [
-            { provider: "antigravity", accountId: "acc-no-argon" },
-            { provider: "antigravity", accountId: "acc-has-argon" },
+            { provider: "antigravity", accountId: "acc-no-gemini" },
+            { provider: "antigravity", accountId: "acc-has-gemini" },
         ]
 
-        const argonRanked = rankAccountCandidates(candidates, {
+        const geminiRanked = rankAccountCandidates(candidates, {
             model: "gemini-4-argon",
             now: baseNow,
         })
-        expect(argonRanked[0].entry.accountId).toBe("acc-has-argon")
-        expect(argonRanked[1].score.exhausted).toBe(true)
+        expect(geminiRanked[0].entry.accountId).toBe("acc-has-gemini")
+        expect(geminiRanked[1].score.exhausted).toBe(true)
 
         const claudeRanked = rankAccountCandidates(candidates, {
             model: "claude-opus-5-5",
             now: baseNow,
         })
-        expect(claudeRanked[0].entry.accountId).toBe("acc-no-argon")
+        expect(claudeRanked[0].entry.accountId).toBe("acc-no-gemini")
         expect(claudeRanked[1].score.exhausted).toBe(true)
     })
 
     test("prefers an already-ticking account over starting an untriggered 100% reserve window", () => {
         // Account 1: 100% untriggered (no resetTime yet)
         syncIntelligentQuotaCache("antigravity", "acc-untriggered-100", [
-            { key: "argon_week", label: "weekly argon", percentage: 100 },
+            { key: "gemini_week", label: "weekly gemini", percentage: 100 },
         ])
 
         // Account 2: 90% with active timer (120h left)
         syncIntelligentQuotaCache("antigravity", "acc-ticking-90", [
             {
-                key: "argon_week",
-                label: "weekly argon",
+                key: "gemini_week",
+                label: "weekly gemini",
                 percentage: 90,
                 resetTime: new Date(baseNow + 120 * HOUR_MS).toISOString(),
             },
@@ -308,8 +308,8 @@ describe("Intelligent Routing Scorer", () => {
         // Cached bar had 0% quota, but its resetTime was 10 minutes ago
         syncIntelligentQuotaCache("antigravity", "acc-just-reset", [
             {
-                key: "argon_week",
-                label: "weekly argon",
+                key: "gemini_week",
+                label: "weekly gemini",
                 percentage: 0,
                 resetTime: new Date(baseNow - 10 * 60 * 1000).toISOString(),
             },
@@ -467,8 +467,8 @@ describe("Intelligent Routing Scorer", () => {
         // 1. Reset time has passed -> should trigger "reset_passed"
         syncIntelligentQuotaCache("antigravity", "acc-expired-timer", [
             {
-                key: "argon_week",
-                label: "weekly argon",
+                key: "gemini_week",
+                label: "weekly gemini",
                 percentage: 10,
                 resetTime: new Date(baseNow - 60_000).toISOString(),
             },
