@@ -3,9 +3,20 @@ import { join } from "path"
 import { randomUUID } from "crypto"
 import consola from "consola"
 import type { AuthProvider } from "~/services/auth/types"
-import { isHiddenCodexModel } from "./models"
 import { getDataDir } from "~/lib/data-dir"
 import { safeErrorMessage } from "~/lib/redaction"
+import { loadSettings } from "~/services/settings"
+
+export const CODEX_HIDDEN_MODELS = new Set([
+    "gpt-5.3-max-high",
+    "gpt-5.3-max",
+    "gpt-5.2-max-high",
+    "gpt-5.2-max",
+])
+
+export function isHiddenCodexModel(modelId: string): boolean {
+    return CODEX_HIDDEN_MODELS.has(modelId)
+}
 
 export interface RoutingEntry {
     id: string
@@ -32,8 +43,10 @@ export interface AccountRoutingRoute {
 
 export interface AccountRoutingConfig {
     smartSwitch: boolean
+    separateThinkingModels?: boolean
     routes: AccountRoutingRoute[]
 }
+
 
 export interface RoutingFlow {
     id: string
@@ -108,12 +121,17 @@ function normalizeConfig(raw: Partial<RoutingConfig> & { entries?: RoutingEntry[
     const updatedAt = raw.updatedAt || new Date().toISOString()
     const accountRouting: AccountRoutingConfig = {
         smartSwitch: raw.accountRouting?.smartSwitch ?? false,
+        separateThinkingModels: raw.accountRouting?.separateThinkingModels ?? (
+            process.env.ANTI_API_SEPARATE_THINKING_MODELS === "true" ||
+            process.env.ANTI_API_SEPARATE_THINKING_MODELS === "1"
+        ),
         routes: Array.isArray(raw.accountRouting?.routes)
             ? raw.accountRouting!.routes
                 .map((route, index) => normalizeAccountRoute(route, index))
                 .filter((route): route is AccountRoutingRoute => !!route)
             : [],
     }
+
 
     if (Array.isArray(raw.flows)) {
         const flows = raw.flows.flatMap((flow, index) => {
@@ -194,3 +212,25 @@ export function setActiveFlow(flowId: string | null): RoutingConfig {
     writeFileSync(ROUTING_FILE, JSON.stringify(config, null, 2))
     return config
 }
+
+export function isSeparateThinkingModelsEnabled(): boolean {
+    try {
+        const settings = loadSettings()
+        if (typeof settings.separateThinkingModels === "boolean") {
+            return settings.separateThinkingModels
+        }
+    } catch {
+        // ignore
+    }
+    try {
+        const config = loadRoutingConfig()
+        if (typeof config.accountRouting?.separateThinkingModels === "boolean") {
+            return config.accountRouting.separateThinkingModels
+        }
+    } catch {
+        // ignore
+    }
+    const env = process.env.ANTI_API_SEPARATE_THINKING_MODELS
+    return env === "true" || env === "1"
+}
+

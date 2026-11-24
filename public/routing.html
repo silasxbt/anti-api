@@ -402,6 +402,21 @@
             min-height: 520px;
         }
 
+        @media (max-width: 1023px) {
+            body.iframe-mode {
+                overflow-y: auto !important;
+            }
+            .routing-panels {
+                height: auto !important;
+                min-height: 0 !important;
+                grid-template-columns: 1fr !important;
+            }
+            .routing-panels > aside,
+            .routing-panels > section {
+                max-height: 420px;
+            }
+        }
+
         .select-field {
             appearance: none;
             background-color: rgba(10, 10, 10, 0.8);
@@ -432,7 +447,7 @@
     </style>
 </head>
 
-<body class="min-h-screen p-6">
+<body class="min-h-screen p-3 sm:p-6 overflow-x-hidden">
     <script>
         // Immediately detect iframe before DOM renders
         if (window.self !== window.top) {
@@ -440,12 +455,12 @@
         }
     </script>
     <div class="max-w-7xl mx-auto space-y-6 main-container">
-        <header class="flex items-center justify-between">
+        <header class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
-                <h1 class="text-3xl font-bold text-gray-200" data-i18n="routing.title">Routing</h1>
-                <p class="text-sm text-gray-500 mt-1 font-bold" data-i18n="routing.subtitle">Build reliability chains with cooldown-aware failover for authorized accounts</p>
+                <h1 class="text-2xl sm:text-3xl font-bold text-gray-200" data-i18n="routing.title">Routing</h1>
+                <p class="text-xs sm:text-sm text-gray-500 mt-1 font-bold" data-i18n="routing.subtitle">Build reliability chains with cooldown-aware failover for authorized accounts</p>
             </div>
-            <div class="flex items-center gap-4">
+            <div class="flex flex-wrap items-center gap-2 sm:gap-4">
                 <div class="flex items-center gap-2 text-xs">
                     <button id="tab-flow" onclick="setRoutingTab('flow')"
                         class="action-btn px-3 py-2 rounded-lg font-bold text-gray-300">
@@ -535,13 +550,17 @@
                 <div id="account-model-list" class="space-y-2 flex-1 min-h-0 overflow-y-auto panel-scroll"></div>
             </aside>
 
-            <section class="panel rounded-2xl p-6 flex flex-col min-h-0">
-                <div class="flex items-start justify-between gap-3 mb-4 flex-shrink-0">
+            <section class="panel rounded-2xl p-4 sm:p-6 flex flex-col min-h-0">
+                <div class="flex flex-col sm:flex-row sm:items-start justify-between gap-3 mb-4 flex-shrink-0">
                     <div>
                         <h2 class="text-sm uppercase tracking-[0.2em] text-gray-500" data-i18n="routing.accountChain">Account Chain</h2>
                         <p class="text-xs text-gray-600 mt-1" data-i18n="routing.accountChainDesc">Ordered provider/account fallback.</p>
                     </div>
-                    <div class="flex items-center gap-2 text-xs text-gray-400">
+                    <div class="flex flex-wrap items-center gap-3 text-xs text-gray-400">
+                        <label class="flex items-center gap-2 cursor-pointer" title="Mostra modelli con thinking separati (-low, -high, -thinking) in /v1/models">
+                            <input id="separate-thinking-switch" type="checkbox" class="toggle-switch">
+                            <span>Separate Thinking</span>
+                        </label>
                         <label class="flex items-center gap-2 cursor-pointer">
                             <input id="smart-switch" type="checkbox" class="toggle-switch">
                             <span data-i18n="routing.smartSwitch">Smart Switch</span>
@@ -551,11 +570,12 @@
                             <span data-i18n="common.save">Save</span>
                         </button>
                     </div>
+
                 </div>
 
                 <div id="account-route-title" class="text-sm text-gray-400 mb-3 flex-shrink-0" data-i18n="routing.selectModel">Select a model</div>
 
-                <div class="grid gap-3 mb-4 flex-shrink-0" style="grid-template-columns: 1fr 1fr auto;">
+                <div class="grid grid-cols-1 sm:grid-cols-[1fr_1fr_auto] gap-2 sm:gap-3 mb-4 flex-shrink-0">
                     <select id="account-provider-select" class="select-field w-full">
                         <option value="" data-i18n="routing.provider">Provider</option>
                     </select>
@@ -577,16 +597,17 @@
     </div>
 
     <script>
-        const API_BASE = 'http://localhost:8964';
+        const API_BASE = window.location.origin;
         const STORAGE_KEYS = {
             activeFlow: 'anti-api-active-flow',
             privacyMode: 'anti-api-privacy-mode',
         };
         const PROVIDER_ORDER = ['antigravity', 'codex', 'copilot', 'zed', 'kiro'];
         const MODEL_GROUPS = {
-            claudeGpt: ['claude-sonnet-4-5', 'claude-sonnet-4-5-thinking', 'claude-opus-4-5-thinking', 'claude-opus-4-6-thinking', 'gpt-oss-120b'],
-            gpro: ['gemini-3-pro-low', 'gemini-3-pro-high'],
-            gflash: ['gemini-3-flash'],
+            claudeGpt: ['claude-opus-5-5', 'claude-opus-5-5-thinking', 'claude-sonnet-5-5', 'claude-sonnet-5-5-thinking', 'claude-opus-4-6-thinking', 'claude-sonnet-4-6', 'claude-opus-4-5-thinking', 'claude-sonnet-4-5', 'claude-sonnet-4-5-thinking', 'gpt-oss-120b'],
+            argon: ['gemini-4-argon', 'gemini-4-argon-high', 'gemini-4-argon-medium', 'gemini-4-argon-low', 'gemini-4-argon-thinking', 'gemini-argon', 'gemini-argon-high', 'gemini-argon-medium', 'gemini-argon-low', 'gemini-argon-thinking', 'argon'],
+            gpro: ['gemini-3-pro-low', 'gemini-3-pro-high', 'gemini-3.1-pro', 'gemini-3.1-pro-high', 'gemini-3.1-pro-low'],
+            gflash: ['gemini-3.8-flash', 'gemini-3.8-flash-high', 'gemini-3.8-flash-medium', 'gemini-3.8-flash-low', 'gemini-3-flash'],
         };
 
         const dom = {
@@ -764,6 +785,56 @@
                 'status.saving': '保存中...',
                 'status.flowNameRequired': '需要流程名称',
                 'status.flowNameExists': '流程名称已存在',
+            },
+            it: {
+                'common.add': 'Aggiungi',
+                'common.new': 'Nuovo',
+                'common.save': 'Salva',
+                'common.refresh': 'Aggiorna',
+                'routing.title': 'Routing',
+                'routing.subtitle': 'Costruisci catene di affidabilità con failover per gli account autorizzati',
+                'routing.flowRouting': 'Routing Flusso',
+                'routing.accountRouting': 'Routing Account',
+                'routing.backToQuota': 'Torna a Quota',
+                'routing.accounts': 'Account',
+                'routing.accountsDesc': 'Trascina un blocco modello nel flusso.',
+                'routing.flow': 'Flusso',
+                'routing.flowDesc': 'Corrispondenza per nome del modello nelle richieste.',
+                'routing.modelId': 'ID Modello',
+                'routing.saved': 'Salvati',
+                'routing.savedDesc': 'Modifica, rinomina o elimina i flussi salvati.',
+                'routing.models': 'Modelli',
+                'routing.modelsDesc': 'Solo ID modello nativi del provider.',
+                'routing.accountChain': 'Catena Account',
+                'routing.accountChainDesc': 'Fallback ordinato provider/account.',
+                'routing.smartSwitch': 'Smart Switch',
+                'routing.selectModel': 'Seleziona un modello',
+                'routing.modelPrefix': 'Modello',
+                'routing.provider': 'Provider',
+                'routing.account': 'Account',
+                'routing.autoSmart': 'Auto (Smart Switch)',
+                'routing.smartHint': 'Smart Switch attivo: le voci automatiche si espandono per ordine dell\'account.',
+                'routing.manualHint': 'Smart Switch disattivo: configura account espliciti per ciascun modello.',
+                'routing.noOfficialModels': 'Nessun modello nativo del provider disponibile.',
+                'routing.noEntries': 'Nessuna voce presente.',
+                'routing.noAccounts': 'Nessun account presente. Aggiungi account da /quota.',
+                'routing.noSavedFlows': 'Nessun flusso salvato.',
+                'routing.editing': 'Modifica in corso',
+                'routing.edit': 'Modifica',
+                'routing.delete': 'Elimina',
+                'routing.remove': 'Rimuovi',
+                'routing.up': 'Su',
+                'routing.down': 'Giù',
+                'routing.dropHere': 'Trascina qui',
+                'routing.hops': 'salti',
+                'routing.flowFallback': 'fallback su 429',
+                'status.refreshing': 'Aggiornamento in corso...',
+                'status.refreshed': 'Aggiornato',
+                'status.refreshFailed': 'Aggiornamento non riuscito',
+                'status.saved': 'Salvato',
+                'status.saving': 'Salvataggio in corso...',
+                'status.flowNameRequired': 'Nome del flusso obbligatorio',
+                'status.flowNameExists': 'Nome del flusso già esistente',
             }
         };
 
@@ -904,6 +975,16 @@
                     void persistAccountRoutingOnly();
                 };
             }
+
+            const separateThinkingInput = dom.byId('separate-thinking-switch');
+            if (separateThinkingInput) {
+                separateThinkingInput.checked = !!accountRouting.separateThinkingModels;
+                separateThinkingInput.onchange = () => {
+                    accountRouting.separateThinkingModels = separateThinkingInput.checked;
+                    void persistAccountRoutingOnly();
+                };
+            }
+
 
             renderAccountModels();
             if (!selectedAccountModelId && officialModels.length > 0) {
@@ -1265,15 +1346,18 @@
 
             if (!accountData || !accountData.bars) return null;
 
-            let barKey = null;
-            if (MODEL_GROUPS.claudeGpt.includes(modelId)) barKey = 'claude_gpt';
-            else if (MODEL_GROUPS.gpro.includes(modelId)) barKey = 'gpro';
-            else if (MODEL_GROUPS.gflash.includes(modelId)) barKey = 'gflash';
+            if (MODEL_GROUPS.argon.includes(modelId) || modelId.includes('argon')) {
+                const aBars = accountData.bars.filter(b => b.key.includes('argon'));
+                if (aBars.length > 0) return Math.min(...aBars.map(b => b.percentage));
+            } else if (MODEL_GROUPS.claudeGpt.includes(modelId) || modelId.includes('claude') || modelId.includes('gpt-oss')) {
+                const cBars = accountData.bars.filter(b => b.key.startsWith('claude_gpt'));
+                if (cBars.length > 0) return Math.min(...cBars.map(b => b.percentage));
+            } else if (modelId.includes('gemini') || MODEL_GROUPS.gpro.includes(modelId) || MODEL_GROUPS.gflash.includes(modelId)) {
+                const gBars = accountData.bars.filter(b => b.key.startsWith('gemini') && !b.key.includes('argon'));
+                if (gBars.length > 0) return Math.min(...gBars.map(b => b.percentage));
+            }
 
-            if (!barKey) return null;
-
-            const bar = accountData.bars.find(b => b.key === barKey);
-            return bar ? bar.percentage : null;
+            return null;
         }
 
         function renderAccounts() {

@@ -1,21 +1,21 @@
 import { afterEach, expect, test } from "bun:test"
-import { clearDynamicCodexModels, clearDynamicCopilotModels, clearDynamicKiroModels, getProviderModels, setDynamicCodexModels, setDynamicCopilotModels, setDynamicKiroModels } from "~/services/routing/models"
+import { clearDynamicCodexModels, clearDynamicCopilotModels, clearDynamicKiroModels, clearDynamicAntigravityModels, getProviderModels, setDynamicAntigravityModels, setDynamicCodexModels, setDynamicCopilotModels, setDynamicKiroModels } from "~/services/routing/models"
 
 afterEach(() => {
     clearDynamicCopilotModels()
     clearDynamicCodexModels()
     clearDynamicKiroModels()
+    clearDynamicAntigravityModels()
 })
 
-test("copilot models fall back to static list when dynamic list is empty", () => {
+test("copilot models are not hardcoded when dynamic list is empty", () => {
     clearDynamicCopilotModels()
     const models = getProviderModels("copilot")
 
-    expect(models.some(model => model.id === "gpt-4o")).toBe(true)
-    expect(models.some(model => model.id === "claude-opus-4-5-thinking")).toBe(true)
+    expect(models).toEqual([])
 })
 
-test("copilot models merge dynamic models before static fallback", () => {
+test("copilot models come only from the dynamic list", () => {
     setDynamicCopilotModels([
         { id: "gpt-5.2", label: "Copilot - GPT-5.2" },
         { id: "gpt-4o", label: "Copilot - GPT-4o Dynamic" },
@@ -27,6 +27,7 @@ test("copilot models merge dynamic models before static fallback", () => {
 
     expect(gpt52?.label).toBe("Copilot - GPT-5.2")
     expect(gpt4o?.label).toBe("Copilot - GPT-4o Dynamic")
+    expect(models.length).toBe(2)
 })
 
 test("dynamic copilot model options are sanitized and deduplicated", () => {
@@ -43,11 +44,31 @@ test("dynamic copilot model options are sanitized and deduplicated", () => {
     expect(matches[0].label).toBe("Copilot - GPT-5.2")
 })
 
-test("codex models fall back to static list when dynamic list is empty", () => {
+test("discovered model context limits are carried through and sanitized", () => {
+    setDynamicCopilotModels([
+        { id: "gpt-5.5", label: "Copilot - GPT-5.5", maxInputTokens: 1048576.0, maxOutputTokens: 262144 },
+        { id: "gpt-5-mini", label: "Copilot - GPT-5-mini", maxInputTokens: 0, maxOutputTokens: -5 },
+        { id: "gpt-5-tiny", label: "Copilot - GPT-5-tiny", maxInputTokens: NaN, maxOutputTokens: "1000" as unknown as number },
+    ])
+
+    const models = getProviderModels("copilot")
+    const full = models.find(model => model.id === "gpt-5.5")
+    const zeroed = models.find(model => model.id === "gpt-5-mini")
+    const junk = models.find(model => model.id === "gpt-5-tiny")
+
+    expect(full?.maxInputTokens).toBe(1048576)
+    expect(full?.maxOutputTokens).toBe(262144)
+    expect(zeroed?.maxInputTokens).toBeUndefined()
+    expect(zeroed?.maxOutputTokens).toBeUndefined()
+    expect(junk?.maxInputTokens).toBeUndefined()
+    expect(junk?.maxOutputTokens).toBeUndefined()
+})
+
+test("codex models are not hardcoded when dynamic list is empty", () => {
     clearDynamicCodexModels()
     const models = getProviderModels("codex")
 
-    expect(models.some(model => model.id === "gpt-5.3-codex")).toBe(true)
+    expect(models).toEqual([])
 })
 
 test("codex dynamic models override static list when available", () => {
@@ -60,12 +81,11 @@ test("codex dynamic models override static list when available", () => {
     expect(models.map(model => model.id)).toEqual(["gpt-5.3-codex", "gpt-5.2-codex"])
 })
 
-test("kiro models fall back to static list when dynamic list is empty", () => {
+test("kiro models are not hardcoded when dynamic list is empty", () => {
     clearDynamicKiroModels()
     const models = getProviderModels("kiro")
 
-    expect(models.some(model => model.id === "auto")).toBe(true)
-    expect(models.some(model => model.id === "claude-sonnet-4.6")).toBe(true)
+    expect(models).toEqual([])
 })
 
 test("kiro models merge dynamic models before static fallback", () => {
@@ -80,4 +100,37 @@ test("kiro models merge dynamic models before static fallback", () => {
 
     expect(custom?.label).toBe("Kiro - Custom")
     expect(auto?.label).toBe("Kiro - Dynamic Auto")
+})
+
+test("antigravity catalog entries inherit discovered upstream context limits", () => {
+    setDynamicAntigravityModels([
+        { id: "gemini-4-hydrogen-xhigh", label: "Antigravity - gemini-4-hydrogen-xhigh", maxInputTokens: 1048576, maxOutputTokens: 262144 },
+        { id: "gemini-4-hydrogen", label: "Antigravity - gemini-4-hydrogen", maxInputTokens: 1048576, maxOutputTokens: 262144 },
+    ])
+
+    const models = getProviderModels("antigravity", { includeAllVariants: true })
+    const hydrogen = models.find(model => model.id === "gemini-4-hydrogen")
+
+    expect(hydrogen?.maxInputTokens).toBe(1048576)
+    expect(hydrogen?.maxOutputTokens).toBe(262144)
+    // The catalog display label must win over the raw discovered label.
+    expect(hydrogen?.label).toBe("Gemini 4 Hydrogen")
+})
+
+test("base models inherit context limits from variant siblings only exposed upstream", () => {
+    // Upstream reality: only suffixed variants carry maxTokens; the catalog
+    // synthesizes the base entry without any metadata.
+    setDynamicAntigravityModels([
+        { id: "gemini-4-hydrogen-xhigh", label: "Antigravity - gemini-4-hydrogen-xhigh", maxInputTokens: 1048576, maxOutputTokens: 262144 },
+        { id: "gemini-4-hydrogen-high", label: "Antigravity - gemini-4-hydrogen-high", maxInputTokens: 1048576, maxOutputTokens: 262144 },
+        { id: "gemini-4-hydrogen-medium", label: "Antigravity - gemini-4-hydrogen-medium", maxInputTokens: 1048576, maxOutputTokens: 262144 },
+    ])
+
+    const models = getProviderModels("antigravity", { includeAllVariants: true })
+    const hydrogen = models.find(model => model.id === "gemini-4-hydrogen")
+    const medium = models.find(model => model.id === "gemini-4-hydrogen-medium")
+
+    expect(hydrogen?.maxInputTokens).toBe(1048576)
+    expect(hydrogen?.maxOutputTokens).toBe(262144)
+    expect(medium?.maxInputTokens).toBe(1048576)
 })

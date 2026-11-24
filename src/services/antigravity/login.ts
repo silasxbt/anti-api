@@ -20,6 +20,10 @@ import {
     fetchUserInfo,
     getProjectID,
     refreshAccessToken,
+    getAntigravityAuthUrl,
+    cleanAuthCode,
+    extractAuthCodeAndRedirectUri,
+    ANTIGRAVITY_OAUTH_REDIRECT_URI,
 } from "./oauth"
 import { generateMockProjectId } from "./project-id"
 import { ensureDataDir, getDataDir, getLegacyProjectDataDir } from "~/lib/data-dir"
@@ -147,6 +151,66 @@ export function setAuth(accessToken: string, refreshToken?: string, email?: stri
     state.userEmail = email || null
     state.userName = name || null
     saveAuth()
+}
+
+export function getAntigravityLoginUrl(): string {
+    return getAntigravityAuthUrl()
+}
+
+/**
+ * 使用 Google 返回的授权码完成登录（零端口、支持 Docker/远程服务器）
+ */
+export async function loginWithAuthCode(rawCode: string, redirectUri?: string): Promise<{ success: boolean; email?: string; error?: string }> {
+    try {
+        const { code, redirectUri: resolvedUri } = extractAuthCodeAndRedirectUri(rawCode, redirectUri)
+        if (!code) {
+            return { success: false, error: "Authorization code cannot be empty" }
+        }
+
+        const tokens = await exchangeCode(code, resolvedUri)
+        const userInfo = await fetchUserInfo(tokens.accessToken)
+        const projectId = await getProjectID(tokens.accessToken)
+        const resolvedProjectId = projectId || generateMockProjectId()
+
+        state.accessToken = tokens.accessToken
+        state.antigravityToken = tokens.accessToken
+        state.refreshToken = tokens.refreshToken
+        state.tokenExpiresAt = Date.now() + tokens.expiresIn * 1000
+        state.userEmail = userInfo.email
+        state.userName = userInfo.email.split("@")[0]
+        state.cloudaicompanionProject = resolvedProjectId
+
+        saveAuth()
+
+        const { accountManager } = await import("./account-manager")
+        const { authStore } = await import("~/services/auth/store")
+        accountManager.load()
+        accountManager.addAccount({
+            id: userInfo.email,
+            email: userInfo.email,
+            accessToken: tokens.accessToken,
+            refreshToken: tokens.refreshToken,
+            expiresAt: Date.now() + tokens.expiresIn * 1000,
+            projectId: resolvedProjectId,
+        })
+        authStore.saveAccount({
+            id: userInfo.email,
+            provider: "antigravity",
+            email: userInfo.email,
+            accessToken: tokens.accessToken,
+            refreshToken: tokens.refreshToken,
+            expiresAt: Date.now() + tokens.expiresIn * 1000,
+            projectId: resolvedProjectId,
+            label: userInfo.email,
+        })
+
+        consola.success(`✓ Login successful: ${userInfo.email}`)
+        return { success: true, email: userInfo.email }
+    } catch (error) {
+        const message = error instanceof Error ? error.message : "Authentication failed."
+        consola.error(`Code login failed: ${message}`)
+        return { success: false, error: message }
+    }
 }
 
 /**

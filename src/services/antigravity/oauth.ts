@@ -22,6 +22,8 @@ export const OAUTH_CONFIG = {
         "https://www.googleapis.com/auth/userinfo.profile",
         "https://www.googleapis.com/auth/cclog",
         "https://www.googleapis.com/auth/experimentsandconfigs",
+        "https://www.googleapis.com/auth/aicode",
+        "openid",
     ],
 }
 
@@ -148,6 +150,76 @@ export function discardOAuthPkceSession(oauthState: string): void {
     oauthPkceSessions.delete(oauthState)
 }
 
+export const ANTIGRAVITY_OAUTH_REDIRECT_URI = "https://antigravity.google/oauth-callback"
+
+export function getDefaultOAuthRedirectUri(): string {
+    return ANTIGRAVITY_OAUTH_REDIRECT_URI
+}
+
+const recentCodeVerifiers: string[] = []
+
+export function rememberRecentCodeVerifier(verifier: string): void {
+    if (!verifier) return
+    if (!recentCodeVerifiers.includes(verifier)) {
+        recentCodeVerifiers.unshift(verifier)
+        if (recentCodeVerifiers.length > 20) {
+            recentCodeVerifiers.pop()
+        }
+    }
+}
+
+export function getAntigravityAuthUrl(): string {
+    const session = createOAuthPkceSession()
+    rememberRecentCodeVerifier(session.codeVerifier)
+    const challenge = generateCodeChallenge(session.codeVerifier)
+
+    const params = new URLSearchParams({
+        client_id: OAUTH_CONFIG.clientId,
+        redirect_uri: ANTIGRAVITY_OAUTH_REDIRECT_URI,
+        response_type: "code",
+        scope: OAUTH_CONFIG.scopes.join(" "),
+        access_type: "offline",
+        prompt: "consent",
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        state: session.state,
+        app_domain: "https://antigravity.google",
+    })
+    return `${OAUTH_CONFIG.authUrl}?${params.toString()}`
+}
+
+export function extractAuthCodeAndRedirectUri(
+    rawInput: string,
+    fallbackRedirectUri?: string
+): { code: string; redirectUri: string; state?: string } {
+    const trimmed = (rawInput || "").trim()
+    const defaultUri = fallbackRedirectUri || ANTIGRAVITY_OAUTH_REDIRECT_URI
+
+    if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+        try {
+            const url = new URL(trimmed)
+            const code = url.searchParams.get("code")
+            const state = url.searchParams.get("state") || undefined
+            if (code) {
+                return {
+                    code: code.trim(),
+                    redirectUri: `${url.origin}${url.pathname}`,
+                    state,
+                }
+            }
+        } catch { }
+    }
+
+    return {
+        code: trimmed,
+        redirectUri: defaultUri,
+    }
+}
+
+export function cleanAuthCode(rawCode: string): string {
+    return extractAuthCodeAndRedirectUri(rawCode).code
+}
+
 /**
  * 生成 OAuth 授权 URL
  */
@@ -169,43 +241,95 @@ export function generateAuthURL(redirectUri: string, state: string, codeVerifier
 /**
  * 交换 authorization code 获取 tokens
  */
-export async function exchangeCode(code: string, redirectUri: string, codeVerifier: string): Promise<{
+export async function exchangeCode(
+    code: string,
+    redirectUri?: string,
+    codeVerifier?: string
+): Promise<{
     accessToken: string
     refreshToken: string
     expiresIn: number
 }> {
-    const params = new URLSearchParams({
-        code,
-        client_id: OAUTH_CONFIG.clientId,
-        client_secret: OAUTH_CONFIG.clientSecret,
-        redirect_uri: redirectUri,
-        grant_type: "authorization_code",
-    })
-    params.set("code_verifier", codeVerifier)
-
-    const response = await fetchJson(OAUTH_CONFIG.tokenUrl, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-        body: params.toString(),
-    })
-
-    if (response.status < 200 || response.status >= 300) {
-        throw new Error(`Token exchange failed (${response.status}).`)
+    const extracted = extractAuthCodeAndRedirectUri(code, redirectUri)
+    const cleanedCode = extracted.code
+    if (!cleanedCode) {
+        throw new Error("Authorization code cannot be empty")
     }
 
-    const data = response.data as {
-        access_token: string
-        refresh_token: string
-        expires_in: number
+    const verifiersToTry: string[] = []
+    if (codeVerifier) {
+        verifiersToTry.push(codeVerifier)
+    }
+    if (extracted.state) {
+        const fromSession = consumeOAuthPkceVerifier(extracted.state)
+        if (fromSession && !verifiersToTry.includes(fromSession)) {
+            verifiersToTry.push(fromSession)
+        }
+    }
+    for (const v of recentCodeVerifiers) {
+        if (!verifiersToTry.includes(v)) verifiersToTry.push(v)
+    }
+    for (const session of oauthPkceSessions.values()) {
+        if (!verifiersToTry.includes(session.codeVerifier)) {
+            verifiersToTry.push(session.codeVerifier)
+        }
+    }
+    if (verifiersToTry.length === 0) {
+        verifiersToTry.push("")
     }
 
-    return {
-        accessToken: data.access_token,
-        refreshToken: data.refresh_token,
-        expiresIn: data.expires_in,
+    const candidateUris = Array.from(new Set([
+        extracted.redirectUri,
+        redirectUri,
+        ANTIGRAVITY_OAUTH_REDIRECT_URI,
+        "http://localhost:8964/oauth-callback",
+        "http://localhost:51121/oauth-callback",
+    ])).filter((u): u is string => Boolean(u))
+
+    let lastError: any = null
+    for (const uri of candidateUris) {
+        for (const verifier of verifiersToTry) {
+            const params = new URLSearchParams({
+                code: cleanedCode,
+                client_id: OAUTH_CONFIG.clientId,
+                client_secret: OAUTH_CONFIG.clientSecret,
+                redirect_uri: uri,
+                grant_type: "authorization_code",
+            })
+            if (verifier) {
+                params.set("code_verifier", verifier)
+            }
+
+            const response = await fetchJson(OAUTH_CONFIG.tokenUrl, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                body: params.toString(),
+            })
+
+            if (response.status >= 200 && response.status < 300) {
+                const data = response.data as {
+                    access_token: string
+                    refresh_token: string
+                    expires_in: number
+                }
+                return {
+                    accessToken: data.access_token,
+                    refreshToken: data.refresh_token,
+                    expiresIn: data.expires_in,
+                }
+            }
+
+            lastError = new Error(`Token exchange failed (${response.status}): ${response.text || "invalid code"}`)
+            // Stop early on unrecoverable non-matching errors
+            if (response.text && !response.text.includes("redirect_uri_mismatch") && !response.text.includes("invalid_grant")) {
+                throw lastError
+            }
+        }
     }
+
+    throw lastError
 }
 
 /**
@@ -228,7 +352,7 @@ export async function fetchUserInfo(accessToken: string): Promise<{ email: strin
 /**
  * 获取 Antigravity Project ID
  */
-export async function getProjectID(accessToken: string): Promise<string | null> {
+export async function getProjectID(accessToken: string, proxy?: string): Promise<string | null> {
     try {
         const response = await fetchJson(OAUTH_CONFIG.projectUrl, {
             method: "POST",
@@ -242,6 +366,7 @@ export async function getProjectID(accessToken: string): Promise<string | null> 
                     ideType: "ANTIGRAVITY",
                 },
             }),
+            proxy,
         })
 
         if (response.status < 200 || response.status >= 300) {
@@ -258,7 +383,7 @@ export async function getProjectID(accessToken: string): Promise<string | null> 
 /**
  * 刷新 access token
  */
-export async function refreshAccessToken(refreshToken: string): Promise<{
+export async function refreshAccessToken(refreshToken: string, proxy?: string): Promise<{
     accessToken: string
     expiresIn: number
 }> {
@@ -275,6 +400,7 @@ export async function refreshAccessToken(refreshToken: string): Promise<{
             "Content-Type": "application/x-www-form-urlencoded",
         },
         body: params.toString(),
+        proxy,
     })
 
     if (response.status < 200 || response.status >= 300) {
@@ -333,14 +459,18 @@ type InsecureResponse = {
 
 export async function fetchJson(
     url: string,
-    options: { method?: string; headers?: Record<string, string>; body?: string }
+    options: { method?: string; headers?: Record<string, string>; body?: string; proxy?: string }
 ): Promise<{ status: number; data: any; text: string }> {
-    const response = await fetch(url, {
+    const fetchInit: any = {
         method: options.method,
         headers: { "User-Agent": "anti-api", ...(options.headers || {}) },
         body: options.body,
         signal: AbortSignal.timeout(10_000),
-    })
+    }
+    if (options.proxy) {
+        fetchInit.proxy = options.proxy
+    }
+    const response = await fetch(url, fetchInit)
     const text = await response.text()
     let data: any = null
     if (text) {
@@ -352,10 +482,21 @@ export async function fetchJson(
 /**
  * OAuth 回调服务器
  */
-interface OAuthCallbackResult {
+export interface OAuthCallbackResult {
     code?: string
     state?: string
     error?: string
+}
+
+let globalOAuthCallbackResolve: ((result: OAuthCallbackResult) => void) | null = null
+
+export function dispatchOAuthCallback(code?: string, state?: string, error?: string): boolean {
+    if (globalOAuthCallbackResolve) {
+        globalOAuthCallbackResolve({ code, state, error })
+        globalOAuthCallbackResolve = null
+        return true
+    }
+    return false
 }
 
 export function startOAuthCallbackServer(options: OAuthCallbackServerOptions = {}): Promise<{
@@ -367,6 +508,13 @@ export function startOAuthCallbackServer(options: OAuthCallbackServerOptions = {
         let callbackResolve: ((result: OAuthCallbackResult) => void) | null = null
         const callbackPromise = new Promise<OAuthCallbackResult>((res) => {
             callbackResolve = res
+            globalOAuthCallbackResolve = (result) => {
+                if (callbackResolve) {
+                    callbackResolve(result)
+                    callbackResolve = null
+                }
+                globalOAuthCallbackResolve = null
+            }
         })
 
         const startPort = options.port || OAUTH_CONFIG.callbackPort
@@ -397,6 +545,7 @@ export function startOAuthCallbackServer(options: OAuthCallbackServerOptions = {
                                 callbackResolve({ code: code || undefined, state: state || undefined, error: error || undefined })
                                 callbackResolve = null
                             }
+                            globalOAuthCallbackResolve = null
 
                             // Redirect to official success page
                             return Response.redirect("https://antigravity.google/auth-success", 302)

@@ -10,18 +10,64 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return !!value && typeof value === "object" && !Array.isArray(value)
 }
 
-const MODEL_MAPPING: Record<string, string> = {
-    // GPT → Claude 映射 (使用 Antigravity 正确的模型名称)
-    "gpt-4": "claude-sonnet-4-5",
-    "gpt-4o": "claude-sonnet-4-5",
-    "gpt-4-turbo": "claude-sonnet-4-5",
-    "gpt-3.5-turbo": "gemini-2.0-flash-exp",  // 使用 Gemini 作为轻量模型
-    "o1": "claude-sonnet-4-5-thinking",
-    "o1-mini": "gemini-2.0-flash-exp",
+type ReasoningEffort = "low" | "medium" | "high"
+
+/** Picks a model per reasoning effort; `medium`/unset falls back to `fallback`. */
+interface EffortRule {
+    match: string[]
+    low?: string
+    medium?: string
+    high?: string
+    fallback: string
 }
 
-export function mapModel(openaiModel: string): string {
-    return MODEL_MAPPING[openaiModel] || openaiModel
+function effortRule(match: string[], fallback: string, overrides: Partial<Record<ReasoningEffort, string>> = {}): EffortRule {
+    return { match, fallback, ...overrides }
+}
+
+/** Gemini/Claude family with explicit -low/-high native variants. */
+function tieredRule(match: string[], base: string, medium: string = base): EffortRule {
+    return effortRule(match, medium, { low: `${base}-low`, high: `${base}-high` })
+}
+
+/** Models that switch to a single thinking variant whenever any effort is requested. */
+function thinkingRule(match: string[], plain: string, thinking: string): EffortRule {
+    return effortRule(match, plain, { low: thinking, medium: thinking, high: thinking })
+}
+
+/** Models whose id never changes with reasoning effort. */
+function constantRule(match: string[], id: string): EffortRule {
+    return thinkingRule(match, id, id)
+}
+
+const EFFORT_RULES: EffortRule[] = [
+    tieredRule(["gemini-4-argon", "gemini-argon", "argon"], "gemini-4-argon", "gemini-4-argon"),
+    tieredRule(["gemini-3-8-flash", "gemini-3-8-flash-preview"], "gemini-3.8-flash", "gemini-3.8-flash-medium"),
+    tieredRule(["gemini-3-7-flash"], "gemini-3.7-flash", "gemini-3.7-flash-medium"),
+    tieredRule(["gemini-3-6-flash"], "gemini-3.6-flash", "gemini-3.6-flash-medium"),
+    constantRule(["gemini-3-5-flash-lite"], "gemini-3.5-flash-lite"),
+    effortRule(["gemini-3-1-pro", "gemini-3-1-pro-preview"], "gemini-3.1-pro-high", { low: "gemini-3.1-pro-low" }),
+    effortRule(["gemini-3-pro"], "gemini-3-pro-high", { low: "gemini-3-pro-low" }),
+    thinkingRule(["gemini-2-5-flash"], "gemini-2.5-flash", "gemini-2.5-flash-thinking"),
+    tieredRule(["claude-opus-5-5", "claude-3-opus", "claude-3-opus-20240229", "claude-opus"], "claude-opus-5-5"),
+    tieredRule(["claude-sonnet-5-5", "claude-3-7-sonnet", "claude-3-7-sonnet-20250219", "claude-3-7-sonnet-latest", "claude-sonnet"], "claude-sonnet-5-5"),
+    constantRule(["claude-opus-4-6"], "claude-opus-4-6-thinking"),
+    constantRule(["claude-sonnet-4-6"], "claude-sonnet-4-6"),
+    constantRule(["claude-opus-4-5"], "claude-opus-4-5-thinking"),
+    thinkingRule(["claude-sonnet-4-5", "claude-3-5-sonnet", "claude-3-5-sonnet-20241022", "claude-3-5-sonnet-latest", "claude-3-5-haiku"], "claude-sonnet-4-5", "claude-sonnet-4-5-thinking"),
+]
+
+const EFFORT_RULE_BY_MODEL = new Map<string, EffortRule>(
+    EFFORT_RULES.flatMap(rule => rule.match.map(name => [name, rule] as const)),
+)
+
+export function mapModel(openaiModel: string, reasoningEffort?: ReasoningEffort): string {
+    const raw = openaiModel
+    const norm = raw.trim().toLowerCase().replace(/[._]/g, "-")
+
+    const rule = EFFORT_RULE_BY_MODEL.get(norm)
+    if (!rule) return raw
+    return (reasoningEffort && rule[reasoningEffort]) || rule.fallback
 }
 
 const MAX_INLINE_IMAGE_BYTES = 10 * 1024 * 1024
@@ -121,6 +167,30 @@ function parseDataImageUrl(url: string): ClaudeContentBlock["source"] | null {
     }
 }
 
+function parseDataAudioUrl(url: string): ClaudeContentBlock["source"] | null {
+    const separator = url.indexOf(",")
+    if (separator === -1) return null
+    const header = url.slice(0, separator)
+    const match = header.match(/^data:(audio\/[A-Za-z0-9.+-]+);base64$/i)
+    if (!match) return null
+
+    const rawData = url.slice(separator + 1)
+    if (!rawData) {
+        throw new RequestValidationError("audio data URI must include base64 audio data")
+    }
+    const data = rawData.replace(/[\t\n\f\r ]/g, "")
+    if (!data) {
+        throw new RequestValidationError("audio data URI must include base64 audio data")
+    }
+    validateBase64ImageData(data)
+
+    return {
+        type: "base64",
+        media_type: match[1].toLowerCase(),
+        data,
+    }
+}
+
 function parseToolCallArguments(value: unknown, index: number): Record<string, unknown> {
     const raw = value === undefined || value === null || value === "" ? "{}" : value
     if (typeof raw !== "string") {
@@ -160,6 +230,11 @@ function translateContentPart(part: OpenAIContentPart, index: number): ClaudeCon
             throw new RequestValidationError(`image_url part at index ${index} must include image_url.url`)
         }
 
+        const inlineAudio = parseDataAudioUrl(url)
+        if (inlineAudio) {
+            return { type: "audio", source: inlineAudio }
+        }
+
         const inlineSource = parseDataImageUrl(url)
         if (inlineSource) {
             return { type: "image", source: inlineSource }
@@ -175,6 +250,115 @@ function translateContentPart(part: OpenAIContentPart, index: number): ClaudeCon
             throw new RequestValidationError(`image_url part at index ${index} must use http(s) or a base64 data URI`)
         }
         return { type: "image", source: { type: "url", url: parsed.toString() } }
+    }
+
+    if (part.type === "audio_url") {
+        if (!isRecord(part.audio_url) || typeof part.audio_url.url !== "string") {
+            throw new RequestValidationError(`audio_url part at index ${index} must include audio_url.url`)
+        }
+        const url = part.audio_url.url.trim()
+        if (!url) {
+            throw new RequestValidationError(`audio_url part at index ${index} must include audio_url.url`)
+        }
+
+        const inlineSource = parseDataAudioUrl(url)
+        if (inlineSource) {
+            return { type: "audio", source: inlineSource }
+        }
+
+        let parsed: URL
+        try {
+            parsed = new URL(url)
+        } catch {
+            throw new RequestValidationError(`audio_url part at index ${index} must be a data URI or an http(s) URL`)
+        }
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+            throw new RequestValidationError(`audio_url part at index ${index} must use http(s) or a base64 data URI`)
+        }
+        return { type: "audio", source: { type: "url", url: parsed.toString() } }
+    }
+
+    if (part.type === "input_audio") {
+        if (!isRecord(part.input_audio) || typeof part.input_audio.data !== "string") {
+            throw new RequestValidationError(`input_audio part at index ${index} must include input_audio.data`)
+        }
+        const format = (typeof part.input_audio.format === "string" ? part.input_audio.format : "wav").toLowerCase()
+        const mediaType = format === "mp3" ? "audio/mp3" : format === "wav" ? "audio/wav" : `audio/${format}`
+        const rawData = part.input_audio.data
+        const data = rawData.replace(/[\t\n\f\r ]/g, "")
+        if (!data) {
+            throw new RequestValidationError(`input_audio part at index ${index} must include base64 audio data`)
+        }
+        validateBase64ImageData(data)
+        return {
+            type: "audio",
+            source: {
+                type: "base64",
+                media_type: mediaType,
+                data,
+            },
+        }
+    }
+
+    if (part.type === "audio") {
+        const source = (part as any).source
+        if (isRecord(source)) {
+            if (source.type === "base64" && typeof source.data === "string") {
+                const mediaType = typeof source.media_type === "string" ? source.media_type.toLowerCase() : "audio/wav"
+                const data = source.data.replace(/[\t\n\f\r ]/g, "")
+                validateBase64ImageData(data)
+                return {
+                    type: "audio",
+                    source: {
+                        type: "base64",
+                        media_type: mediaType,
+                        data,
+                    },
+                }
+            }
+            if (source.type === "url" && typeof source.url === "string") {
+                return {
+                    type: "audio",
+                    source: {
+                        type: "url",
+                        url: source.url,
+                    },
+                }
+            }
+        }
+        if (isRecord((part as any).input_audio)) {
+            const ia = (part as any).input_audio
+            const format = (typeof ia.format === "string" ? ia.format : "wav").toLowerCase()
+            const mediaType = format === "mp3" ? "audio/mp3" : format === "wav" ? "audio/wav" : `audio/${format}`
+            const data = (ia.data || "").replace(/[\t\n\f\r ]/g, "")
+            validateBase64ImageData(data)
+            return {
+                type: "audio",
+                source: {
+                    type: "base64",
+                    media_type: mediaType,
+                    data,
+                },
+            }
+        }
+    }
+
+    if (part.type === "document") {
+        const source = (part as any).source
+        if (isRecord(source) && typeof source.media_type === "string" && source.media_type.toLowerCase().startsWith("audio/")) {
+            if (source.type === "base64" && typeof source.data === "string") {
+                const data = source.data.replace(/[\t\n\f\r ]/g, "")
+                validateBase64ImageData(data)
+                return {
+                    type: "audio",
+                    source: {
+                        type: "base64",
+                        media_type: source.media_type.toLowerCase(),
+                        data,
+                    },
+                }
+            }
+        }
     }
 
     throw new RequestValidationError(`Unsupported OpenAI content part type at index ${index}`)
@@ -219,12 +403,23 @@ export function translateMessages(messages: OpenAIMessage[]): ClaudeMessage[] {
                         if (typeof tc.function.name !== "string" || !tc.function.name) {
                             throw new RequestValidationError(`tool call at index ${index} must include a function name`)
                         }
-                        return {
+                        const toolBlock: any = {
                             type: "tool_use" as const,
                             id: tc.id,
                             name: tc.function.name,
                             input: parseToolCallArguments(tc.function.arguments, index),
                         }
+                        const sig = (tc as any).thought_signature
+                            || (tc as any).thoughtSignature
+                            || (tc.function as any)?.thought_signature
+                            || (tc.function as any)?.thoughtSignature
+                            || (msg as any).thought_signature
+                            || (msg as any).thoughtSignature
+                        if (sig) {
+                            toolBlock.thought_signature = sig
+                            toolBlock.thoughtSignature = sig
+                        }
+                        return toolBlock
                     }),
                 ],
             }
@@ -289,11 +484,40 @@ export function translateTools(tools?: OpenAITool[]): ClaudeTool[] | undefined {
     })
 }
 
-export function mapStopReason(anthropicReason: string): "stop" | "length" | "tool_calls" | null {
+export function extractOpenAIReasoningEffort(payload: {
+    reasoning_effort?: string
+    reasoning?: { effort?: string }
+}): ReasoningEffort | undefined {
+    const raw = (payload.reasoning_effort ?? payload.reasoning?.effort)?.trim().toLowerCase()
+    if (!raw) return undefined
+    if (raw === "xhigh" || raw === "max" || raw === "high") return "high"
+    if (raw === "medium") return "medium"
+    if (raw === "low" || raw === "minimal") return "low"
+    return undefined
+}
+
+export function translateOpenAIToolChoice(
+    toolChoice: unknown
+): { type: "auto" | "any" | "tool" | "none"; name?: string } | undefined {
+    if (toolChoice === undefined || toolChoice === null) return undefined
+    if (typeof toolChoice === "string") {
+        if (toolChoice === "auto") return { type: "auto" }
+        if (toolChoice === "none") return { type: "none" }
+        if (toolChoice === "required") return { type: "any" }
+        return undefined
+    }
+    if (isRecord(toolChoice) && toolChoice.type === "function" && isRecord(toolChoice.function) && typeof toolChoice.function.name === "string" && toolChoice.function.name) {
+        return { type: "tool", name: toolChoice.function.name }
+    }
+    return undefined
+}
+
+export function mapStopReason(anthropicReason: string): "stop" | "length" | "tool_calls" | "content_filter" | null {
     switch (anthropicReason) {
         case "end_turn": return "stop"
         case "tool_use": return "tool_calls"
         case "max_tokens": return "length"
+        case "content_filter": return "content_filter"
         default: return "stop"
     }
 }
@@ -308,7 +532,8 @@ export function buildStreamChunk(
     content?: string,
     role?: string,
     finishReason?: string,
-    toolCalls?: any[]
+    toolCalls?: any[],
+    reasoningContent?: string
 ): string {
     const chunk: any = {
         id,
@@ -324,14 +549,172 @@ export function buildStreamChunk(
 
     if (role) chunk.choices[0].delta.role = role
     if (content !== undefined) chunk.choices[0].delta.content = content
+    if (reasoningContent !== undefined) {
+        chunk.choices[0].delta.reasoning_content = reasoningContent
+    }
     if (toolCalls) {
         chunk.choices[0].delta.tool_calls = toolCalls.map((tc, idx) => ({
             index: idx,
             id: tc.id,
             type: "function",
             function: { name: tc.name, arguments: JSON.stringify(tc.input) },
+            ...(tc.thought_signature ? { thought_signature: tc.thought_signature } : {}),
+            ...(tc.thoughtSignature ? { thoughtSignature: tc.thoughtSignature } : {}),
         }))
     }
 
     return JSON.stringify(chunk)
+}
+
+export function completionToOpenAIChatObject(
+    completion: {
+        contentBlocks: Array<{
+            type: string
+            text?: string
+            thinking?: string
+            id?: string
+            name?: string
+            input?: any
+            thought_signature?: string
+            thoughtSignature?: string
+        }>
+        stopReason: string | null
+        usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number }
+    },
+    model: string,
+    id: string = generateChatId()
+): Record<string, any> {
+    let textContent = ""
+    let reasoningContent = ""
+    const toolCalls: any[] = []
+
+    for (const block of completion.contentBlocks || []) {
+        if (block.type === "text") {
+            textContent += block.text || ""
+        } else if (block.type === "thinking") {
+            reasoningContent += block.thinking || block.text || ""
+        } else if (block.type === "tool_use") {
+            toolCalls.push({
+                id: block.id,
+                name: block.name,
+                input: block.input,
+                thought_signature: block.thought_signature || block.thoughtSignature,
+            })
+        }
+    }
+
+    const message: any = { role: "assistant", content: toolCalls.length > 0 ? null : textContent }
+    if (reasoningContent) {
+        message.reasoning_content = reasoningContent
+    }
+    if (toolCalls.length > 0) {
+        message.tool_calls = toolCalls.map((tc) => ({
+            id: tc.id,
+            type: "function",
+            function: { name: tc.name, arguments: JSON.stringify(tc.input ?? {}) },
+            ...(tc.thought_signature ? { thought_signature: tc.thought_signature } : {}),
+        }))
+    }
+
+    const cacheReadTokens = completion.usage?.cacheReadTokens || 0
+    const inputTokens = (completion.usage?.inputTokens || 0) + cacheReadTokens
+    const outputTokens = completion.usage?.outputTokens || 0
+
+    return {
+        id,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{ index: 0, message, finish_reason: mapStopReason(completion.stopReason || "end_turn") }],
+        usage: {
+            prompt_tokens: inputTokens,
+            completion_tokens: outputTokens,
+            total_tokens: inputTokens + outputTokens,
+            prompt_tokens_details: { cached_tokens: cacheReadTokens },
+        },
+    }
+}
+
+export async function* eventsToOpenAIChatSse(
+    events: AsyncIterable<import("~/lib/stream-events").RoutedStreamEvent>,
+    model: string,
+    options: { id?: string; includeUsage?: boolean } = {}
+): AsyncGenerator<string, void, unknown> {
+    const chatId = options.id || generateChatId()
+    let sentRole = false
+    const accumulatedToolCalls: any[] = []
+    let streamInputTokens = 0
+    let streamCacheReadTokens = 0
+    let streamOutputTokens = 0
+
+    const frame = (data: string) => `data: ${data}\n\n`
+
+    for await (const event of events) {
+        if (event.type === "start") {
+            if (!sentRole) {
+                sentRole = true
+                yield frame(buildStreamChunk(chatId, model, undefined, "assistant"))
+            }
+            continue
+        }
+
+        if (!sentRole) {
+            sentRole = true
+            yield frame(buildStreamChunk(chatId, model, undefined, "assistant"))
+        }
+
+        if (event.type === "thinking_delta") {
+            if (event.text) {
+                yield frame(buildStreamChunk(chatId, model, undefined, undefined, undefined, undefined, event.text))
+            }
+            continue
+        }
+
+        if (event.type === "text_delta") {
+            if (event.text) {
+                yield frame(buildStreamChunk(chatId, model, event.text))
+            }
+            continue
+        }
+
+        if (event.type === "tool_call") {
+            accumulatedToolCalls.push({
+                id: event.id,
+                name: event.name,
+                input: event.input ?? {},
+                ...(event.thoughtSignature ? { thought_signature: event.thoughtSignature, thoughtSignature: event.thoughtSignature } : {}),
+            })
+            continue
+        }
+
+        if (event.type === "finish") {
+            streamInputTokens = event.usage?.inputTokens ?? 0
+            streamCacheReadTokens = event.usage?.cacheReadTokens ?? 0
+            streamOutputTokens = event.usage?.outputTokens ?? 0
+
+            if (accumulatedToolCalls.length > 0) {
+                yield frame(buildStreamChunk(chatId, model, undefined, undefined, "tool_use", accumulatedToolCalls))
+            }
+            yield frame(buildStreamChunk(chatId, model, undefined, undefined, event.stopReason || "end_turn"))
+        }
+    }
+
+    if (options.includeUsage) {
+        const promptTokens = streamInputTokens + streamCacheReadTokens
+        yield frame(JSON.stringify({
+            id: chatId,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [],
+            usage: {
+                prompt_tokens: promptTokens,
+                completion_tokens: streamOutputTokens,
+                total_tokens: promptTokens + streamOutputTokens,
+                prompt_tokens_details: { cached_tokens: streamCacheReadTokens },
+            },
+        }))
+    }
+
+    yield frame("[DONE]")
 }

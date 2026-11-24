@@ -1,4 +1,4 @@
-const DEFAULT_ANTIGRAVITY_IDE_VERSION = "2.9.1"
+const DEFAULT_ANTIGRAVITY_IDE_VERSION = "2.24.0"
 const ANTIGRAVITY_VERSION_MANIFEST_URL = "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml"
 const ANTIGRAVITY_HUB_PLATFORM = "darwin/arm64"
 const VERSION_CACHE_TTL_MS = 6 * 60 * 60 * 1000

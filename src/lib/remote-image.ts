@@ -5,6 +5,7 @@ import { isIP } from "node:net"
 import { RequestValidationError } from "./error"
 
 export const MAX_REMOTE_IMAGE_BYTES = 10 * 1024 * 1024
+export const MAX_REMOTE_AUDIO_BYTES = 25 * 1024 * 1024
 const REMOTE_IMAGE_TIMEOUT_MS = 10_000
 const REMOTE_IMAGE_TIMEOUT_MESSAGE = "remote image request timed out"
 const MAX_REMOTE_IMAGE_TIMEOUT_MS = 120_000
@@ -544,4 +545,119 @@ export async function fetchRemoteImageAsBase64(
         throw new RequestValidationError("remote image could not be read")
     }
     return toInlineImage(response.status, response.headers, bytes, maxBytes)
+}
+
+function toInlineAudio(status: number, headers: Headers, bytes: Uint8Array, maxBytes: number): InlineImageSource {
+    if (status < 200 || status >= 300) {
+        throw new RequestValidationError("remote audio could not be fetched")
+    }
+    const mediaType = (headers.get("content-type") || "").split(";", 1)[0].trim().toLowerCase()
+    if (!mediaType.startsWith("audio/")) {
+        throw new RequestValidationError("remote audio response must have an audio content type")
+    }
+    const contentLength = Number(headers.get("content-length") || "")
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+        throw new RequestValidationError(`remote audio exceeds the ${Math.floor(maxBytes / (1024 * 1024))} MiB limit`)
+    }
+    if (bytes.byteLength > maxBytes) {
+        throw new RequestValidationError(`remote audio exceeds the ${Math.floor(maxBytes / (1024 * 1024))} MiB limit`)
+    }
+    return {
+        type: "base64",
+        media_type: mediaType,
+        data: Buffer.from(bytes).toString("base64"),
+    }
+}
+
+/** Fetch a public HTTP(S) audio file without following redirects or exposing response data in errors. */
+export async function fetchRemoteAudioAsBase64(
+    rawUrl: string,
+    options: RemoteImageFetchOptions = {}
+): Promise<InlineImageSource> {
+    throwIfAborted(options.signal)
+    let url: URL
+    try {
+        url = new URL(rawUrl)
+    } catch {
+        throw new RequestValidationError("remote audio URL is invalid")
+    }
+
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+        throw new RequestValidationError("remote audio URL must use http(s)")
+    }
+    if (url.username || url.password) {
+        throw new RequestValidationError("remote audio URL must not include credentials")
+    }
+
+    const hostname = url.hostname.replace(/^\[|\]$/g, "")
+    const timeoutMs = normalizeTimeout(options.timeoutMs)
+    const maxBytes = options.maxBytes ?? MAX_REMOTE_AUDIO_BYTES
+    const deadline = Date.now() + timeoutMs
+    const lookupHost = options.lookupHost || (async (host: string) => await lookup(host, { all: true, verbatim: true }))
+    let addresses: string[]
+    try {
+        const result = isIP(hostname)
+            ? [{ address: hostname }]
+            : await withAbort(withDeadline(Promise.resolve(lookupHost(hostname)), deadline, () => {}), options.signal)
+        addresses = result.map(item => item.address)
+    } catch {
+        if (options.signal?.aborted) throw abortError()
+        throw new RequestValidationError("remote audio host is not allowed")
+    }
+    throwIfAborted(options.signal)
+    assertPublicRemoteHost(url, addresses)
+
+    if (!options.fetchImpl) {
+        try {
+            const response = await requestPinnedImage(url, addresses[0], deadline, maxBytes, options.signal)
+            return toInlineAudio(response.status, response.headers, response.bytes, maxBytes)
+        } catch (error) {
+            if (options.signal?.aborted || (error as { name?: string } | undefined)?.name === "AbortError") throw abortError()
+            if (error instanceof RequestValidationError) throw error
+            throw new RequestValidationError("remote audio could not be fetched")
+        }
+    }
+
+    const fetchImpl = options.fetchImpl
+    const controller = new AbortController()
+    let response: Response
+    try {
+        response = await withAbort(withDeadline(
+            Promise.resolve(
+                fetchImpl(url, {
+                    method: "GET",
+                    headers: { Accept: "audio/*" },
+                    redirect: "error",
+                    signal: controller.signal,
+                })
+            ),
+            deadline,
+            () => controller.abort()
+        ), options.signal, () => controller.abort())
+    } catch (error) {
+        if (options.signal?.aborted || (error as { name?: string } | undefined)?.name === "AbortError") throw abortError()
+        if (error instanceof RequestValidationError) throw error
+        throw new RequestValidationError("remote audio could not be fetched")
+    }
+
+    if (response.status < 200 || response.status >= 300) {
+        void response.body?.cancel().catch(() => {})
+        return toInlineAudio(response.status, response.headers, new Uint8Array(), maxBytes)
+    }
+
+    const declaredLength = Number(response.headers.get("content-length") || "")
+    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+        void response.body?.cancel().catch(() => {})
+        throw new RequestValidationError(`remote audio exceeds the ${Math.floor(maxBytes / (1024 * 1024))} MiB limit`)
+    }
+
+    let bytes: Uint8Array
+    try {
+        bytes = await readLimitedBody(response, maxBytes, deadline, () => controller.abort(), options.signal)
+    } catch (error) {
+        if (options.signal?.aborted || (error as { name?: string } | undefined)?.name === "AbortError") throw abortError()
+        if (error instanceof RequestValidationError) throw error
+        throw new RequestValidationError("remote audio could not be read")
+    }
+    return toInlineAudio(response.status, response.headers, bytes, maxBytes)
 }

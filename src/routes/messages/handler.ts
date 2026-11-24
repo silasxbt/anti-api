@@ -11,6 +11,7 @@ import consola from "consola"
 
 import { createRoutedCompletion, createRoutedCompletionStream, RoutingError } from "~/services/routing/router"
 import type { ClaudeMessage, ClaudeTool } from "~/lib/translator"
+import { generateMessageId, getCacheReadTokens } from "~/lib/translator"
 import { rateLimiter } from "~/lib/rate-limiter"
 import { validateAnthropicRequest } from "~/lib/validation"
 import { forwardError, RequestValidationError, UpstreamError } from "~/lib/error"
@@ -27,8 +28,21 @@ import type {
 /**
  * 将Anthropic消息转换为 Claude 格式（保留完整结构）
  */
+function extractSystemText(system: AnthropicMessagesPayload["system"]): string {
+    if (typeof system === "string") return system.trim()
+    if (!Array.isArray(system)) return ""
+    return system
+        .map(block => (block && typeof block === "object" && block.type === "text" && typeof block.text === "string" ? block.text : ""))
+        .filter(Boolean)
+        .join("\n\n")
+        .trim()
+}
+
 function translateMessages(payload: AnthropicMessagesPayload): ClaudeMessage[] {
-    return payload.messages as unknown as ClaudeMessage[]
+    const base = (payload.messages as unknown as ClaudeMessage[]) || []
+    const systemText = extractSystemText(payload.system)
+    if (!systemText) return base
+    return [{ role: "system" as any, content: systemText }, ...base]
 }
 
 /**
@@ -57,13 +71,6 @@ function collectToolResultIds(messages: ClaudeMessage[]): string[] {
         }
     }
     return ids
-}
-
-/**
- * 生成响应ID
- */
-function generateMessageId(): string {
-    return `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`
 }
 
 /**
@@ -129,20 +136,29 @@ export async function handleCompletion(c: Context): Promise<Response> {
         }
 
         // 构建响应内容
-        const content = result.contentBlocks.map(block => {
-            if (block.type === "tool_use") {
-                return {
+        const content: any[] = []
+        for (const block of result.contentBlocks) {
+            if (block.type === "thinking") {
+                if (block.thinking) {
+                    content.push({ type: "thinking", thinking: block.thinking })
+                }
+            } else if (block.type === "tool_use") {
+                content.push({
                     type: "tool_use" as const,
                     id: block.id!,
                     name: block.name!,
-                    input: block.input
-                }
+                    input: block.input,
+                })
+            } else if (block.text) {
+                content.push({
+                    type: "text" as const,
+                    text: block.text,
+                })
             }
-            return {
-                type: "text" as const,
-                text: block.text || ""
-            }
-        })
+        }
+        if (content.length === 0) {
+            content.push({ type: "text" as const, text: "" })
+        }
 
         const response: AnthropicResponse = {
             id: generateMessageId(),
@@ -155,6 +171,8 @@ export async function handleCompletion(c: Context): Promise<Response> {
             usage: {
                 input_tokens: result.usage?.inputTokens || 0,
                 output_tokens: result.usage?.outputTokens || 0,
+                cache_read_input_tokens: getCacheReadTokens(result.usage),
+                cache_creation_input_tokens: 0,
             },
         }
 

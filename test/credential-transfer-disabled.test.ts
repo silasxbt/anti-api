@@ -59,15 +59,15 @@ test("auth export endpoint is disabled", async () => {
     expect(await res.json()).toEqual({ success: false, error: REMOVED_MESSAGE })
 })
 
-test("auth import endpoint is disabled", async () => {
+test("auth import only accepts explicit account payloads", async () => {
     const server = await serverPromise
     const res = await server.request("/auth/import", {
         method: "POST",
         headers: { ...LOCAL_HEADERS, "content-type": "application/json" },
         body: JSON.stringify({ accounts: [] }),
     })
-    expect(res.status).toBe(410)
-    expect(await res.json()).toEqual({ success: false, error: REMOVED_MESSAGE })
+    expect(res.status).toBe(400)
+    expect((await res.json()).success).toBe(false)
 })
 
 test("auth status endpoint is still available", async () => {

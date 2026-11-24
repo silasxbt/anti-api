@@ -15,6 +15,7 @@ export type OpenAIResponsesContentPart =
 export type OpenAIContentPart =
     | { type: "text"; text: string }
     | { type: "image_url"; image_url: { url: string } }
+    | { type: "input_audio"; input_audio: { data: string; format: string } }
 
 export interface OpenAIToolDefinition {
     type: "function"
@@ -107,6 +108,18 @@ function toOpenAIContent(blocks: ClaudeContentBlock[]): string | OpenAIContentPa
         if (block.type === "image" && block.source?.type === "url") {
             hasImage = true
             parts.push({ type: "image_url", image_url: { url: block.source.url } })
+            continue
+        }
+        if (block.type === "audio" && block.source?.type === "base64") {
+            hasImage = true
+            parts.push({
+                type: "input_audio",
+                input_audio: {
+                    data: block.source.data,
+                    format: block.source.media_type.replace("audio/", ""),
+                },
+            })
+            continue
         }
     }
 
@@ -158,8 +171,8 @@ export function toOpenAIMessages(messages: ClaudeMessage[]): OpenAIChatMessage[]
                 }
             }
 
-            // Then add text and image input together as one multimodal user message.
-            const inputBlocks = blocks.filter(block => block.type === "text" || block.type === "image")
+            // Then add text, image and audio input together as one multimodal user message.
+            const inputBlocks = blocks.filter(block => block.type === "text" || block.type === "image" || block.type === "audio")
             if (inputBlocks.length > 0) {
                 result.push({ role: "user", content: toOpenAIContent(inputBlocks) })
             }

@@ -146,6 +146,10 @@ export function summarizeUpstreamError(error: UpstreamError): { message: string;
             message: "Zed authorization is no longer valid for this account. Update the configured credentials file, then re-import the account.",
         }
     }
+    const parsed = parseUpstreamErrorBody(error.body || "")
+    if (parsed.message) {
+        return { message: `${error.provider} upstream error (${error.status}): ${parsed.message}` }
+    }
     return { message: `${error.provider} upstream error (${error.status}).` }
 }
 

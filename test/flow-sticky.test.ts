@@ -80,7 +80,9 @@ function resetTracking(resetCounts: boolean) {
     }
 }
 
+const realChat = await import("~/services/antigravity/chat")
 mock.module("~/services/antigravity/chat", () => ({
+    ...realChat,
     createChatCompletionWithOptions: async (_request: any, options: { accountId?: string }) => {
         const accountId = options?.accountId || "auto"
         callOrder.push(accountId)
@@ -117,6 +119,21 @@ mock.module("~/services/antigravity/chat", () => ({
         }
         yield ""
     },
+    createAntigravityEventStreamWithOptions: async function* (_request: any, options?: { accountId?: string }) {
+        const accountId = options?.accountId || "auto"
+        callOrder.push(accountId)
+        const count = (callCounts.get(accountId) ?? 0) + 1
+        callCounts.set(accountId, count)
+
+        if (scenario === "stream-wrap") {
+            if (accountId === "s1" && count === 1) throw makeModelMismatchError()
+            if (accountId === "s2" && count >= 2) throw makeModelMismatchError()
+            if (accountId === "s3") throw makeModelMismatchError()
+        }
+        yield { type: "start" as const, model: "claude-opus-4-5-thinking" }
+        yield { type: "text_delta" as const, text: "ok" }
+        yield { type: "finish" as const, stopReason: "end_turn" as const }
+    },
 }))
 
 mock.module("~/services/antigravity/account-manager", () => ({
@@ -129,7 +146,9 @@ mock.module("~/services/antigravity/account-manager", () => ({
     },
 }))
 
+const realConfig = await import("~/services/routing/config")
 mock.module("~/services/routing/config", () => ({
+    ...realConfig,
     loadRoutingConfig: () => routingConfig,
 }))
 

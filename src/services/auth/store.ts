@@ -15,11 +15,13 @@ interface StoredAuthFile {
     email?: string
     login?: string
     label?: string
+    proxy?: string
     auth_source?: string
     access_token: string
     refresh_token?: string
     expires_at?: number
     project_id?: string
+    plan?: string
     organization_id?: string
     server_url?: string
     metadata?: Record<string, unknown>
@@ -82,6 +84,7 @@ function toSummary(account: ProviderAccount): ProviderAccountSummary {
         email: account.email,
         login: account.login,
         label: account.label,
+        proxy: account.proxy,
         expiresAt: account.expiresAt,
     }
 }
@@ -89,27 +92,32 @@ function toSummary(account: ProviderAccount): ProviderAccountSummary {
 function loadAccountFromFile(path: string): ProviderAccount | null {
     try {
         tightenPrivateFile(path)
-        const raw = JSON.parse(readFileSync(path, "utf-8")) as StoredAuthFile
-        const provider = storedTypeToProvider(raw.type)
-        if (!provider || !raw.access_token || !raw.id) {
+        const raw = JSON.parse(readFileSync(path, "utf-8")) as any
+        const typeStr = raw.type || raw.provider || ""
+        const provider = storedTypeToProvider(typeStr)
+        const accessToken = raw.access_token || raw.accessToken || raw.apiKey
+        const id = raw.id || raw.login || raw.email
+        if (!provider || !accessToken || !id) {
             return null
         }
         return {
-            id: raw.id,
+            id,
             provider,
             email: raw.email,
-            login: raw.login,
-            label: raw.label,
-            accessToken: raw.access_token,
-            refreshToken: raw.refresh_token,
-            expiresAt: raw.expires_at,
-            projectId: raw.project_id,
-            organizationId: raw.organization_id,
-            serverUrl: raw.server_url,
-            authSource: raw.auth_source as ProviderAccount["authSource"],
+            login: raw.login || (provider === "copilot" ? id : undefined),
+            label: raw.label || raw.displayName || (provider === "copilot" ? (raw.login || id) : undefined),
+            proxy: raw.proxy,
+            accessToken,
+            refreshToken: raw.refresh_token || raw.refreshToken,
+            expiresAt: raw.expires_at || raw.expiresAt,
+            projectId: raw.project_id || raw.projectId,
+            plan: raw.plan,
+            organizationId: raw.organization_id || raw.organizationId,
+            serverUrl: raw.server_url || raw.serverUrl,
+            authSource: (raw.auth_source || raw.authSource) as ProviderAccount["authSource"],
             metadata: raw.metadata,
-            createdAt: raw.created_at,
-            updatedAt: raw.updated_at,
+            createdAt: raw.created_at || raw.createdAt,
+            updatedAt: raw.updated_at || raw.updatedAt,
         }
     } catch (error) {
         consola.warn("Failed to parse auth file:", path, safeErrorMessage(error))
@@ -130,11 +138,13 @@ function writeAccountFile(account: ProviderAccount): void {
         email: account.email,
         login: account.login,
         label: account.label,
+        proxy: account.proxy,
         auth_source: account.authSource,
         access_token: account.accessToken,
         refresh_token: account.refreshToken,
         expires_at: account.expiresAt,
         project_id: account.projectId,
+        plan: account.plan,
         organization_id: account.organizationId,
         server_url: account.serverUrl,
         metadata: account.metadata,
@@ -198,6 +208,21 @@ export const authStore = {
     saveAccount(account: ProviderAccount): void {
         writeAccountFile(account)
         invalidateAccountCache()
+    },
+
+    updateAccountOptions(
+        provider: AuthProvider,
+        id: string,
+        options: { proxy?: string; label?: string; projectId?: string; plan?: string }
+    ): ProviderAccount | null {
+        const account = this.getAccount(provider, id)
+        if (!account) return null
+        if (options.proxy !== undefined) account.proxy = options.proxy.trim() || undefined
+        if (options.label !== undefined) account.label = options.label.trim() || undefined
+        if (options.projectId !== undefined) account.projectId = options.projectId.trim() || undefined
+        if (options.plan !== undefined) account.plan = options.plan.trim().toLowerCase() || undefined
+        this.saveAccount(account)
+        return account
     },
 
     deleteAccount(provider: AuthProvider, id: string): boolean {

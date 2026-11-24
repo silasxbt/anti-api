@@ -85,3 +85,42 @@ test("OpenAI rejects malformed tool definitions as request validation errors", (
     expect(() => translateTools([{ function: null }] as any)).toThrow(RequestValidationError)
     expect(() => translateTools([{ function: { name: "lookup", parameters: [] } }] as any)).toThrow(RequestValidationError)
 })
+
+test("OpenAI audio content supports input_audio and audio_url", () => {
+    const inputAudio = translateOpenAIContent([
+        { type: "text", text: "transcribe" },
+        { type: "input_audio", input_audio: { data: "AQID", format: "mp3" } },
+    ])
+
+    expect(inputAudio).toEqual([
+        { type: "text", text: "transcribe" },
+        { type: "audio", source: { type: "base64", media_type: "audio/mp3", data: "AQID" } },
+    ])
+
+    const roundTrip = toOpenAIMessages([{ role: "user", content: inputAudio as any }])
+    expect(roundTrip[0].content).toEqual([
+        { type: "text", text: "transcribe" },
+        { type: "input_audio", input_audio: { data: "AQID", format: "mp3" } },
+    ])
+
+    const audioUrl = translateOpenAIContent([
+        { type: "audio_url", audio_url: { url: "data:audio/wav;base64,AQID" } },
+    ])
+    expect(audioUrl).toEqual([
+        { type: "audio", source: { type: "base64", media_type: "audio/wav", data: "AQID" } },
+    ])
+
+    const audioInImageUrl = translateOpenAIContent([
+        { type: "image_url", image_url: { url: "data:audio/ogg;base64,AQID" } },
+    ])
+    expect(audioInImageUrl).toEqual([
+        { type: "audio", source: { type: "base64", media_type: "audio/ogg", data: "AQID" } },
+    ])
+
+    const remoteAudio = translateOpenAIContent([
+        { type: "audio_url", audio_url: { url: "https://example.com/sound.mp3" } },
+    ])
+    expect(remoteAudio).toEqual([
+        { type: "audio", source: { type: "url", url: "https://example.com/sound.mp3" } },
+    ])
+})

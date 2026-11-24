@@ -40,8 +40,13 @@ mock.module("~/services/kiro/oauth", () => ({
     getKiroRegion: () => "us-east-1",
 }))
 
+// Keep the real store for everything but markSuccess: bun module mocks leak into later test files.
+const realStore = await import("../src/services/auth/store")
 mock.module("~/services/auth/store", () => ({
-    authStore: { markSuccess: () => { } },
+    ...realStore,
+    authStore: new Proxy(realStore.authStore, {
+        get: (target, key) => (key === "markSuccess" ? () => { } : Reflect.get(target, key)),
+    }),
 }))
 
 const { createKiroCompletion } = await import(`../src/services/kiro/chat.ts?${Date.now()}`)

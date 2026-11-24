@@ -54,9 +54,31 @@ export interface AnthropicToolUseBlock {
     input: Record<string, unknown>
 }
 
+export interface AnthropicAudioBlock {
+    type: "audio"
+    source: {
+        type: "base64" | "url"
+        media_type: string
+        data?: string
+        url?: string
+    }
+}
+
+export interface AnthropicDocumentBlock {
+    type: "document"
+    source: {
+        type: "base64" | "url"
+        media_type: string
+        data?: string
+        url?: string
+    }
+}
+
 export type AnthropicContentBlock =
     | AnthropicTextBlock
     | AnthropicImageBlock
+    | AnthropicAudioBlock
+    | AnthropicDocumentBlock
     | AnthropicToolResultBlock
     | AnthropicToolUseBlock
 
@@ -79,6 +101,8 @@ export interface AnthropicResponse {
     usage: {
         input_tokens: number
         output_tokens: number
+        cache_read_input_tokens?: number
+        cache_creation_input_tokens?: number
     }
 }
 
@@ -119,6 +143,8 @@ export interface AnthropicMessageDeltaEvent {
         stop_sequence?: string | null
     }
     usage?: {
+        input_tokens?: number
+        cache_read_input_tokens?: number
         output_tokens: number
     }
 }

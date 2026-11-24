@@ -13,28 +13,29 @@ let tempHome: string | null = null
 let prevHome: string | undefined
 let prevProfile: string | undefined
 
-mock.module("~/services/auth/store", () => ({
-    authStore: {
-        listAccounts: (_provider?: Provider) => [],
-        listSummaries: (_provider?: Provider) => [],
-        getAccount: () => null,
-    },
-}))
+const realStore = await import("../src/services/auth/store")
+mock.module("~/services/auth/store", () => realStore)
 
 mock.module("~/services/antigravity/account-manager", () => ({
     accountManager: {
         load: () => { },
         clearAllRateLimits: () => { },
         hasAccount: () => true,
+        addAccount: () => { },
     },
 }))
 
+const realCopilot = await import("../src/services/copilot/chat")
 mock.module("~/services/copilot/chat", () => ({
+    ...realCopilot,
     createCopilotCompletion: async () => ({ contentBlocks: [], stopReason: "end_turn", usage: {} }),
+    getCopilotReasoningEfforts: () => [],
     listCopilotModelsForAccount: async (_account: ProviderAccount) => [],
 }))
 
+const realCodex = await import("../src/services/codex/chat")
 mock.module("~/services/codex/chat", () => ({
+    ...realCodex,
     createCodexCompletion: async () => ({ contentBlocks: [], stopReason: "end_turn", usage: {} }),
     listCodexModelsForAccount: async (_account: ProviderAccount) => [],
     isCodexModelSupportedForAccount: () => undefined,

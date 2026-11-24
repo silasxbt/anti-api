@@ -3,7 +3,7 @@
  */
 
 import { Hono } from "hono"
-import { isAuthenticated, getUserInfo, setAuth, clearAuth, startOAuthLogin } from "~/services/antigravity/login"
+import { isAuthenticated, getUserInfo, setAuth, clearAuth, getAntigravityLoginUrl, loginWithAuthCode } from "~/services/antigravity/login"
 import { accountManager } from "~/services/antigravity/account-manager"
 import { state } from "~/lib/state"
 import { authStore } from "~/services/auth/store"
@@ -15,16 +15,21 @@ import { importKiroAuthSources } from "~/services/kiro/oauth"
 import { runAccountDiagnostics } from "~/services/auth/diagnostics"
 import { isLoopbackHost } from "~/lib/local-request"
 import { safeErrorMessage } from "~/lib/redaction"
+import { importAgyAuthSources, exchangeAuthCode, getAgyAuthStatus } from "~/services/antigravity/agy-auth"
 
 export const authRouter = new Hono()
 
 // 获取认证状态
 authRouter.get("/status", (c) => {
     const userInfo = getUserInfo()
+    accountManager.load()
+    const antigravityAccounts = authStore.listAccounts("antigravity")
+    const isAuthed = isAuthenticated() && antigravityAccounts.length > 0
     return c.json({
-        authenticated: isAuthenticated(),
-        email: userInfo.email,
-        name: userInfo.name,
+        authenticated: isAuthed,
+        email: userInfo.email || (antigravityAccounts[0]?.email ?? null),
+        name: userInfo.name || null,
+        requiresReauth: !isAuthed,
     })
 })
 
@@ -47,10 +52,92 @@ authRouter.get("/export", (c) => {
     return c.json({ success: false, error: "Credential bundle export/import has been removed." }, 410)
 })
 
-// Credential export/import has been removed.
-authRouter.post("/import", (c) => {
-    return c.json({ success: false, error: "Credential bundle export/import has been removed." }, 410)
+// Import credenziali da file JSON (trascinato da Web UI)
+authRouter.post("/import", async (c) => {
+    try {
+        const payload = await c.req.json()
+        const accountsToImport = Array.isArray(payload)
+            ? payload
+            : (Array.isArray(payload.accounts) ? payload.accounts : [payload])
+
+        accountManager.load()
+        let importedCount = 0
+        let lastEmail = ""
+
+        for (const item of accountsToImport) {
+            const accessToken = item.accessToken || item.access_token || item.apiKey
+            const refreshToken = item.refreshToken || item.refresh_token || ""
+            const email = item.userEmail || item.email || item.login || item.id || "unknown"
+            const name = item.userName || item.name || email.split("@")[0]
+            const projectId = item.projectId || item.cloudaicompanionProject || "aicode-consumers"
+            const expiresAt = item.expiresAt || item.expires_at || (Date.now() + 3600 * 1000)
+
+            if (!accessToken && !refreshToken) continue
+
+            const providerType = (item.provider || item.type || "").toLowerCase()
+            if (providerType === "copilot" || providerType === "github-copilot") {
+                const login = item.login || item.id || name
+                authStore.saveAccount({
+                    id: item.id || login,
+                    provider: "copilot",
+                    login,
+                    label: item.label || item.displayName || login,
+                    accessToken: accessToken || "",
+                    refreshToken,
+                    expiresAt,
+                })
+                lastEmail = login
+                importedCount++
+                continue
+            }
+
+            if (providerType === "codex" || providerType === "chatgpt") {
+                const login = item.email || item.login || item.id || name
+                authStore.saveAccount({
+                    id: item.id || login,
+                    provider: "codex",
+                    email: item.email || login,
+                    login,
+                    label: item.label || item.displayName || login,
+                    accessToken: accessToken || "",
+                    refreshToken,
+                    expiresAt,
+                })
+                lastEmail = login
+                importedCount++
+                continue
+            }
+
+            accountManager.addAccount({
+                id: email || `account-${Date.now()}`,
+                email,
+                accessToken: accessToken || "",
+                refreshToken: refreshToken || "",
+                expiresAt,
+                projectId,
+            })
+            if (!state.accessToken && accessToken) {
+                setAuth(accessToken, refreshToken, email, name)
+            }
+            lastEmail = email
+            importedCount++
+        }
+
+        if (importedCount === 0) {
+            return c.json({ success: false, error: "Nessuna credenziale valida trovata nel file JSON." }, 400)
+        }
+
+        return c.json({
+            success: true,
+            imported: importedCount,
+            email: lastEmail,
+            message: `Importato con successo ${importedCount} account.`
+        })
+    } catch (e) {
+        return c.json({ success: false, error: safeErrorMessage(e) || "Errore nella lettura del JSON" }, 400)
+    }
 })
+
 
 // 登录（触发 OAuth 或设置 token）
 authRouter.post("/login", async (c) => {
@@ -59,6 +146,8 @@ authRouter.post("/login", async (c) => {
         let body: {
             accessToken?: string
             refreshToken?: string
+            code?: string
+            redirectUri?: string
             email?: string
             name?: string
             provider?: string
@@ -68,6 +157,9 @@ authRouter.post("/login", async (c) => {
             profileArn?: string
             region?: string
             apiRegion?: string
+            projectId?: string
+            proxy?: string
+            label?: string
         } = {}
         try {
             const text = await c.req.text()
@@ -212,47 +304,52 @@ authRouter.post("/login", async (c) => {
         }
 
         // 默认 Antigravity
-        if (!body.accessToken) {
-            const result = await startOAuthLogin()
-            if (result.success) {
-                accountManager.load()
-                if (state.accessToken && state.refreshToken) {
-                    accountManager.addAccount({
-                        id: state.userEmail || `account-${Date.now()}`,
-                        email: state.userEmail || "unknown",
-                        accessToken: state.accessToken,
-                        refreshToken: state.refreshToken,
-                        expiresAt: state.tokenExpiresAt || 0,
-                        projectId: state.cloudaicompanionProject,
-                    })
-                }
+        if (body.code) {
+            const exchangeResult = await loginWithAuthCode(body.code, (body as any).redirectUri)
+            if (exchangeResult.success) {
                 return c.json({
                     success: true,
                     authenticated: true,
                     provider: "antigravity",
-                    email: result.email,
+                    status: "success",
+                    email: exchangeResult.email,
                 })
             } else {
-                return c.json({ success: false, error: result.error }, 400)
+                return c.json({ success: false, error: exchangeResult.error }, 400)
             }
         }
 
-        setAuth(body.accessToken, body.refreshToken, body.email, body.name)
+        if (!body.accessToken) {
+            // Base flow for Docker & remote server: return Google OAuth authorization link
+            return c.json({
+                success: true,
+                status: "pending",
+                provider: "antigravity",
+                auth_url: getAntigravityLoginUrl(),
+                instructions: "Open auth_url in your browser, sign in with Google, and copy the authorization code to complete login.",
+            })
+        }
+
+        const email = body.email || (body as any).userEmail
+        const name = body.name || (body as any).userName
+        const projectId = body.projectId || (body as any).cloudaicompanionProject || state.cloudaicompanionProject
+
+        setAuth(body.accessToken, body.refreshToken, email, name)
         accountManager.load()
         accountManager.addAccount({
-            id: body.email || `account-${Date.now()}`,
-            email: body.email || "unknown",
+            id: email || `account-${Date.now()}`,
+            email: email || "unknown",
             accessToken: body.accessToken,
             refreshToken: body.refreshToken || "",
             expiresAt: state.tokenExpiresAt || 0,
-            projectId: state.cloudaicompanionProject,
+            projectId,
         })
         return c.json({
             success: true,
             authenticated: true,
             provider: "antigravity",
-            email: body.email,
-            name: body.name,
+            email: email,
+            name: name,
         })
     } catch {
         return c.json({ error: "Authentication request failed. Check provider setup and retry." }, 500)
@@ -326,8 +423,17 @@ authRouter.post("/logout", (c) => {
 
 // ====== IDE 登出 ======
 
-// 查看 IDE 当前登录状态
-authRouter.get("/ide/status", (c) => {
+// 查看 IDE / agy 当前登录状态
+authRouter.get("/ide/status", async (c) => {
+    const agyStatus = await getAgyAuthStatus()
+    if (agyStatus.loggedIn) {
+        return c.json({
+            loggedIn: true,
+            email: agyStatus.email,
+            name: agyStatus.email?.split("@")[0] || null,
+            source: "agy",
+        })
+    }
     const status = getIdeAuthStatus()
     return c.json(status)
 })
@@ -349,3 +455,14 @@ authRouter.post("/ide/logout", async (c) => {
         return c.json({ success: false, error: safeErrorMessage(error) }, 500)
     }
 })
+
+// ====== Antigravity CLI (agy) ======
+
+authRouter.get("/agy/status", async (c) => {
+    return c.json(await getAgyAuthStatus())
+})
+
+authRouter.post("/agy/import", async (c) => {
+    return c.json(await importAgyAuthSources())
+})
+
