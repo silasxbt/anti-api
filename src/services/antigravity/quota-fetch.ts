@@ -12,6 +12,9 @@ export type AntigravityModelInfo = {
     resetTime?: string
     maxTokens?: number
     maxOutputTokens?: number
+    supportsImages?: boolean
+    supportsVideo?: boolean
+    inputModalities?: string[]
 }
 
 export type AntigravityQuotaBucket = {
@@ -97,14 +100,33 @@ export async function fetchAntigravityModels(
                         quotaInfo?: { remainingFraction?: number; resetTime?: string }
                         maxTokens?: number
                         maxOutputTokens?: number
+                        supportsImages?: boolean
+                        supportsVideo?: boolean
+                        supportedMimeTypes?: Record<string, boolean>
                     }>
                 }
 
                 const models: Record<string, AntigravityModelInfo> = {}
                 for (const [name, info] of Object.entries(data.models || {})) {
+                    const mimes = Object.entries(info.supportedMimeTypes || {})
+                        .filter(([, allowed]) => allowed !== false)
+                        .map(([mime]) => mime.toLowerCase())
+                    const hasImageMime = mimes.some(mime => mime.startsWith("image/"))
+                    const hasAudioMime = mimes.some(mime => mime.startsWith("audio/"))
+                    const supportsImages = info.supportsImages === true || hasImageMime
+                    const supportsVideo = info.supportsVideo === true
+                    const inputModalities = [
+                        "text",
+                        ...(supportsImages ? ["image"] : []),
+                        ...(hasAudioMime ? ["audio"] : []),
+                        ...(supportsVideo ? ["video"] : []),
+                    ]
                     const entry: AntigravityModelInfo = {
                         remainingFraction: info.quotaInfo?.remainingFraction ?? 0,
                         resetTime: info.quotaInfo?.resetTime,
+                        supportsImages,
+                        supportsVideo,
+                        inputModalities,
                     }
                     if (typeof info.maxTokens === "number" && Number.isFinite(info.maxTokens) && info.maxTokens > 0) {
                         entry.maxTokens = Math.floor(info.maxTokens)

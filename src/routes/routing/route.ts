@@ -232,19 +232,29 @@ function copilotModelLimits(model: CopilotModelInfo): Pick<ProviderModelOption, 
     return out
 }
 
+function copilotModelCapabilities(model: CopilotModelInfo): Pick<ProviderModelOption, "supportsVision" | "inputModalities"> {
+    const vision = model.capabilities?.supports?.vision
+    if (typeof vision !== "boolean") return {}
+    return {
+        supportsVision: vision,
+        inputModalities: vision ? ["text", "image"] : ["text"],
+    }
+}
+
 /** Copilot models as the account really has them, plus per-effort variants when the model advertises reasoning effort. */
 function copilotModelOptions(remote: CopilotModelInfo[]): ProviderModelOption[] {
     const options: ProviderModelOption[] = []
     for (const model of remote) {
         const name = model.name?.trim() || model.id
         const limits = copilotModelLimits(model)
-        options.push({ id: model.id, label: `Copilot - ${name}`, ...limits })
+        const caps = copilotModelCapabilities(model)
+        options.push({ id: model.id, label: `Copilot - ${name}`, ...limits, ...caps })
         const efforts = getCopilotReasoningEfforts(model).filter(e => e === "low" || e === "medium" || e === "high")
         for (const effort of efforts) {
-            options.push({ id: `${model.id}-${effort}`, label: `Copilot - ${name} (${effort})`, ...limits })
+            options.push({ id: `${model.id}-${effort}`, label: `Copilot - ${name} (${effort})`, ...limits, ...caps })
         }
         if (model.id === "copilot-auto" || (efforts.includes("high") && !options.some(o => o.id === `${model.id}-thinking`))) {
-            options.push({ id: `${model.id}-thinking`, label: `Copilot - ${name} (thinking)`, ...limits })
+            options.push({ id: `${model.id}-thinking`, label: `Copilot - ${name} (thinking)`, ...limits, ...caps })
         }
     }
     return options
@@ -286,6 +296,8 @@ export async function syncProviderModels(
                 label: `Antigravity - ${id}`,
                 ...(typeof info.maxTokens === "number" && info.maxTokens > 0 ? { maxInputTokens: info.maxTokens } : {}),
                 ...(typeof info.maxOutputTokens === "number" && info.maxOutputTokens > 0 ? { maxOutputTokens: info.maxOutputTokens } : {}),
+                ...(typeof info.supportsImages === "boolean" ? { supportsVision: info.supportsImages } : {}),
+                ...(info.inputModalities?.length ? { inputModalities: info.inputModalities } : {}),
             }))
         }, perAccountTimeoutMs),
         triggerProviderSync("zed", "Zed", zedAccounts, now, async (account) => {

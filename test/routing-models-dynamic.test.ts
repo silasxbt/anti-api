@@ -134,3 +134,31 @@ test("base models inherit context limits from variant siblings only exposed upst
     expect(hydrogen?.maxOutputTokens).toBe(262144)
     expect(medium?.maxInputTokens).toBe(1048576)
 })
+
+test("antigravity base and catalog entries inherit upstream vision and input modalities", () => {
+    setDynamicAntigravityModels([
+        {
+            id: "gemini-4-hydrogen-xhigh",
+            label: "Antigravity - gemini-4-hydrogen-xhigh",
+            maxInputTokens: 1048576,
+            supportsVision: true,
+            inputModalities: ["text", "image", "audio", "video"],
+        },
+        {
+            id: "gpt-oss-120b-medium",
+            label: "Antigravity - gpt-oss-120b-medium",
+            maxInputTokens: 131072,
+            supportsVision: false,
+            inputModalities: ["text"],
+        },
+    ])
+
+    const models = getProviderModels("antigravity", { includeAllVariants: true })
+    const hydrogen = models.find((model: { id: string }) => model.id === "gemini-4-hydrogen")
+    const gptOss = models.find((model: { id: string }) => model.id === "gpt-oss-120b")
+
+    expect(hydrogen?.supportsVision).toBe(true)
+    expect(hydrogen?.inputModalities).toEqual(["text", "image", "audio", "video"])
+    expect(gptOss?.supportsVision).toBe(false)
+    expect(gptOss?.inputModalities).toEqual(["text"])
+})

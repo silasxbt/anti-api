@@ -24,6 +24,8 @@ export interface ProviderModelOption {
     label: string
     maxInputTokens?: number
     maxOutputTokens?: number
+    supportsVision?: boolean
+    inputModalities?: string[]
 }
 
 // No hardcoded model lists: every provider's models are discovered online per account (see syncProviderModels).
@@ -63,6 +65,17 @@ function getStore(provider: AuthProvider): ProviderModelStore {
     return store
 }
 
+function sanitizeModalities(raw: unknown): string[] | undefined {
+    if (!Array.isArray(raw)) return undefined
+    const seen = new Set<string>()
+    for (const item of raw) {
+        if (typeof item !== "string") continue
+        const norm = item.trim().toLowerCase()
+        if (norm) seen.add(norm)
+    }
+    return seen.size > 0 ? Array.from(seen) : undefined
+}
+
 function sanitizeModelOptions(
     models: ProviderModelOption[],
     prefix: string,
@@ -81,6 +94,13 @@ function sanitizeModelOptions(
         if (typeof model?.maxOutputTokens === "number" && Number.isFinite(model.maxOutputTokens) && model.maxOutputTokens > 0) {
             entry.maxOutputTokens = Math.floor(model.maxOutputTokens)
         }
+        if (typeof model?.supportsVision === "boolean") {
+            entry.supportsVision = model.supportsVision
+        }
+        const modalities = sanitizeModalities(model?.inputModalities)
+        if (modalities) {
+            entry.inputModalities = modalities
+        }
         if (filter && !filter(entry)) continue
         deduped.set(id, entry)
     }
@@ -95,15 +115,24 @@ function mergeModelOptions(...groups: ProviderModelOption[][]): ProviderModelOpt
             const existing = merged.get(model.id)
             if (!existing) {
                 merged.set(model.id, model)
-            } else if (!hasContextMetadata(existing) && hasContextMetadata(model)) {
-                // Catalog/static entries never carry upstream limits: keep their
-                // display labels and attach the discovered entry's limits to them.
-                merged.set(model.id, {
-                    ...existing,
-                    label: existing.label || model.label,
-                    maxInputTokens: model.maxInputTokens,
-                    maxOutputTokens: model.maxOutputTokens,
-                })
+            } else {
+                const needContext = !hasContextMetadata(existing) && hasContextMetadata(model)
+                const needVision = typeof existing.supportsVision !== "boolean" && typeof model.supportsVision === "boolean"
+                const needModalities = !existing.inputModalities?.length && Boolean(model.inputModalities?.length)
+                if (needContext || needVision || needModalities) {
+                    // Catalog/static entries never carry upstream metadata: keep their
+                    // display labels and attach the discovered entry's limits/capabilities.
+                    merged.set(model.id, {
+                        ...existing,
+                        label: existing.label || model.label,
+                        ...(needContext ? {
+                            maxInputTokens: model.maxInputTokens,
+                            maxOutputTokens: model.maxOutputTokens,
+                        } : {}),
+                        ...(needVision ? { supportsVision: model.supportsVision } : {}),
+                        ...(needModalities ? { inputModalities: model.inputModalities } : {}),
+                    })
+                }
             }
         }
     }
@@ -115,27 +144,55 @@ function hasContextMetadata(model: ProviderModelOption): boolean {
 }
 
 /**
- * Upstream often reports token limits only on effort/thinking variants
- * (e.g. `model-xhigh`) while the catalog synthesizes the base entry. Propagate
- * the largest limits seen among variant siblings onto metadata-free entries of
- * the same family so exposed base models carry the real context window.
+ * Upstream often reports token limits and capabilities only on effort/thinking
+ * variants (e.g. `model-xhigh`) while the catalog synthesizes the base entry.
+ * Propagate limits and modality/vision capabilities seen among variant siblings
+ * onto metadata-free entries of the same family so exposed base models carry them.
  */
 function attachFamilyContextLimits(models: ProviderModelOption[]): ProviderModelOption[] {
     const limitsByBase = new Map<string, { maxInputTokens?: number; maxOutputTokens?: number }>()
+    const capsByBase = new Map<string, { supportsVision?: boolean; inputModalities: Set<string> }>()
     for (const model of models) {
-        if (!hasContextMetadata(model)) continue
         const baseId = model.id.replace(/-(xhigh|high|low|medium|thinking)$/, "")
         if (baseId === model.id) continue
-        const current = limitsByBase.get(baseId)
-        const maxInput = Math.max(current?.maxInputTokens ?? 0, model.maxInputTokens!)
-        const maxOutput = Math.max(current?.maxOutputTokens ?? 0, model.maxOutputTokens ?? 0)
-        limitsByBase.set(baseId, { maxInputTokens: maxInput, maxOutputTokens: maxOutput })
+        if (hasContextMetadata(model)) {
+            const current = limitsByBase.get(baseId)
+            const maxInput = Math.max(current?.maxInputTokens ?? 0, model.maxInputTokens!)
+            const maxOutput = Math.max(current?.maxOutputTokens ?? 0, model.maxOutputTokens ?? 0)
+            limitsByBase.set(baseId, { maxInputTokens: maxInput, maxOutputTokens: maxOutput })
+        }
+        if (typeof model.supportsVision === "boolean" || model.inputModalities?.length) {
+            const currentCaps = capsByBase.get(baseId) ?? { inputModalities: new Set<string>() }
+            if (model.supportsVision === true) {
+                currentCaps.supportsVision = true
+            } else if (model.supportsVision === false && currentCaps.supportsVision === undefined) {
+                currentCaps.supportsVision = false
+            }
+            for (const mod of model.inputModalities || []) {
+                currentCaps.inputModalities.add(mod)
+            }
+            capsByBase.set(baseId, currentCaps)
+        }
     }
     return models.map(model => {
-        if (hasContextMetadata(model)) return model
-        const limits = limitsByBase.get(model.id)
-        if (!limits) return model
-        return { ...model, ...limits }
+        let updated = model
+        if (!hasContextMetadata(updated)) {
+            const limits = limitsByBase.get(model.id)
+            if (limits) updated = { ...updated, ...limits }
+        }
+        const caps = capsByBase.get(model.id)
+        if (caps) {
+            const needVision = typeof updated.supportsVision !== "boolean" && typeof caps.supportsVision === "boolean"
+            const needModalities = !updated.inputModalities?.length && caps.inputModalities.size > 0
+            if (needVision || needModalities) {
+                updated = {
+                    ...updated,
+                    ...(needVision ? { supportsVision: caps.supportsVision } : {}),
+                    ...(needModalities ? { inputModalities: Array.from(caps.inputModalities) } : {}),
+                }
+            }
+        }
+        return updated
     })
 }
 

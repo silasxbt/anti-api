@@ -25,7 +25,7 @@ let remoteModels: Array<{
     capabilities?: {
         type?: string
         limits?: { max_context_window_tokens?: number; max_prompt_tokens?: number; max_output_tokens?: number }
-        supports?: { reasoning_effort?: string[] | boolean }
+        supports?: { reasoning_effort?: string[] | boolean; vision?: boolean }
     }
 }> = []
 const syncedWithAccountIds: string[] = []
@@ -302,7 +302,7 @@ test("syncProviderModels preserves context limits on copilot-auto and its varian
             capabilities: {
                 type: "chat",
                 limits: { max_context_window_tokens: 1050000, max_prompt_tokens: 922000, max_output_tokens: 128000 },
-                supports: { reasoning_effort: ["low", "medium", "high"] },
+                supports: { reasoning_effort: ["low", "medium", "high"], vision: true },
             },
         },
     ]
@@ -315,6 +315,10 @@ test("syncProviderModels preserves context limits on copilot-auto and its varian
     const autoThinking = all.find((m: { id: string }) => m.id === "copilot-auto-thinking")
     expect(auto?.maxInputTokens).toBe(1050000)
     expect(auto?.maxOutputTokens).toBe(128000)
+    expect(auto?.supportsVision).toBe(true)
+    expect(auto?.inputModalities).toEqual(["text", "image"])
     expect(autoThinking?.maxInputTokens).toBe(1050000)
     expect(autoThinking?.maxOutputTokens).toBe(128000)
+    expect(autoThinking?.supportsVision).toBe(true)
+    expect(autoThinking?.inputModalities).toEqual(["text", "image"])
 })

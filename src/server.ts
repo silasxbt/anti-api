@@ -64,6 +64,8 @@ interface ModelListEntry {
     max_output_tokens?: number
     context_window?: number
     context_length?: number
+    supports_vision?: boolean
+    input_modalities?: string[]
 }
 
 initLogCapture()
@@ -371,6 +373,8 @@ function computeModelsCatalog() {
                 ? { max_input_tokens: model.maxInputTokens, context_window: model.maxInputTokens, context_length: model.maxInputTokens }
                 : {}),
             ...(model.maxOutputTokens ? { max_output_tokens: model.maxOutputTokens } : {}),
+            ...(typeof model.supportsVision === "boolean" ? { supports_vision: model.supportsVision } : {}),
+            ...(model.inputModalities?.length ? { input_modalities: model.inputModalities } : {}),
         }))
     )
 
@@ -386,6 +390,8 @@ function computeModelsCatalog() {
             id: "gemini-transcribe",
             name: "Gemini Transcribe",
             owned_by: "antigravity",
+            supports_vision: false,
+            input_modalities: ["audio"],
         })
     }
 
@@ -426,6 +432,14 @@ const modelsHandler = async (c: any) => {
                 context_length: m.context_length,
             } : {}),
             ...(m.max_output_tokens ? { max_output_tokens: m.max_output_tokens } : {}),
+            ...(typeof m.supports_vision === "boolean" ? {
+                supports_vision: m.supports_vision,
+                capabilities: { vision: m.supports_vision },
+            } : {}),
+            ...(m.input_modalities?.length ? {
+                architecture: { input_modalities: m.input_modalities, output_modalities: ["text"] },
+                modalities: { input: m.input_modalities, output: ["text"] },
+            } : {}),
         })),
         has_more: false,
         first_id: models[0]?.id,
