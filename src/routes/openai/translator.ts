@@ -29,6 +29,7 @@ export function translateMessages(messages: OpenAIMessage[]): ClaudeMessage[] {
                     id: tc.id,
                     name: tc.function.name,
                     input: JSON.parse(tc.function.arguments || "{}"),
+                    ...(tc.extra_content ? { extra_content: tc.extra_content } : {}),
                 })),
             }
         }
@@ -109,6 +110,7 @@ export function buildStreamChunk(
             id: tc.id,
             type: "function",
             function: { name: tc.name, arguments: JSON.stringify(tc.input) },
+            ...(tc.extra_content ? { extra_content: tc.extra_content } : {}),
         }))
     }
 

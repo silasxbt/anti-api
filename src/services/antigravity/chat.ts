@@ -145,6 +145,14 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: nu
 }
 
 const MODEL_MAPPING: Record<string, string> = {
+    "gemini-4-argon": "gemini-4-argon-medium",
+    "gemini-4-argon-low": "gemini-4-argon-low",
+    "gemini-4-argon-medium": "gemini-4-argon-medium",
+    "gemini-4-argon-high": "gemini-4-argon-high",
+    "gemini-3.8-flash-tiered": "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-low": "gemini-3.8-flash-low",
+    "gemini-3.8-flash-medium": "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-high": "gemini-3.8-flash-high",
     "claude-sonnet-4-5": "claude-sonnet-4-5",
     "claude-sonnet-4-5-thinking": "claude-sonnet-4-5-thinking",
     "claude-opus-4-5-thinking": "claude-opus-4-5-thinking",
@@ -244,6 +252,36 @@ function generateToolUseId(): string {
     return `toolu_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`
 }
 
+// Gemini 3 rejects replayed functionCall parts that lack a thought_signature.
+// The signature only exists at the part level of the model's original response,
+// so keep a per-request id→signature map and re-emit it on the next turn.
+const DUMMY_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
+const thoughtSignatureCache = new Map<string, string>()
+
+function needsThoughtSignature(toolName: string, modelName: string): boolean {
+    if (/^gemini-[34]/i.test(modelName)) return true
+    return /^(default_api:|google:|system:)?(terminal|execute_code|bash|shell|exec|run_command|write_file|read_file|edit_file|apply_patch|codebase_search|search|list_dir|search_web|search_code)/.test(toolName)
+}
+
+function extractThoughtSignature(part: any): string | null {
+    const sig = part?.thoughtSignature || part?.thought_signature
+    return typeof sig === "string" && sig.length > 0 ? sig : null
+}
+
+function rememberThoughtSignature(toolCallId: string, signature: string): void {
+    if (!toolCallId || !signature) return
+    if (thoughtSignatureCache.has(toolCallId)) return
+    if (thoughtSignatureCache.size > 4096) {
+        const firstKey = thoughtSignatureCache.keys().next().value
+        if (firstKey) thoughtSignatureCache.delete(firstKey)
+    }
+    thoughtSignatureCache.set(toolCallId, signature)
+}
+
+function getThoughtSignatureForId(toolCallId: string): string | undefined {
+    return thoughtSignatureCache.get(toolCallId)
+}
+
 function parseFunctionCallArgs(args: unknown): any {
     if (args == null) return {}
     if (typeof args === "string") {
@@ -256,7 +294,7 @@ function parseFunctionCallArgs(args: unknown): any {
     return args
 }
 
-function buildAntigravityParts(content: ClaudeMessage["content"], toolIdToName: Map<string, string>): any[] {
+function buildAntigravityParts(content: ClaudeMessage["content"], toolIdToName: Map<string, string>, modelName: string): any[] {
     if (typeof content === "string") {
         return [{ text: content }]
     }
@@ -289,13 +327,21 @@ function buildAntigravityParts(content: ClaudeMessage["content"], toolIdToName: 
             const toolId = block.id || generateToolUseId()
             const toolName = block.name || toolId
             toolIdToName.set(toolId, toolName)
-            parts.push({
-                functionCall: {
-                    name: toolName,
-                    args: block.input || {},
-                    id: toolId,
-                },
-            })
+            const functionCall: any = {
+                name: toolName,
+                args: block.input || {},
+                id: toolId,
+            }
+            // Gemini 3 requires thought_signature on replayed functionCall parts.
+            // In Gemini 3 the signature is a SIBLING of functionCall on the Part
+            // (in 2.5 it was nested inside functionCall; the 3.x endpoint rejects the nested form).
+            const blockExtra = (block as any).extra_content?.google
+            const signature = (typeof blockExtra?.thought_signature === "string" && blockExtra.thought_signature) || getThoughtSignatureForId(toolId)
+            const part: any = { functionCall }
+            if (needsThoughtSignature(toolName, modelName) && signature) {
+                part.thoughtSignature = signature
+            }
+            parts.push(part)
             continue
         }
 
@@ -308,7 +354,13 @@ function buildAntigravityParts(content: ClaudeMessage["content"], toolIdToName: 
                 response: { result: merged },
             }
             if (toolUseId) functionResponse.id = toolUseId
-            parts.push({ functionResponse })
+            const functionResponsePart: any = { functionResponse }
+            // Gemini 3 also validates functionResponse parts that carry an id.
+            if (toolUseId && needsThoughtSignature(toolName, modelName)) {
+                const signature = getThoughtSignatureForId(toolUseId) || DUMMY_THOUGHT_SIGNATURE
+                functionResponsePart.thoughtSignature = signature
+            }
+            parts.push(functionResponsePart)
             continue
         }
     }
@@ -423,7 +475,7 @@ function claudeToAntigravity(
     const toolIdToName = new Map<string, string>()
     const contents = messages.map((msg) => ({
         role: msg.role === "assistant" ? "model" : msg.role,
-        parts: buildAntigravityParts(msg.content, toolIdToName),
+        parts: buildAntigravityParts(msg.content, toolIdToName, model),
     }))
 
     const sessionId = generateStableSessionId(messages)
@@ -440,11 +492,11 @@ function claudeToAntigravity(
         },
     }
 
-    if (model.includes("claude")) {
+    if (model.includes("claude") || model.includes("gemini")) {
         innerRequest.toolConfig = { functionCallingConfig: buildFunctionCallingConfig(toolChoice) }
     }
 
-    if (tools && tools.length > 0 && model.includes("claude")) {
+    if (tools && tools.length > 0 && (model.includes("claude") || model.includes("gemini"))) {
         innerRequest.tools = tools.map(tool => ({
             functionDeclarations: [{
                 name: tool.name,
@@ -488,11 +540,15 @@ function parseApiResponse(rawResponse: string): ChatResponse {
             if (part.functionCall) {
                 hasToolUse = true
                 const input = parseFunctionCallArgs(part.functionCall.args)
+                const toolCallId = part.functionCall.id || generateToolUseId()
+                const signature = extractThoughtSignature(part)
+                if (signature) rememberThoughtSignature(toolCallId, signature)
                 contentBlocks.push({
                     type: "tool_use",
-                    id: part.functionCall.id || generateToolUseId(),
+                    id: toolCallId,
                     name: part.functionCall.name,
                     input,
+                    ...(signature ? { extra_content: { google: { thought_signature: signature } } } : {}),
                 })
             }
         }
@@ -608,7 +664,12 @@ async function sendRequestSse(
                 }, FETCH_TIMEOUT_MS)
 
                 if (response.ok) {
-                    if (currentAccountId) accountManager.markSuccess(currentAccountId)
+                    if (currentAccountId) {
+                        accountManager.markSuccess(currentAccountId, modelName)
+                        if (antigravityRequest?.model && antigravityRequest.model !== modelName) {
+                            accountManager.markSuccess(currentAccountId, antigravityRequest.model)
+                        }
+                    }
 
                     // Log 200 success with actual account used and elapsed time (green)
                     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
@@ -648,18 +709,7 @@ async function sendRequestSse(
 
                     // 🆕 非配额 429：始终重试同一账号，不切换
                     if (!quotaExhausted && nonQuota429Count < MAX_NON_QUOTA_429_RETRIES) {
-                        // 🆕 关键修复：在等待期间临时标记账号为限流，防止其他并发请求选择它
-                        const account = await accountManager.getAccountById(currentAccountId)
-                        if (account) {
-                            (account as any).rateLimitedUntil = Date.now() + boundedDelayMs + 500
-                        }
-
                         await new Promise(resolve => setTimeout(resolve, boundedDelayMs + 200)) // 加 200ms 缓冲
-
-                        // 🆕 等待结束后清除临时限流标记
-                        if (account) {
-                            (account as any).rateLimitedUntil = null
-                        }
 
                         nonQuota429Count += 1
                         lastError = new Error("429 - waited and retry")
@@ -668,18 +718,25 @@ async function sendRequestSse(
 
                     // 仅在配额耗尽时才切换账号
                     if (quotaExhausted) {
-                        const limitResult = await accountManager.markRateLimitedFromError(
-                            currentAccountId,
-                            lastStatusCode,
-                            lastErrorText,
-                            lastRetryAfterHeader
-                        )
-
-                        if (limitResult?.reason === "quota_exhausted") {
-                            accountManager.moveToEndOfQueue(currentAccountId)
-                        }
+                        const perModelCooldownMs = Math.min(Math.max(retryDelayMs, 15_000), 60_000)
+                        accountManager.markModelRateLimited(currentAccountId, modelName, perModelCooldownMs)
+                        accountManager.markModelRateLimited(currentAccountId, antigravityRequest?.model, perModelCooldownMs)
 
                         if (allowRotation && accountManager.count() > 1) {
+                            const limitResult = await accountManager.markRateLimitedFromError(
+                                currentAccountId,
+                                lastStatusCode,
+                                lastErrorText,
+                                lastRetryAfterHeader,
+                                undefined,
+                                // 明確的配額耗盡是帳號級事件，值得封禁整個帳號
+                                { maxDurationMs: 60_000, forceAccountScope: true }
+                            )
+
+                            if (limitResult?.reason === "quota_exhausted") {
+                                accountManager.moveToEndOfQueue(currentAccountId)
+                            }
+
                             const next = await accountManager.getNextAvailableAccount(true)
                             if (next && next.accountId !== currentAccountId) {
                                 currentAccessToken = next.accessToken
@@ -690,11 +747,19 @@ async function sendRequestSse(
                                 break
                             }
                         }
+                        throw new UpstreamError("antigravity", 429, lastErrorText, lastRetryAfterHeader)
                     }
                     if (!quotaExhausted) {
                         const cooldownMs = Math.max(boundedDelayMs, NON_QUOTA_429_COOLDOWN_MS)
-                        accountManager.markRateLimited(currentAccountId, cooldownMs)
+                        accountManager.markModelRateLimited(currentAccountId, modelName, cooldownMs)
+                        accountManager.markModelRateLimited(currentAccountId, antigravityRequest?.model, cooldownMs)
+                        // 🆕 2026-10-02: 同 chat.ts 內另一處 SSE 分支的處理。
+                        // 只有真的有其他帳號可輪替時才標記；單帳號時標記只會讓
+                        // 同一帳號下所有其他模型一起回 400 "No account routing
+                        // entries"（實測 gemini-3.8-flash-high 的 429 會拖死
+                        // claude-sonnet-4-6 與 gemini-3-flash）。
                         if (allowRotation && accountManager.count() > 1) {
+                            accountManager.markRateLimited(currentAccountId, cooldownMs)
                             const next = await accountManager.getNextAvailableAccount(true)
                             if (next && next.accountId !== currentAccountId) {
                                 currentAccessToken = next.accessToken
@@ -847,27 +912,41 @@ async function* sendRequestSseStreaming(
                     }
                     if (response.status === 429 && currentAccountId) {
                         const quotaExhausted = isQuotaExhaustedErrorText(errorText)
+                        const retryAfter = response.headers.get("retry-after") || undefined
+                        const parsedDelay = parseRetryDelay(errorText, retryAfter)
                         if (quotaExhausted) {
-                            const limitResult = await accountManager.markRateLimitedFromError(currentAccountId, response.status, errorText)
-                            if (limitResult?.reason === "quota_exhausted") {
-                                accountManager.moveToEndOfQueue(currentAccountId)
+                            const perModelCooldownMs = Math.min(Math.max(parsedDelay ?? 15_000, 15_000), 60_000)
+                            accountManager.markModelRateLimited(currentAccountId, modelName, perModelCooldownMs)
+                            accountManager.markModelRateLimited(currentAccountId, antigravityRequest?.model, perModelCooldownMs)
+                            if (allowRotation && accountManager.count() > 1) {
+                                const limitResult = await accountManager.markRateLimitedFromError(currentAccountId, response.status, errorText, undefined, undefined, { maxDurationMs: 60_000, forceAccountScope: true })
+                                if (limitResult?.reason === "quota_exhausted") {
+                                    accountManager.moveToEndOfQueue(currentAccountId)
+                                }
                             }
-                            lastError = new UpstreamError("antigravity", response.status, errorText, response.headers.get("retry-after") || undefined)
+                            lastError = new UpstreamError("antigravity", response.status, errorText, retryAfter)
                             throw lastError
                         }
 
-                        const parsedDelay = parseRetryDelay(errorText, response.headers.get("retry-after") || undefined)
                         const waitMs = Math.min(parsedDelay ?? 2000, MAX_NON_QUOTA_429_WAIT_MS)
                         if (nonQuota429Count < MAX_NON_QUOTA_429_RETRIES) {
                             await new Promise(resolve => setTimeout(resolve, waitMs))
                             nonQuota429Count += 1
-                            lastError = new UpstreamError("antigravity", response.status, errorText, response.headers.get("retry-after") || undefined)
+                            lastError = new UpstreamError("antigravity", response.status, errorText, retryAfter)
                             retryAttempt = true
                             break
                         }
                         const cooldownMs = Math.max(waitMs, NON_QUOTA_429_COOLDOWN_MS)
-                        accountManager.markRateLimited(currentAccountId, cooldownMs)
+                        accountManager.markModelRateLimited(currentAccountId, modelName, cooldownMs)
+                        accountManager.markModelRateLimited(currentAccountId, antigravityRequest?.model, cooldownMs)
+                        // 🆕 2026-10-02: 只有在真的有其他帳號可切換時才標記限流。
+                        // 標記是「這個帳號暫時別用」的意思，會讓該帳號下所有模型
+                        // 一起回 400 "No account routing entries"。單帳號設定下沒有
+                        // 可輪替的目標，標記純粹是有害的副作用——實測
+                        // gemini-3.8-flash-high 一次 429 就讓當下完全正常的
+                        // claude-sonnet-4-6 與 gemini-3-flash 跟著掛掉。
                         if (allowRotation && accountManager.count() > 1) {
+                            accountManager.markRateLimited(currentAccountId, cooldownMs)
                             const next = await accountManager.getNextAvailableAccount(true)
                             if (next && next.accountId !== currentAccountId) {
                                 currentAccessToken = next.accessToken
@@ -878,7 +957,7 @@ async function* sendRequestSseStreaming(
                                 break
                             }
                         }
-                        const upstream = new UpstreamError("antigravity", response.status, errorText, response.headers.get("retry-after") || undefined)
+                        const upstream = new UpstreamError("antigravity", response.status, errorText, retryAfter)
                         ;(upstream as any).retryable = true
                         throw upstream
                     }
@@ -894,7 +973,12 @@ async function* sendRequestSseStreaming(
                     throw new UpstreamError("antigravity", response.status, errorText, response.headers.get("retry-after") || undefined)
                 }
 
-                if (currentAccountId) accountManager.markSuccess(currentAccountId)
+                if (currentAccountId) {
+                    accountManager.markSuccess(currentAccountId, modelName)
+                    if (antigravityRequest?.model && antigravityRequest.model !== modelName) {
+                        accountManager.markSuccess(currentAccountId, antigravityRequest.model)
+                    }
+                }
 
                 const reader = response.body?.getReader()
                 if (!reader) {
@@ -1054,6 +1138,37 @@ function extractSseEventData(event: string): string | null {
     return dataLines.join("\n")
 }
 
+/** Fail fast before acquiring the per-account lock when a model is already in cooldown. */
+function throwIfModelRateLimited(
+    accountId: string | undefined,
+    requestModel: string,
+    targetModel: string,
+    allowRotation: boolean | undefined
+): void {
+    if (!accountId) return
+    if (allowRotation && accountManager.count() > 1) return
+    if (!accountManager.isModelRateLimited(accountId, requestModel) && !accountManager.isModelRateLimited(accountId, targetModel)) {
+        return
+    }
+    const waitMs = Math.max(
+        accountManager.getModelRateLimitWait(accountId, requestModel),
+        accountManager.getModelRateLimitWait(accountId, targetModel)
+    )
+    const waitSec = Math.max(1, Math.ceil(waitMs / 1000))
+    throw new UpstreamError(
+        "antigravity",
+        429,
+        JSON.stringify({
+            error: {
+                code: 429,
+                status: "RESOURCE_EXHAUSTED",
+                details: [{ reason: "RATE_LIMIT_EXCEEDED" }],
+                message: `Model ${requestModel} is in cooldown for ${waitSec}s.`,
+            },
+        })
+    )
+}
+
 export async function createChatCompletion(request: ChatRequest): Promise<ChatResponse> {
     return createChatCompletionWithOptions(request)
 }
@@ -1093,13 +1208,16 @@ export async function createChatCompletionWithOptions(
 
     setRequestLogContext({ model: request.model, provider: "antigravity", account: accountEmail, routeTag: options.routeTag })
 
+    const targetModel = getAntigravityModelName(request.model)
+    throwIfModelRateLimited(accountId, request.model, targetModel, options.allowRotation ?? true)
+
     if (accountId) {
         releaseAccountLock = await accountManager.acquireAccountLock(accountId)
     }
 
     try {
     const antigravityRequest = claudeToAntigravity(
-        getAntigravityModelName(request.model),
+        targetModel,
         request.messages,
         request.tools,
         request.toolChoice
@@ -1124,7 +1242,7 @@ export async function createChatCompletionWithOptions(
         // Record usage (fire-and-forget) - use actual native model ID
         const inputTokens = result.usage?.inputTokens || 0
         const outputTokens = result.usage?.outputTokens || 0
-        const actualModelId = getAntigravityModelName(request.model)
+        const actualModelId = targetModel
         if (inputTokens > 0 || outputTokens > 0) {
             import("~/services/usage-tracker").then(({ recordUsage }) => {
                 recordUsage(actualModelId, inputTokens, outputTokens)
@@ -1174,13 +1292,16 @@ export async function* createChatCompletionStreamWithOptions(
         }
     }
 
+    const targetModel = getAntigravityModelName(request.model)
+    throwIfModelRateLimited(accountId, request.model, targetModel, options.allowRotation ?? true)
+
     if (accountId) {
         releaseAccountLock = await accountManager.acquireAccountLock(accountId)
     }
 
     try {
         const antigravityRequest = claudeToAntigravity(
-            getAntigravityModelName(request.model),
+            targetModel,
             request.messages,
             request.tools,
             request.toolChoice
@@ -1252,7 +1373,10 @@ export async function* createChatCompletionStreamWithOptions(
                 }
 
                 hasToolUse = true
-                const toolStart = { type: "content_block_start", index: blockIndex, content_block: { type: "tool_use", id: part.functionCall.id || generateToolUseId(), name: part.functionCall.name, input: {} } }
+                const toolCallId = part.functionCall.id || generateToolUseId()
+                const signature = extractThoughtSignature(part)
+                if (signature) rememberThoughtSignature(toolCallId, signature)
+                const toolStart = { type: "content_block_start", index: blockIndex, content_block: { type: "tool_use", id: toolCallId, name: part.functionCall.name, input: {}, ...(signature ? { extra_content: { google: { thought_signature: signature } } } : {}) } }
                 yield "event: content_block_start\ndata: " + JSON.stringify(toolStart) + "\n\n"
                 if (part.functionCall.args) {
                     const rawArgs = part.functionCall.args

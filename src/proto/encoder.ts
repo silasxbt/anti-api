@@ -73,6 +73,11 @@ export const MODEL_ENUM = {
     GEMINI_3_FLASH: 348,       // RIFTRUNNER
     GEMINI_3_PRO: 350,         // INFINITYJET
 
+    // Gemini 4 Argon models (MODEL_PLACEHOLDER_M417..M419)
+    GEMINI_4_ARGON_HIGH: 1417,
+    GEMINI_4_ARGON_MEDIUM: 1418,
+    GEMINI_4_ARGON_LOW: 1419,
+
     // GPT-OSS models
     GPT_OSS_120B_MEDIUM: 342,
 } as const
@@ -81,7 +86,10 @@ export const MODEL_ENUM = {
  * Map user-friendly model names to enum values
  */
 export function getModelEnumValue(modelName: string): number | undefined {
-    const normalized = modelName.toLowerCase().replace(/[- .]/g, "_")
+    const normalized = modelName.toLowerCase()
+        .replace(/[- .]/g, "_")
+        .replace(/gemini_3_1_pro/g, "gemini_3_pro")
+        .replace(/gemini_3_[567]_flash/g, "gemini_3_flash")
 
     // Claude 4.5 Sonnet (with thinking)
     if (normalized.includes("sonnet_4_5") || normalized.includes("4_5_sonnet")) {
@@ -121,6 +129,17 @@ export function getModelEnumValue(modelName: string): number | undefined {
         return MODEL_ENUM.CLAUDE_4_SONNET
     }
 
+    // Gemini 4 Argon (High/Medium/Low)
+    if (normalized.includes("gemini_4_argon") || normalized.includes("argon")) {
+        if (normalized.includes("high")) {
+            return MODEL_ENUM.GEMINI_4_ARGON_HIGH
+        }
+        if (normalized.includes("low")) {
+            return MODEL_ENUM.GEMINI_4_ARGON_LOW
+        }
+        return MODEL_ENUM.GEMINI_4_ARGON_MEDIUM
+    }
+
     // Gemini 3 Pro (High/Low)
     if (normalized.includes("gemini_3_pro")) {
         if (normalized.includes("high")) {
@@ -135,6 +154,18 @@ export function getModelEnumValue(modelName: string): number | undefined {
     // Gemini 3 Flash
     if (normalized.includes("gemini_3_flash")) {
         return MODEL_ENUM.GEMINI_3_FLASH
+    }
+
+    // 🆕 2026-10-02: gemini-3.8-flash-* 目前無法透過 enum 路徑使用。
+    // 實測（上游原始回應，/tmp/antiapi-upstream-diag.log）：
+    //   enum 348 (GEMINI_3_FLASH) → 404 NOT_FOUND "Requested entity was not found"
+    //   undefined (cascade 自動選) → 429 RESOURCE_EXHAUSTED
+    // 上游的 enum 表（從 agy 二進位 descriptor 解出）只有
+    // RIFTRUNNER=348 / RIFTRUNNER_THINKING_LOW=352 / RIFTRUNNER_THINKING_HIGH=353
+    // / INFINITYJET=350，沒有對應 3.8 的新值；3.8 目前只能由官方 agy 用字串
+    // model ID 送出。保留映射位置，等上游 enum 更新後填入。
+    if (normalized.includes("gemini_3_8_flash")) {
+        return undefined
     }
 
     // Gemini 2.5 Pro

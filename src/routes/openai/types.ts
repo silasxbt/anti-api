@@ -39,6 +39,7 @@ export interface OpenAIToolCall {
         name: string
         arguments: string
     }
+    extra_content?: Record<string, any>
 }
 
 export interface OpenAIChatCompletionResponse {

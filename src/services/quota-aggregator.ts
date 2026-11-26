@@ -3,7 +3,12 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs"
 import { join } from "path"
 import { authStore } from "~/services/auth/store"
 import { refreshAccessToken } from "~/services/antigravity/oauth"
-import { fetchAntigravityModels as fetchAntigravityModelsRequest, type AntigravityModelInfo } from "~/services/antigravity/quota-fetch"
+import {
+    fetchAntigravityModels as fetchAntigravityModelsRequest,
+    fetchAntigravityQuotaSummary as fetchAntigravityQuotaSummaryRequest,
+    type AntigravityModelInfo,
+    type AntigravityQuotaSummaryGroup,
+} from "~/services/antigravity/quota-fetch"
 import { refreshCodexAccessToken, refreshCodexAccountIfNeeded } from "~/services/codex/oauth"
 import { accountManager } from "~/services/antigravity/account-manager"
 import type { ProviderAccount } from "~/services/auth/types"
@@ -80,7 +85,11 @@ function updateQuotaCache(entry: QuotaCacheEntry): void {
 
 function getCachedBars(provider: QuotaCacheEntry["provider"], accountId: string): AccountBar[] | null {
     const cached = quotaCache.get(getCacheKey(provider, accountId))
-    return cached?.bars || null
+    if (!cached?.bars) return null
+    if (provider === "antigravity" && cached.bars.some(b => b.key === "gpro" || b.key === "gflash")) {
+        return null
+    }
+    return cached.bars
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: () => T, label: string): Promise<T> {
@@ -215,8 +224,11 @@ async function fetchAntigravityQuotas(accounts: ProviderAccount[]): Promise<Acco
         for (let attempt = 0; attempt < 2; attempt++) {
             try {
                 const refreshed = await refreshAntigravityToken(account)
-                const quotaModels = await fetchAntigravityModelsForAccount(refreshed)
-                const bars = buildAntigravityBars(quotaModels)
+                const [quotaModels, summaryGroups] = await Promise.all([
+                    fetchAntigravityModelsForAccount(refreshed),
+                    fetchAntigravityQuotaSummaryForAccount(refreshed),
+                ])
+                const bars = buildAntigravityBars(quotaModels, summaryGroups)
                 updateQuotaCache({
                     provider: "antigravity",
                     accountId: account.id,
@@ -329,22 +341,117 @@ async function fetchAntigravityModelsForAccount(
     }
 }
 
-function buildAntigravityBars(models: Record<string, ModelInfo>): AccountBar[] {
-    const claudeGptIds = [
-        "claude-sonnet-4-5",
-        "claude-sonnet-4-5-thinking",
-        "claude-opus-4-5-thinking",
-        "claude-opus-4-6-thinking",
-        "gpt-oss-120b",
-    ]
-    const gproIds = ["gemini-3-pro-low", "gemini-3-pro-high"]
-    const gflashIds = ["gemini-3-flash"]
+async function fetchAntigravityQuotaSummaryForAccount(
+    account: ProviderAccount
+): Promise<AntigravityQuotaSummaryGroup[]> {
+    try {
+        const result = await fetchAntigravityQuotaSummaryRequest(account.accessToken, account.projectId)
+        if (!account.projectId && result.projectId) {
+            account.projectId = result.projectId
+            authStore.saveAccount(account)
+        }
+        return result.groups
+    } catch {
+        return []
+    }
+}
 
-    return [
-        buildMergedBar("claude_gpt", "claude&gpt", models, claudeGptIds),
-        buildMergedBar("gpro", "gpro", models, gproIds),
-        buildMergedBar("gflash", "gflash", models, gflashIds),
-    ]
+export function buildAntigravityBars(
+    models: Record<string, ModelInfo>,
+    summaryGroups: AntigravityQuotaSummaryGroup[] = []
+): AccountBar[] {
+    const bars: AccountBar[] = []
+
+    const claudeGptGroup = summaryGroups.find(g => {
+        const name = (g.displayName || "").toLowerCase()
+        return name.includes("claude") || name.includes("gpt")
+    })
+    const weeklyBucket = claudeGptGroup?.buckets?.find(b => b.window === "weekly" || b.bucketId?.includes("weekly"))
+    const fiveHourBucket = claudeGptGroup?.buckets?.find(b => b.window === "5h" || b.bucketId?.includes("5h"))
+
+    const claudeGptIds = Object.keys(models).filter(id => /^(claude-|gpt-)/.test(id))
+
+    if (weeklyBucket) {
+        bars.push({
+            key: "claude_gpt",
+            label: "Claude & GPT · Weekly",
+            percentage: Math.round((weeklyBucket.remainingFraction ?? 0) * 100),
+            ...(weeklyBucket.resetTime ? { resetTime: weeklyBucket.resetTime } : {}),
+        })
+    } else {
+        bars.push(buildMergedBar("claude_gpt", "Claude & GPT · Weekly", models, claudeGptIds))
+    }
+
+    if (fiveHourBucket) {
+        bars.push({
+            key: "claude_gpt_5h",
+            label: "Claude & GPT · 5h",
+            percentage: Math.round((fiveHourBucket.remainingFraction ?? 0) * 100),
+            ...(fiveHourBucket.resetTime ? { resetTime: fiveHourBucket.resetTime } : {}),
+        })
+    }
+
+    const geminiGroup = summaryGroups.find(g => {
+        const name = (g.displayName || "").toLowerCase()
+        return name.includes("gemini") && !name.includes("argon")
+    })
+    const geminiWeekly = geminiGroup?.buckets?.find(b => b.window === "weekly" || b.bucketId?.includes("weekly"))
+    const gemini5h = geminiGroup?.buckets?.find(b => b.window === "5h" || b.bucketId?.includes("5h"))
+
+    if (gemini5h || geminiWeekly) {
+        if (geminiWeekly) {
+            bars.push({
+                key: "gemini_weekly",
+                label: "Gemini · Weekly",
+                percentage: Math.round((geminiWeekly.remainingFraction ?? 0) * 100),
+                ...(geminiWeekly.resetTime ? { resetTime: geminiWeekly.resetTime } : {}),
+            })
+        }
+        if (gemini5h) {
+            bars.push({
+                key: "gemini",
+                label: "Gemini · 5h",
+                percentage: Math.round((gemini5h.remainingFraction ?? 0) * 100),
+                ...(gemini5h.resetTime ? { resetTime: gemini5h.resetTime } : {}),
+            })
+        }
+    } else {
+        const geminiIds = Object.keys(models).filter(id => id.startsWith("gemini-") && !id.startsWith("gemini-4-argon"))
+        bars.push(buildMergedBar("gemini", "Gemini", models, geminiIds))
+    }
+
+    const argonGroup = summaryGroups.find(g => {
+        const name = (g.displayName || "").toLowerCase()
+        return name.includes("argon") || (g.buckets || []).some(b => (b.bucketId || "").toLowerCase().includes("argon"))
+    })
+    const argonWeekly = argonGroup?.buckets?.find(b => b.window === "weekly" || b.bucketId?.includes("weekly"))
+    const argon5h = argonGroup?.buckets?.find(b => b.window === "5h" || b.bucketId?.includes("5h"))
+
+    if (argonWeekly || argon5h) {
+        if (argonWeekly) {
+            bars.push({
+                key: "gemini_argon",
+                label: "Gemini 4 Argon · Weekly",
+                percentage: Math.round((argonWeekly.remainingFraction ?? 0) * 100),
+                ...(argonWeekly.resetTime ? { resetTime: argonWeekly.resetTime } : {}),
+            })
+        }
+        if (argon5h) {
+            bars.push({
+                key: "gemini_argon_5h",
+                label: "Gemini 4 Argon · 5h",
+                percentage: Math.round((argon5h.remainingFraction ?? 0) * 100),
+                ...(argon5h.resetTime ? { resetTime: argon5h.resetTime } : {}),
+            })
+        }
+    } else {
+        const argonIds = Object.keys(models).filter(id => id.startsWith("gemini-4-argon"))
+        if (argonIds.length > 0) {
+            bars.push(buildMergedBar("gemini_argon", "Gemini 4 Argon · Weekly", models, argonIds))
+        }
+    }
+
+    return bars
 }
 
 function buildMergedBar(

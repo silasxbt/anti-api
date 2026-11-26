@@ -62,7 +62,7 @@ server.use(async (c, next) => {
             const ctx = getRequestLogContext()
             const method = c.req.method
             const path = c.req.path
-            const debugInfo = status === 400 ? ` (${method} ${path}${reason ? ` - ${reason}` : ""})` : ""
+            const debugInfo = status >= 400 ? ` (${method} ${path}${reason ? ` - ${reason}` : ""})` : ""
             if (ctx.model && ctx.provider) {
                 const providerNames: Record<string, string> = {
                     copilot: "GitHub Copilot",
@@ -124,6 +124,9 @@ if (process.env.ANTI_API_IMPORT_GROK_ON_START === "1") {
 
 // 根路径 - 重定向到配额面板
 server.get("/", (c) => c.redirect("/quota"))
+
+// 浏览器 favicon 请求直接返回空响应，避免触发 404 日志
+server.get("/favicon.ico", (c) => c.body(null, 204))
 
 // Auth 路由
 server.route("/auth", authRouter)
@@ -214,13 +217,24 @@ const modelsHandler = (c: any) => {
         name: `Route: ${flow.name}`,
         owned_by: "routing",
     }))
-    const providerModels: ModelListEntry[] = PROVIDERS.flatMap((provider) =>
-        getProviderModels(provider).map(model => ({
+    // antigravity 只用 curated 靜態清單（baseModels / AVAILABLE_MODELS）：
+    // 動態 sync 會把已下線 / 無 routing 的死模型（claude-5.5-*、tab_*_preview…）帶回清單。
+    // 其它 provider 只在「已配置帳號」時才列出，避免暴露無帳號可路由的死 endpoint。
+    const providerModels: ModelListEntry[] = PROVIDERS.flatMap((provider) => {
+        if (provider === "antigravity") return []
+        let accounts: { id?: string }[] = []
+        try {
+            accounts = authStore.listAccounts(provider) || []
+        } catch {
+            accounts = []
+        }
+        if (accounts.length === 0) return []
+        return getProviderModels(provider).map(model => ({
             id: model.id,
             name: model.label,
             owned_by: provider,
         }))
-    )
+    })
     const seen = new Set<string>()
     const baseModels: ModelListEntry[] = AVAILABLE_MODELS.map(model => ({
         id: model.id,

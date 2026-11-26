@@ -21,9 +21,12 @@ let nextId = 1
 let initialized = false
 let captureEnabled = false
 
+const ANSI_ESCAPE_RE = /\x1b\[[0-9;]*[A-Za-z]/g
+
 function appendLog(level: LogLevel, args: unknown[]): void {
     if (!captureEnabled) return
-    const line = redactSensitiveText(args.length ? format(...args) : "")
+    const raw = redactSensitiveText(args.length ? format(...args) : "")
+    const line = raw.replace(ANSI_ESCAPE_RE, "")
     const entry: LogEntry = {
         id: nextId++,
         ts: new Date().toISOString(),

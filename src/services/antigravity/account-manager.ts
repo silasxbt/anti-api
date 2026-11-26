@@ -146,16 +146,19 @@ export interface Account {
     refreshToken: string
     expiresAt: number
     projectId: string | null
+    label?: string
+    createdAt?: string
     // 限流状态
     rateLimitedUntil: number | null
     consecutiveFailures: number
 }
 
-class AccountManager {
+export class AccountManager {
     private accounts: Map<string, Account> = new Map()
     private currentIndex = 0
     private dataFile: string
     private loaded = false
+    private persist: boolean
     // 🆕 60秒账号锁定：记录最近使用的账号（匹配 proj-1 的 last_used_account）
     private lastUsedAccount: { accountId: string; timestamp: number } | null = null
     // 🆕 粘性账户队列：失败的账户移到队尾，避免反复 429
@@ -165,9 +168,14 @@ class AccountManager {
     private inFlightStartedAt = new Map<string, number>()
     private accountLocks = new Map<string, Promise<void>>()
     private lastCallByAccount = new Map<string, number>()
+    private modelRateLimitedUntil = new Map<string, number>()
 
-    constructor() {
+    constructor(options?: { persist?: boolean }) {
         this.dataFile = path.join(getDataDir(), "accounts.json")
+        this.persist = options?.persist ?? true
+        if (!this.persist) {
+            this.loaded = true
+        }
     }
 
     private ensureLoaded(): void {
@@ -257,6 +265,7 @@ class AccountManager {
      * 保存账号列表
      */
     save(): void {
+        if (!this.persist) return
         try {
             const accounts = Array.from(this.accounts.values()).map(acc => ({
                 id: acc.id,
@@ -276,6 +285,7 @@ class AccountManager {
      * 添加账号
      */
     addAccount(account: Omit<Account, "rateLimitedUntil" | "consecutiveFailures">): void {
+        this.ensureLoaded()
         this.accounts.set(account.id, {
             ...account,
             rateLimitedUntil: null,
@@ -285,17 +295,19 @@ class AccountManager {
         if (!this.accountQueue.includes(account.id)) {
             this.accountQueue.push(account.id)
         }
-        this.save()
-        authStore.saveAccount({
-            id: account.id,
-            provider: "antigravity",
-            email: account.email,
-            accessToken: account.accessToken,
-            refreshToken: account.refreshToken,
-            expiresAt: account.expiresAt,
-            projectId: account.projectId || undefined,
-            label: account.email,
-        })
+        if (this.persist) {
+            this.save()
+            authStore.saveAccount({
+                id: account.id,
+                provider: "antigravity",
+                email: account.email,
+                accessToken: account.accessToken,
+                refreshToken: account.refreshToken,
+                expiresAt: account.expiresAt,
+                projectId: account.projectId || undefined,
+                label: account.email,
+            })
+        }
     }
 
     /**
@@ -316,8 +328,11 @@ class AccountManager {
             this.inFlightStartedAt.delete(accountIdOrEmail)
             this.accountLocks.delete(accountIdOrEmail)
             this.lastCallByAccount.delete(accountIdOrEmail)
-            this.save()
-            authStore.deleteAccount("antigravity", accountIdOrEmail)
+            this.clearModelRateLimitsForAccount(accountIdOrEmail)
+            if (this.persist) {
+                this.save()
+                authStore.deleteAccount("antigravity", accountIdOrEmail)
+            }
             return true
         }
 
@@ -330,8 +345,11 @@ class AccountManager {
                 this.inFlightStartedAt.delete(id)
                 this.accountLocks.delete(id)
                 this.lastCallByAccount.delete(id)
-                this.save()
-                authStore.deleteAccount("antigravity", id)
+                this.clearModelRateLimitsForAccount(id)
+                if (this.persist) {
+                    this.save()
+                    authStore.deleteAccount("antigravity", id)
+                }
                 return true
             }
         }
@@ -345,6 +363,14 @@ class AccountManager {
      */
     count(): number {
         return this.accounts.size
+    }
+
+    /**
+     * 获取所有账号列表
+     */
+    listAccounts(): Account[] {
+        this.ensureLoaded()
+        return Array.from(this.accounts.values())
     }
 
     /**
@@ -435,6 +461,55 @@ class AccountManager {
         return Array.from(this.accounts.values()).map(a => a.email)
     }
 
+    /** Build composite key for per-(accountId, modelId) cooldown tracking. */
+    private getModelRateLimitKey(accountId: string, modelId: string): string {
+        return `${accountId}:${modelId.trim()}`
+    }
+
+    /** Remove all per-model cooldown entries associated with an account. */
+    private clearModelRateLimitsForAccount(accountId: string): void {
+        const prefix = `${accountId}:`
+        for (const key of this.modelRateLimitedUntil.keys()) {
+            if (key.startsWith(prefix)) {
+                this.modelRateLimitedUntil.delete(key)
+            }
+        }
+    }
+
+    /** Mark a specific (accountId, modelId) pair as rate-limited for durationMs. */
+    markModelRateLimited(accountId: string, modelId: string | undefined, durationMs: number = 15_000): void {
+        if (!accountId || !modelId) return
+        const key = this.getModelRateLimitKey(accountId, modelId)
+        this.modelRateLimitedUntil.set(key, Date.now() + durationMs)
+    }
+
+    /** Return whether a specific (accountId, modelId) pair is currently in cooldown. */
+    isModelRateLimited(accountId: string, modelId?: string): boolean {
+        if (!accountId || !modelId) return false
+        const key = this.getModelRateLimitKey(accountId, modelId)
+        const until = this.modelRateLimitedUntil.get(key)
+        if (!until) return false
+        if (Date.now() >= until) {
+            this.modelRateLimitedUntil.delete(key)
+            return false
+        }
+        return true
+    }
+
+    /** Return remaining cooldown milliseconds for a specific (accountId, modelId) pair. */
+    getModelRateLimitWait(accountId: string, modelId?: string): number {
+        if (!accountId || !modelId) return 0
+        const key = this.getModelRateLimitKey(accountId, modelId)
+        const until = this.modelRateLimitedUntil.get(key)
+        if (!until) return 0
+        const rem = until - Date.now()
+        if (rem <= 0) {
+            this.modelRateLimitedUntil.delete(key)
+            return 0
+        }
+        return rem
+    }
+
     /**
      * 标记账号为限流状态
      */
@@ -456,7 +531,7 @@ class AccountManager {
         errorText: string,
         retryAfterHeader?: string,
         modelId?: string,
-        options?: { maxDurationMs?: number }
+        options?: { maxDurationMs?: number; forceAccountScope?: boolean }
     ): Promise<{ reason: RateLimitReason; durationMs: number } | null> {
         const account = this.accounts.get(accountId)
         if (!account) return null
@@ -469,15 +544,45 @@ class AccountManager {
         let rateLimitedUntil: number | null = null
 
         // 🆕 proj-1 风格：不在每次 429 时检查配额（避免额外 API 调用消耗速率限制）
-        // 如果没有明确的 retry delay，直接假设是速率限制并应用短暂退避
-        if (retryDelayMs !== null) {
-            // API 返回了明确的重试延迟
-            durationMs = Math.max(retryDelayMs + 500, 2000)
-            rateLimitedUntil = Date.now() + durationMs
-        } else if (statusCode === 429) {
-            // 没有明确延迟的 429 = 假设是速率限制，应用短暂退避
-            // 不调用 fetchAntigravityModels 避免消耗速率限制
-            durationMs = 10000 // 10 秒短暂退避（增加以避免快速重试）
+                // 如果没有明确的 retry delay，直接假设是速率限制并应用短暂退避
+                //
+                // 🆕 2026-10-02：单一「per-model」层级的错误不应该毒化整个账号。
+                // 这是所有 429 标记路径的共同终点，实测一个模型（例如
+                // gemini-3.8-flash-high，上游连该 model entity 都找不到 → 404
+                // NOT_FOUND / 429 RESOURCE_EXHAUSTED）被拒绝，会在此把账号封 8-60 秒，
+                // 导致同一账号下完全正常的 claude-sonnet-4-6 与 gemini-3-flash 一起回
+                // 400 "No account routing entries"。
+                //
+                // 规则：429 只有在调用方明确声明「账号级封禁」时才生效；
+                // 404/400/401/403 是模型参数、路由或权限问题，从来不是配额信号，
+                // 同样不应该冷卻账号（调用方 router.ts 也已经这样过滤，只是在这里
+                // 兜底，防止任何新调用点绕过）。
+                const isAccountScopeError = statusCode === 429 && options?.forceAccountScope === true
+                const isNeverAccountError = statusCode === 404 || statusCode === 400 || statusCode === 401 || statusCode === 403
+
+                if (isNeverAccountError) {
+                    account.consecutiveFailures = Math.max(0, account.consecutiveFailures - 1)
+                    return null
+                }
+                if (statusCode === 429 && !isAccountScopeError) {
+                    if (modelId) {
+                        const perModelMs = Math.min(
+                            retryDelayMs !== null ? Math.max(retryDelayMs + 500, 2000) : 15_000,
+                            options?.maxDurationMs ?? 30_000
+                        )
+                        this.markModelRateLimited(accountId, modelId, perModelMs)
+                    }
+                    account.consecutiveFailures = Math.max(0, account.consecutiveFailures - 1)
+                    return null
+                }
+
+                if (retryDelayMs !== null) {
+                    // API 返回了明确的重试延迟
+                    durationMs = Math.max(retryDelayMs + 500, 2000)
+                    rateLimitedUntil = Date.now() + durationMs
+                } else if (statusCode === 429) {
+                    // 明确的账号级配额耗尽
+                    durationMs = Math.min(options?.maxDurationMs ?? 10_000, 60_000)
             rateLimitedUntil = Date.now() + durationMs
         }
 
@@ -487,7 +592,7 @@ class AccountManager {
         }
 
         const maxDurationMs = options?.maxDurationMs
-        if (maxDurationMs && reason !== "quota_exhausted" && durationMs > maxDurationMs) {
+        if (maxDurationMs && durationMs > maxDurationMs) {
             durationMs = maxDurationMs
             rateLimitedUntil = Date.now() + durationMs
         }
@@ -502,11 +607,14 @@ class AccountManager {
     /**
      * 标记账号成功
      */
-    markSuccess(accountId: string): void {
+    markSuccess(accountId: string, modelId?: string): void {
         const account = this.accounts.get(accountId)
         if (account) {
             account.rateLimitedUntil = null
             account.consecutiveFailures = 0
+        }
+        if (accountId && modelId) {
+            this.modelRateLimitedUntil.delete(this.getModelRateLimitKey(accountId, modelId))
         }
     }
 
@@ -516,7 +624,8 @@ class AccountManager {
     isAccountRateLimited(accountId: string): boolean {
         const account = this.accounts.get(accountId)
         if (!account) return false
-        return account.rateLimitedUntil !== null && account.rateLimitedUntil > Date.now()
+        const limited = account.rateLimitedUntil !== null && account.rateLimitedUntil > Date.now()
+        return limited
     }
 
     /**
@@ -553,6 +662,7 @@ class AccountManager {
                 count++
             }
         }
+        this.modelRateLimitedUntil.clear()
         if (count > 0) {
             consola.warn(`🔄 Optimistic reset: Cleared rate limits for ${count} account(s)`)
         }

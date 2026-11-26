@@ -126,7 +126,7 @@ export function summarizeUpstreamError(error: UpstreamError): { message: string;
         const summary = summarizeUpstream429(error)
         return { message: summary.message, reason: summary.reason }
     }
-    return { message: `${error.provider} upstream error (${error.status}).` }
+    return { message: `${error.provider} upstream error (${error.status}). Body: ${error.body?.substring(0, 500)}` }
 }
 
 function buildLogReason(error: unknown): string {

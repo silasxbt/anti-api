@@ -29,7 +29,7 @@ export async function getLanguageServerInfo(): Promise<LanguageServerInfo | null
     try {
         // Step 1: 获取 language_server 进程信息
         const { stdout: psOutput } = await execAsync(
-            'ps aux | grep "language_server_macos_arm" | grep -v grep | head -1'
+            'ps aux | grep -E "language_server(_macos_arm)?" | grep -v grep | head -1'
         )
 
         if (!psOutput.trim()) {

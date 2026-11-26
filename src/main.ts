@@ -20,7 +20,7 @@ import { getSetting } from "./services/settings"
 import { logoutIdeSession, getIdeAuthStatus } from "./services/antigravity/ide-switch"
 
 function getLocalHost(): string {
-    const host = process.env.ANTI_API_HOST?.trim() || "[IP]"
+    const host = process.env.ANTI_API_HOST?.trim() || "127.0.0.1"
     if (!isLoopbackAddress(host)) {
         if (process.env.ANTI_API_CONTAINER_CONTROL_PLANE === "1" && host === "0.0.0.0") {
             return host

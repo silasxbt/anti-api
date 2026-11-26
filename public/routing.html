@@ -584,9 +584,8 @@
         };
         const PROVIDER_ORDER = ['antigravity', 'codex', 'copilot', 'zed', 'kiro'];
         const MODEL_GROUPS = {
-            claudeGpt: ['claude-sonnet-4-5', 'claude-sonnet-4-5-thinking', 'claude-opus-4-5-thinking', 'claude-opus-4-6-thinking', 'gpt-oss-120b'],
-            gpro: ['gemini-3-pro-low', 'gemini-3-pro-high'],
-            gflash: ['gemini-3-flash'],
+            claudeGpt: ['claude-opus-5-5-low', 'claude-opus-5-5-medium', 'claude-opus-5-5-high', 'claude-sonnet-5-5-low', 'claude-sonnet-5-5-medium', 'claude-sonnet-5-5-high', 'gpt-oss-120b-medium'],
+            gemini: ['gemini-4-hydrogen-high', 'gemini-4-neon-high', 'gemini-4-argon-high', 'gemini-3.8-flash-tiered', 'gemini-3-flash', 'gemini-2.5-pro'],
         };
 
         const dom = {
@@ -1265,15 +1264,32 @@
 
             if (!accountData || !accountData.bars) return null;
 
-            let barKey = null;
-            if (MODEL_GROUPS.claudeGpt.includes(modelId)) barKey = 'claude_gpt';
-            else if (MODEL_GROUPS.gpro.includes(modelId)) barKey = 'gpro';
-            else if (MODEL_GROUPS.gflash.includes(modelId)) barKey = 'gflash';
+            const isClaudeOrGpt = MODEL_GROUPS.claudeGpt.includes(modelId) || /^(claude-|gpt-)/.test(modelId || '');
+            const isGemini = MODEL_GROUPS.gemini.includes(modelId) || /^gemini-/.test(modelId || '');
 
-            if (!barKey) return null;
-
-            const bar = accountData.bars.find(b => b.key === barKey);
-            return bar ? bar.percentage : null;
+            if (isClaudeOrGpt) {
+                const weeklyBar = accountData.bars.find(b => b.key === 'claude_gpt');
+                const fiveHourBar = accountData.bars.find(b => b.key === 'claude_gpt_5h');
+                if (weeklyBar && fiveHourBar) return Math.min(weeklyBar.percentage, fiveHourBar.percentage);
+                const bar = weeklyBar || fiveHourBar;
+                return bar ? bar.percentage : null;
+            }
+            if (isGemini) {
+                if ((modelId || '').toLowerCase().includes('argon')) {
+                    const argonWeekly = accountData.bars.find(b => b.key === 'gemini_argon');
+                    const argon5h = accountData.bars.find(b => b.key === 'gemini_argon_5h');
+                    if (argonWeekly && argon5h) return Math.min(argonWeekly.percentage, argon5h.percentage);
+                    if (argonWeekly || argon5h) return (argonWeekly || argon5h).percentage;
+                }
+                const gemini5h = accountData.bars.find(b => b.key === 'gemini')
+                    || accountData.bars.find(b => b.key === 'gpro')
+                    || accountData.bars.find(b => b.key === 'gflash');
+                const geminiWeekly = accountData.bars.find(b => b.key === 'gemini_weekly');
+                if (gemini5h && geminiWeekly) return Math.min(gemini5h.percentage, geminiWeekly.percentage);
+                const bar = gemini5h || geminiWeekly;
+                return bar ? bar.percentage : null;
+            }
+            return null;
         }
 
         function renderAccounts() {

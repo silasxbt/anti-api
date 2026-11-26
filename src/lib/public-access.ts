@@ -16,7 +16,7 @@ export function getPublicGatewayPort(_localPort?: number): number {
 }
 
 export function getPublicGatewayHost(): string {
-    return process.env.ANTI_API_PUBLIC_HOST?.trim() || "[IP]"
+    return process.env.ANTI_API_PUBLIC_HOST?.trim() || "0.0.0.0"
 }
 
 export function tokenMatches(expected: string, provided: string | null): boolean {

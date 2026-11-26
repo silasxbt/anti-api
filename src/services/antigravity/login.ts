@@ -152,10 +152,12 @@ export async function startOAuthLogin(): Promise<{ success: boolean; error?: str
         const authUrl = generateAuthURL(redirectUri, oauthState)
 
         // 3. 打开浏览器
-        consola.info(`Open this URL to login: ${authUrl}`)
+        console.log(`\n========================================\n🔗 請在瀏覽器中開啟以下網址進行 Google Antigravity 授權：\n\n${authUrl}\n========================================\n`)
         if (process.env.ANTI_API_OAUTH_NO_OPEN !== "1") {
             try {
-                await Bun.$`open ${authUrl}`.quiet()
+                const openCmd = process.platform === "darwin" ? "open" : (process.platform === "win32" ? "cmd" : "xdg-open")
+                const openArgs = process.platform === "win32" ? ["/c", "start", authUrl] : [authUrl]
+                Bun.spawn([openCmd, ...openArgs], { stdout: "ignore", stderr: "ignore" })
             } catch {
                 consola.warn("Failed to open browser automatically")
             }

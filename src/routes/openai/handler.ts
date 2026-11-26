@@ -17,7 +17,6 @@ import {
     mapStopReason,
 } from "./translator"
 import { validateChatRequest } from "~/lib/validation"
-import { rateLimiter } from "~/lib/rate-limiter"
 import { forwardError, summarizeUpstreamError, UpstreamError } from "~/lib/error"
 
 type ReasoningEffort = "low" | "medium" | "high"
@@ -65,8 +64,6 @@ export async function handleChatCompletion(c: Context): Promise<Response> {
             return c.json({ error: { type: "invalid_request_error", message: validation.error } }, 400)
         }
 
-        await rateLimiter.wait()
-
         const anthropicModel = mapModel(payload.model)
         const messages = translateMessages(payload.messages)
         const tools = translateTools(payload.tools)
@@ -100,7 +97,12 @@ export async function handleChatCompletion(c: Context): Promise<Response> {
             if (block.type === "text") {
                 textContent += block.text || ""
             } else if (block.type === "tool_use") {
-                toolCalls.push({ id: block.id, name: block.name, input: block.input })
+                toolCalls.push({
+                    id: block.id,
+                    name: block.name,
+                    input: block.input,
+                    ...((block as any).extra_content ? { extra_content: (block as any).extra_content } : {}),
+                })
             }
         }
 
@@ -110,6 +112,7 @@ export async function handleChatCompletion(c: Context): Promise<Response> {
                 id: tc.id,
                 type: "function",
                 function: { name: tc.name, arguments: JSON.stringify(tc.input) },
+                ...(tc.extra_content ? { extra_content: tc.extra_content } : {}),
             }))
         }
 
@@ -196,6 +199,7 @@ async function handleStreamCompletion(
                                         name: parsed.content_block.name,
                                         input: {},
                                         arguments: "",
+                                        ...(parsed.content_block.extra_content ? { extra_content: parsed.content_block.extra_content } : {}),
                                     }
                                 }
                                 break

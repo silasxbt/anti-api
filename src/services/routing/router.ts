@@ -174,6 +174,18 @@ function normalizeEntries(entries: RoutingEntry[]): RoutingEntry[] {
 }
 
 function listProviderAccountsInOrder(provider: AuthProvider): ProviderAccount[] {
+    if (provider === "antigravity") {
+        const agAccounts = accountManager.listAccounts()
+        if (agAccounts.length > 0) {
+            return agAccounts.map(a => ({
+                id: a.id,
+                email: a.email,
+                label: a.label || a.email,
+                login: a.email,
+                createdAt: a.createdAt,
+            } as ProviderAccount))
+        }
+    }
     const accounts = authStore.listAccounts(provider)
     return accounts.sort((a, b) => {
         const aTime = a.createdAt || ""
@@ -433,13 +445,18 @@ function shouldSkipFlowEntry(
 
 function applyFlowRateLimit(entry: RoutingEntry, error: UpstreamError, requestModel: string): void {
     if (entry.provider === "antigravity" && entry.accountId !== "auto") {
-        // 404 is usually a model-account mismatch or transient upstream routing miss,
-        // not an account quota/rate-limit signal. Avoid cooling down the account.
-        // 401/403 are auth/permission class errors and should not poison account
-        // availability with synthetic 429 "account unavailable" on subsequent requests.
-        if (error.status === 404 || error.status === 401 || error.status === 403) {
-            return
-        }
+        // 404/400 is usually a model-account mismatch, bad argument or transient upstream routing miss,
+            // not an account quota/rate-limit signal. Avoid cooling down the account.
+            // 401/403 are auth/permission class errors and should not poison account
+            // availability with synthetic 429 "account unavailable" on subsequent requests.
+            // 429 同樣不可在此標記：chat.ts 內部已處理（只在明確 quota_exhausted 時才標記
+            // 帳號並嘗試換帳號）。在這裡再標一次會把「唯一帳號」封 30 秒，讓該帳號下所有
+            // 其他模型全部回 400 "No account routing entries"。
+            // 2026-10-02 實測：gemini-3.8-flash-high 一次 429 之後，當下完全正常的
+            // claude-sonnet-4-6 與 gemini-3-flash 也立刻開始回 400。
+            if (error.status === 404 || error.status === 400 || error.status === 401 || error.status === 403 || error.status === 429) {
+                return
+            }
         const cooldownMs = error.status >= 500 ? ANTIGRAVITY_SERVER_ERROR_COOLDOWN_MS : 30_000
         accountManager
             .markRateLimitedFromError(entry.accountId, error.status, error.body, error.retryAfter, requestModel, { maxDurationMs: cooldownMs })
@@ -620,8 +637,11 @@ async function createAccountCompletionWithEntries(request: RoutedRequest, entrie
                 if (entry.accountId === "auto") {
                     throw new RoutingError(`Account routing entry for "${request.model}" cannot use auto without smart switch expansion`, 400)
                 }
-                const isLimited = accountManager.isAccountRateLimited(entry.accountId) || isRouterRateLimited("antigravity", entry.accountId)
-                if (isLimited) continue
+                const isLimited =
+                    accountManager.isAccountRateLimited(entry.accountId) ||
+                    accountManager.isModelRateLimited(entry.accountId, request.model) ||
+                    isRouterRateLimited("antigravity", entry.accountId)
+                if (entries.length > 1 && isLimited) continue
                 if (entries.length > 1 && accountManager.isAccountInFlight(entry.accountId)) continue
                 const accountDisplay = getAccountDisplay("antigravity", entry.accountId)
                 setRequestLogContext({ model: request.model, provider: "antigravity", account: accountDisplay, routeTag: "ar" })
@@ -670,7 +690,13 @@ async function createAccountCompletionWithEntries(request: RoutedRequest, entrie
                 const shouldAdvance = shouldAdvanceCursorOnError(entry, error)
                 if (shouldAdvance) {
                     if (entry.provider === "antigravity") {
-                        if (error.status !== 404 && error.status !== 401 && error.status !== 403) {
+                        // 429 已由 chat.ts 內部處理（只在明確 quota_exhausted 時標記
+                        // 帳號並嘗試換帳號）。這裡再標一次會用 60 秒的
+                        // DEFAULT_ROUTER_COOLDOWN_MS 把「唯一帳號」整個封死，讓同一
+                        // 帳號下所有其他模型全部回 400 "No account routing entries"。
+                        // 2026-10-02 實測：gemini-3.8-flash-high 一次 429 之後，
+                        // 當下完全正常的 claude-sonnet-4-6 也開始回 400。
+                        if (error.status !== 429 && error.status !== 404 && error.status !== 400 && error.status !== 401 && error.status !== 403) {
                             const cooldownMs = error.status >= 500 ? ANTIGRAVITY_SERVER_ERROR_COOLDOWN_MS : DEFAULT_ROUTER_COOLDOWN_MS
                             accountManager.markRateLimitedFromError(
                                 entry.accountId,
@@ -697,6 +723,21 @@ async function createAccountCompletionWithEntries(request: RoutedRequest, entrie
                 continue
             }
             throw error
+        }
+    }
+
+    if (!lastError && entries.length > 0) {
+        const fallbackEntry = entries[startIndex]
+        if (fallbackEntry.provider === "antigravity" && fallbackEntry.accountId !== "auto") {
+            const accountDisplay = getAccountDisplay("antigravity", fallbackEntry.accountId)
+            setRequestLogContext({ model: request.model, provider: "antigravity", account: accountDisplay, routeTag: "ar" })
+            const result = await createChatCompletionWithOptions({ ...request, model: request.model }, {
+                accountId: fallbackEntry.accountId,
+                allowRotation: false,
+                routeTag: "ar",
+            })
+            accountState.cursor = startIndex
+            return result
         }
     }
 
@@ -866,8 +907,11 @@ async function* createAccountCompletionStreamWithEntries(request: RoutedRequest,
                 if (entry.accountId === "auto") {
                     throw new RoutingError(`Account routing entry for "${request.model}" cannot use auto without smart switch expansion`, 400)
                 }
-                const isLimited = accountManager.isAccountRateLimited(entry.accountId) || isRouterRateLimited("antigravity", entry.accountId)
-                if (isLimited) continue
+                const isLimited =
+                    accountManager.isAccountRateLimited(entry.accountId) ||
+                    accountManager.isModelRateLimited(entry.accountId, request.model) ||
+                    isRouterRateLimited("antigravity", entry.accountId)
+                if (entries.length > 1 && isLimited) continue
                 if (entries.length > 1 && accountManager.isAccountInFlight(entry.accountId)) continue
                 const accountDisplay = getAccountDisplay("antigravity", entry.accountId)
                 setRequestLogContext({ model: request.model, provider: "antigravity", account: accountDisplay, routeTag: "ar" })
@@ -942,7 +986,13 @@ async function* createAccountCompletionStreamWithEntries(request: RoutedRequest,
                 const shouldAdvance = shouldAdvanceCursorOnError(entry, error)
                 if (shouldAdvance) {
                     if (entry.provider === "antigravity") {
-                        if (error.status !== 404 && error.status !== 401 && error.status !== 403) {
+                        // 429 已由 chat.ts 內部處理（只在明確 quota_exhausted 時標記
+                        // 帳號並嘗試換帳號）。這裡再標一次會用 60 秒的
+                        // DEFAULT_ROUTER_COOLDOWN_MS 把「唯一帳號」整個封死，讓同一
+                        // 帳號下所有其他模型全部回 400 "No account routing entries"。
+                        // 2026-10-02 實測：gemini-3.8-flash-high 一次 429 之後，
+                        // 當下完全正常的 claude-sonnet-4-6 也開始回 400。
+                        if (error.status !== 429 && error.status !== 404 && error.status !== 400 && error.status !== 401 && error.status !== 403) {
                             const cooldownMs = error.status >= 500 ? ANTIGRAVITY_SERVER_ERROR_COOLDOWN_MS : DEFAULT_ROUTER_COOLDOWN_MS
                             accountManager.markRateLimitedFromError(
                                 entry.accountId,
@@ -969,6 +1019,21 @@ async function* createAccountCompletionStreamWithEntries(request: RoutedRequest,
                 continue
             }
             throw error
+        }
+    }
+
+    if (!lastError && entries.length > 0) {
+        const fallbackEntry = entries[startIndex]
+        if (fallbackEntry.provider === "antigravity" && fallbackEntry.accountId !== "auto") {
+            const accountDisplay = getAccountDisplay("antigravity", fallbackEntry.accountId)
+            setRequestLogContext({ model: request.model, provider: "antigravity", account: accountDisplay, routeTag: "ar" })
+            yield* createChatCompletionStreamWithOptions({ ...request, model: request.model }, {
+                accountId: fallbackEntry.accountId,
+                allowRotation: false,
+                routeTag: "ar",
+            })
+            accountState.cursor = startIndex
+            return
         }
     }
 

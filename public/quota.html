@@ -1966,8 +1966,16 @@
         function appendLogEntry(entry) {
             const view = document.getElementById('log-view');
             if (!view) return;
-            const line = entry?.line || " ";
+            const raw = entry?.line || " ";
+            const line = raw.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
             const row = document.createElement('div');
+            if (/\b2\d\d\b/.test(line)) {
+                row.className = 'text-emerald-400';
+            } else if (/\b429\b/.test(line) || entry?.level === 'warn') {
+                row.className = 'text-amber-400';
+            } else if (/\b[45]\d\d\b/.test(line) || entry?.level === 'error') {
+                row.className = 'text-red-400';
+            }
             row.textContent = line === "" ? " " : line;
             view.appendChild(row);
             while (view.childNodes.length > maxLogLines) {
@@ -2234,10 +2242,10 @@
                     const latencySec = Math.max(0, latencyMs / 1000).toFixed(1);
                     showToast(`Latency ${latencySec}s`);
                 } else {
-                    showToast('Unavailable');
+                    showToast(t('quota.unavailable'));
                 }
             } catch (error) {
-                showToast('Unavailable');
+                showToast(t('quota.unavailable'));
             } finally {
                 card.dataset.pinging = 'false';
             }
@@ -2355,23 +2363,50 @@
             let bars = account.bars || [];
             const cardId = `${provider}-${account.accountId}`;
 
-            // Compact layout: for Antigravity, show only 2 bars (claude_gpt + lower of gpro/gflash)
-            if (window._compactLayout && provider === 'antigravity' && bars.length >= 3) {
-                const claudeGpt = bars.find(b => b.key === 'claude_gpt');
-                const gpro = bars.find(b => b.key === 'gpro');
-                const gflash = bars.find(b => b.key === 'gflash');
-
-                // Pick the Gemini bar with lower percentage
-                let geminiBar = null;
-                if (gpro && gflash) {
-                    geminiBar = gpro.percentage <= gflash.percentage ? gpro : gflash;
-                    geminiBar = { ...geminiBar, label: 'gemini' }; // Unified label
+            // Compact layout: for Antigravity, show only 2 bars (Claude & GPT + Gemini)
+            if (window._compactLayout && provider === 'antigravity' && bars.length >= 2) {
+                const claudeWeekly = bars.find(b => b.key === 'claude_gpt');
+                const claude5h = bars.find(b => b.key === 'claude_gpt_5h');
+                let claudeBar = null;
+                if (claudeWeekly && claude5h) {
+                    claudeBar = claudeWeekly.percentage <= claude5h.percentage ? claudeWeekly : claude5h;
+                    claudeBar = { ...claudeBar, label: 'Claude & GPT' };
                 } else {
-                    geminiBar = gpro || gflash;
-                    if (geminiBar) geminiBar = { ...geminiBar, label: 'gemini' };
+                    claudeBar = claudeWeekly || claude5h;
+                    if (claudeBar) claudeBar = { ...claudeBar, label: 'Claude & GPT' };
                 }
 
-                bars = [claudeGpt, geminiBar].filter(Boolean);
+                const geminiUnified = bars.find(b => b.key === 'gemini');
+                const geminiWeekly = bars.find(b => b.key === 'gemini_weekly');
+                const gpro = bars.find(b => b.key === 'gpro');
+                const gflash = bars.find(b => b.key === 'gflash');
+                let geminiBar = null;
+                if (geminiUnified && geminiWeekly) {
+                    geminiBar = geminiUnified.percentage <= geminiWeekly.percentage ? geminiUnified : geminiWeekly;
+                    geminiBar = { ...geminiBar, label: 'Gemini' };
+                } else if (geminiUnified || geminiWeekly) {
+                    geminiBar = geminiUnified || geminiWeekly;
+                    geminiBar = { ...geminiBar, label: 'Gemini' };
+                } else if (gpro && gflash) {
+                    geminiBar = gpro.percentage <= gflash.percentage ? gpro : gflash;
+                    geminiBar = { ...geminiBar, label: 'Gemini' };
+                } else {
+                    geminiBar = gpro || gflash;
+                    if (geminiBar) geminiBar = { ...geminiBar, label: 'Gemini' };
+                }
+
+                const argonWeekly = bars.find(b => b.key === 'gemini_argon');
+                const argon5h = bars.find(b => b.key === 'gemini_argon_5h');
+                let argonBar = null;
+                if (argonWeekly && argon5h) {
+                    argonBar = argonWeekly.percentage <= argon5h.percentage ? argonWeekly : argon5h;
+                    argonBar = { ...argonBar, label: 'Gemini 4 Argon' };
+                } else if (argonWeekly || argon5h) {
+                    argonBar = argonWeekly || argon5h;
+                    argonBar = { ...argonBar, label: 'Gemini 4 Argon' };
+                }
+
+                bars = [claudeBar, geminiBar, argonBar].filter(Boolean);
             }
 
             const barHtml = bars.map(bar => {
@@ -2443,7 +2478,14 @@
             for (const provider of providerOrder) {
                 const group = accounts.filter(acc => acc.provider === provider);
                 const metricInfo = (acc) => {
-                    if (provider === 'antigravity') return getQuotaBarInfo(acc, 'claude_gpt', 'claude&gpt');
+                    if (provider === 'antigravity') {
+                        const weekly = getQuotaBarInfo(acc, 'claude_gpt', 'Claude & GPT · Weekly');
+                        const fiveHour = getQuotaBarInfo(acc, 'claude_gpt_5h', 'Claude & GPT · 5h');
+                        if ((acc.bars || []).some(b => b.key === 'claude_gpt_5h')) {
+                            return weekly.percent <= fiveHour.percent ? weekly : fiveHour;
+                        }
+                        return weekly;
+                    }
                     if (provider === 'codex') return getQuotaBarInfo(acc, 'session', '5h');
                     if (provider === 'copilot') return getQuotaBarInfo(acc, 'premium', 'premium');
                     if (provider === 'zed') return getQuotaBarInfo(acc, 'hosted', 'hosted');
@@ -2494,7 +2536,7 @@
                 planInfo.innerHTML = `<span class="text-gray-300">${t('common.accountCount', { count: accounts.length })}</span> <span class="text-gray-600 text-xs">• ${t('quota.tapToPing')}</span>`;
 
                 // Log refresh success
-                console.log(`\x1b[32m200: Quota refreshed (${accounts.length} accounts)\x1b[0m`);
+                console.log(`200: Quota refreshed (${accounts.length} accounts)`);
 
                 if (showToastMsg) {
                     showToast(t('quota.refreshed'));

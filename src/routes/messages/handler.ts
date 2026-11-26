@@ -11,7 +11,6 @@ import consola from "consola"
 
 import { createRoutedCompletion, createRoutedCompletionStream, RoutingError } from "~/services/routing/router"
 import type { ClaudeMessage, ClaudeTool } from "~/lib/translator"
-import { rateLimiter } from "~/lib/rate-limiter"
 import { validateAnthropicRequest } from "~/lib/validation"
 import { UpstreamError } from "~/lib/error"
 import { state } from "~/lib/state"
@@ -76,8 +75,6 @@ export async function handleCompletion(c: Context): Promise<Response> {
             return c.json({ error: { type: "invalid_request_error", message: validation.error } }, 400)
         }
 
-        await rateLimiter.wait()
-
         const messages = translateMessages(payload)
         const tools = extractTools(payload)
         const toolChoice = payload.tool_choice
@@ -128,7 +125,8 @@ export async function handleCompletion(c: Context): Promise<Response> {
                     type: "tool_use" as const,
                     id: block.id!,
                     name: block.name!,
-                    input: block.input
+                    input: block.input,
+                    ...((block as any).extra_content ? { extra_content: (block as any).extra_content } : {}),
                 }
             }
             return {
