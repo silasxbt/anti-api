@@ -35,6 +35,8 @@ interface RoutedRequest {
     }
     maxTokens?: number
     reasoningEffort?: "low" | "medium" | "high"
+    /** Abort upstream work when the downstream HTTP client disconnects. */
+    signal?: AbortSignal
 }
 
 type FlowStickyState = {
@@ -51,9 +53,10 @@ type ProviderUsage = {
     }
 }
 
-function normalizeOfficialModelId(model: string): string {
+export function normalizeOfficialModelId(model: string): string {
     const normalized = model?.trim()
     if (!normalized) return model
+    const lookupKey = normalized.toLowerCase()
     const map: Record<string, string> = {
         "claude-opus-4-7": "claude-opus-4.7",
         "claude-opus-4-6": "claude-opus-4-6-thinking",
@@ -63,7 +66,26 @@ function normalizeOfficialModelId(model: string): string {
         "claude-opus-4.5-thinking": "claude-opus-4-5-thinking",
         "claude-opus-4.6-thinking": "claude-opus-4-6-thinking",
     }
-    return map[normalized] || normalized
+    return map[lookupKey] || normalized
+}
+
+/**
+ * Return a stable comparison key for provider model IDs.
+ *
+ * Providers do not agree on punctuation (for example, `claude-sonnet-4.5`
+ * versus `claude-sonnet-4-5`). Keep the public/request model untouched, but
+ * use the same key while deciding which provider or account route applies.
+ */
+function officialModelKey(model: string): string {
+    return normalizeOfficialModelId(model || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[._]/g, "-")
+        .replace(/-+/g, "-")
+}
+
+export function modelIdsMatch(left: string, right: string): boolean {
+    return officialModelKey(left) === officialModelKey(right)
 }
 
 function isEntryUsable(entry: RoutingEntry): boolean {
@@ -138,7 +160,7 @@ function buildOfficialModelIndex(): Map<string, Set<AuthProvider>> {
     for (const provider of PROVIDER_ORDER) {
         const models = getProviderModels(provider)
         for (const model of models) {
-            const key = model.id
+            const key = officialModelKey(model.id)
             if (!index.has(key)) {
                 index.set(key, new Set<AuthProvider>())
             }
@@ -150,7 +172,7 @@ function buildOfficialModelIndex(): Map<string, Set<AuthProvider>> {
 
 function getOfficialModelProviders(model: string): AuthProvider[] {
     const officialModelIndex = buildOfficialModelIndex()
-    return Array.from(officialModelIndex.get(model) || [])
+    return Array.from(officialModelIndex.get(officialModelKey(model)) || [])
 }
 
 function isOfficialModel(model: string): boolean {
@@ -217,7 +239,7 @@ function resolveAccountRoutingEntries(config: RoutingConfig, model: string): Acc
 
     const accountRouting = config.accountRouting
     const smartSwitch = accountRouting?.smartSwitch ?? false
-    const route = accountRouting?.routes.find(r => r.modelId === model)
+    const route = accountRouting?.routes.find(r => modelIdsMatch(r.modelId, model))
 
     let entries: AccountRoutingEntry[] = route?.entries ? [...route.entries] : []
 
@@ -360,26 +382,25 @@ function getFlowKey(model: string): string {
     return raw
 }
 
-function selectFlowEntries(config: RoutingConfig, model: string): RoutingEntry[] {
-    const { flows } = config
-    if (flows.length === 0) {
-        return []
-    }
-
+function findFlow(config: RoutingConfig, model: string): RoutingConfig["flows"][number] | undefined {
     const raw = model?.trim() || ""
-    const isRoute = raw.toLowerCase().startsWith("route:")
     const flowKey = getFlowKey(model)
-    const exact = flows.find(flow => flow.name === flowKey)
+    const exact = config.flows.find(flow => flow.name === flowKey)
     if (exact) {
-        return exact.entries
+        return exact
     }
 
-    if (isRoute) {
-        return []
+    // `route:` names are explicit and must remain exact. For ordinary model
+    // requests, allow a configured flow to use either dotted or hyphenated
+    // spelling of the same official model ID.
+    if (raw.toLowerCase().startsWith("route:")) {
+        return undefined
     }
+    return config.flows.find(flow => modelIdsMatch(flow.name, flowKey))
+}
 
-    // 🆕 没有匹配到 flow，返回空数组
-    return []
+function selectFlowEntries(config: RoutingConfig, model: string): RoutingEntry[] {
+    return findFlow(config, model)?.entries || []
 }
 
 function resolveFlowEntries(config: RoutingConfig, model: string): RoutingEntry[] {
@@ -391,8 +412,9 @@ function resolveFlowEntries(config: RoutingConfig, model: string): RoutingEntry[
 }
 
 function resolveFlowSelection(config: RoutingConfig, model: string): { flowKey: string; entries: RoutingEntry[] } {
-    const flowKey = getFlowKey(model)
-    const entries = normalizeEntries(selectFlowEntries(config, model))
+    const flow = findFlow(config, model)
+    const flowKey = flow?.name || getFlowKey(model)
+    const entries = normalizeEntries(flow?.entries || [])
     if (entries.length === 0) {
         throw new RoutingError(`No flow routing entries configured for model "${model}"`, 400)
     }
@@ -503,19 +525,19 @@ async function createHostedProviderCompletion(
     request: RoutedRequest
 ) {
     if (provider === "codex") {
-        return createCodexCompletion(account, model, request.messages, request.tools, request.maxTokens, request.reasoningEffort)
+        return createCodexCompletion(account, model, request.messages, request.tools, request.maxTokens, request.reasoningEffort, request.signal)
     }
     if (provider === "copilot") {
-        return createCopilotCompletion(account, model, request.messages, request.tools, request.maxTokens)
+        return createCopilotCompletion(account, model, request.messages, request.tools, request.maxTokens, request.signal)
     }
     if (provider === "zed") {
-        return createZedCompletion(account, model, request.messages, request.tools, request.maxTokens, request.reasoningEffort)
+        return createZedCompletion(account, model, request.messages, request.tools, request.maxTokens, request.reasoningEffort, request.signal)
     }
     if (provider === "kiro") {
-        return createKiroCompletion(account, model, request.messages, request.tools, request.maxTokens)
+        return createKiroCompletion(account, model, request.messages, request.tools, request.maxTokens, request.signal)
     }
     if (provider === "grok") {
-        return createGrokCompletion(account, model, request.messages, request.tools, request.maxTokens, request.reasoningEffort)
+        return createGrokCompletion(account, model, request.messages, request.tools, request.maxTokens, request.reasoningEffort, request.signal)
     }
     throw new Error("Unsupported provider")
 }
@@ -551,7 +573,8 @@ async function createFlowCompletionWithEntries(request: RoutedRequest, entries: 
         return result
     }
 
-    for (let index = startIndex; index < entries.length; index++) {
+    for (let offset = 0; offset < entries.length; offset++) {
+        const index = (startIndex + offset) % entries.length
         const entry = entries[index]
         if (shouldSkipFlowEntry(entry, entries.length)) {
             continue
@@ -639,7 +662,7 @@ async function createAccountCompletionWithEntries(request: RoutedRequest, entrie
                 }
                 const isLimited =
                     accountManager.isAccountRateLimited(entry.accountId) ||
-                    accountManager.isModelRateLimited(entry.accountId, request.model) ||
+                    accountManager.isModelRateLimited?.(entry.accountId, request.model) ||
                     isRouterRateLimited("antigravity", entry.accountId)
                 if (entries.length > 1 && isLimited) continue
                 if (entries.length > 1 && accountManager.isAccountInFlight(entry.accountId)) continue
@@ -825,7 +848,8 @@ async function* createFlowCompletionStreamWithEntries(request: RoutedRequest, en
         console.log(formatSuccessLine({ elapsed, model: request.model, provider: entry.provider, account: accountDisplay, routeTag: "fr" }))
     }
 
-    for (let index = startIndex; index < entries.length; index++) {
+    for (let offset = 0; offset < entries.length; offset++) {
+        const index = (startIndex + offset) % entries.length
         const entry = entries[index]
         if (shouldSkipFlowEntry(entry, entries.length)) {
             continue
@@ -909,7 +933,7 @@ async function* createAccountCompletionStreamWithEntries(request: RoutedRequest,
                 }
                 const isLimited =
                     accountManager.isAccountRateLimited(entry.accountId) ||
-                    accountManager.isModelRateLimited(entry.accountId, request.model) ||
+                    accountManager.isModelRateLimited?.(entry.accountId, request.model) ||
                     isRouterRateLimited("antigravity", entry.accountId)
                 if (entries.length > 1 && isLimited) continue
                 if (entries.length > 1 && accountManager.isAccountInFlight(entry.accountId)) continue
@@ -1049,20 +1073,20 @@ export async function* createRoutedCompletionStream(request: RoutedRequest): Asy
     if (isHiddenCodexModel(normalizedModel)) {
         throw new RoutingError("Model is not available", 400)
     }
+    const normalizedRequest = normalizedModel === request.model ? request : { ...request, model: normalizedModel }
     const config = loadRoutingConfig()
     const activeFlow = resolveActiveFlowSelection(config)
     if (activeFlow) {
-        yield* createFlowCompletionStreamWithEntries(request, activeFlow.entries, activeFlow.flowKey)
+        yield* createFlowCompletionStreamWithEntries(normalizedRequest, activeFlow.entries, activeFlow.flowKey)
         return
     }
 
     if (isOfficialModel(normalizedModel)) {
         const accountEntries = resolveAccountEntries(config, normalizedModel)
-        const normalizedRequest = { ...request, model: normalizedModel }
         yield* createAccountCompletionStreamWithEntries(normalizedRequest, accountEntries)
         return
     }
 
-    const flowSelection = resolveFlowSelection(config, request.model)
-    yield* createFlowCompletionStreamWithEntries(request, flowSelection.entries, flowSelection.flowKey)
+    const flowSelection = resolveFlowSelection(config, normalizedRequest.model)
+    yield* createFlowCompletionStreamWithEntries(normalizedRequest, flowSelection.entries, flowSelection.flowKey)
 }

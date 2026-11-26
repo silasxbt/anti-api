@@ -10,6 +10,7 @@ import consola from "consola"
 import { getDataDir, getLegacyProjectDataDir } from "~/lib/data-dir"
 import { writePrivateFile } from "~/lib/private-file"
 import { getPublicGatewayPort, getPublicGatewayToken } from "~/lib/public-access"
+import { safeErrorMessage } from "~/lib/redaction"
 
 const CONFIG_FILE = join(getDataDir(), "remote-config.json")
 const LEGACY_CONFIG_FILE = join(getLegacyProjectDataDir(), "remote-config.json")
@@ -75,7 +76,7 @@ function saveConfig(config: TunnelConfig): void {
     try {
         writePrivateFile(CONFIG_FILE, JSON.stringify(config, null, 2))
     } catch (e) {
-        consola.error("Failed to save config:", e)
+        consola.error("Failed to save config:", safeErrorMessage(e))
     }
 }
 
@@ -341,7 +342,7 @@ export async function startNgrok(port: number, authtoken?: string): Promise<Tunn
         })
 
         proc.on("error", (err) => {
-            consola.error("Ngrok error:", err)
+            consola.error("Ngrok error:", safeErrorMessage(err))
             tunnelState.ngrok.process = null
             stopNgrokHealthCheck()
             safeResolve({ active: false, url: null, pid: null, error: err.message })
@@ -405,7 +406,7 @@ async function attemptNgrokReconnect() {
         await startNgrok(ngrokStability.lastPort, ngrokStability.lastAuthtoken || undefined)
         consola.success("Ngrok reconnected successfully")
     } catch (e) {
-        consola.error("Ngrok reconnect failed:", e)
+        consola.error("Ngrok reconnect failed:", safeErrorMessage(e))
     }
 
     ngrokStability.isReconnecting = false
@@ -468,7 +469,7 @@ export async function startLocaltunnel(port: number, subdomain?: string): Promis
             })
 
             tunnel.on("error", (err: any) => {
-                consola.error("Localtunnel error:", err)
+                consola.error("Localtunnel error:", safeErrorMessage(err))
                 tunnelState.localtunnel.process = null
                 tunnelState.localtunnel.url = null
             })
@@ -486,8 +487,8 @@ export async function startLocaltunnel(port: number, subdomain?: string): Promis
                 error: password ? `密码: ${password}` : undefined
             })
         } catch (e: any) {
-            consola.error("Failed to start localtunnel:", e)
-            resolve({ active: false, url: null, pid: null, error: e.message })
+            consola.error("Failed to start localtunnel:", safeErrorMessage(e))
+            resolve({ active: false, url: null, pid: null, error: safeErrorMessage(e) })
         }
     })
 }

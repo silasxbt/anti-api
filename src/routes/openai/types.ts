@@ -18,10 +18,25 @@ export interface OpenAIChatCompletionRequest {
 
 export interface OpenAIMessage {
     role: "system" | "user" | "assistant" | "tool" | "developer"
-    content: string | null
+    content: string | OpenAIContentPart[] | null
     tool_calls?: OpenAIToolCall[]
     tool_call_id?: string
 }
+
+export interface OpenAITextContentPart {
+    type: "text" | "input_text"
+    text: string
+}
+
+export interface OpenAIImageUrlContentPart {
+    type: "image_url"
+    image_url: {
+        url: string
+        detail?: "auto" | "low" | "high"
+    }
+}
+
+export type OpenAIContentPart = OpenAITextContentPart | OpenAIImageUrlContentPart
 
 export interface OpenAITool {
     type: "function"

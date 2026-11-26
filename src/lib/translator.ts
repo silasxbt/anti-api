@@ -21,6 +21,9 @@ export interface ClaudeContentBlock {
         type: "base64"
         media_type: string
         data: string
+    } | {
+        type: "url"
+        url: string
     }
 }
 
@@ -204,4 +207,3 @@ export function* antigravityToClaudeSSE(chunk: any, state: ConversionState): Gen
         } catch (e) { }
     }
 }
-

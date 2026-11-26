@@ -3,7 +3,6 @@
  */
 
 import { Hono } from "hono"
-import { cors } from "hono/cors"
 import { readFileSync } from "fs"
 import { join } from "path"
 import consola from "consola"
@@ -28,14 +27,25 @@ import { pingAccount } from "./services/ping"
 import { summarizeUpstreamError, UpstreamError } from "./lib/error"
 import { authStore } from "./services/auth/store"
 import type { AuthProvider } from "./services/auth/types"
+import { safeErrorMessage } from "./lib/redaction"
 
 import { formatLogTime, getRequestLogContext, runWithRequestContext } from "./lib/logger"
 import { initLogCapture, setLogCaptureEnabled } from "./lib/log-buffer"
 import { getUsage, resetUsage } from "./services/usage-tracker"
 import { getPublicDir } from "./lib/public-dir"
 
-import { getPublicGatewayToken, extractPublicToken, tokenMatches } from "./lib/public-access"
+import {
+    CONTROL_PLANE_COOKIE,
+    extractControlPlaneBootstrapToken,
+    extractControlPlaneToken,
+    getControlPlaneToken,
+    getPublicGatewayToken,
+    extractPublicToken,
+    isContainerControlPlaneEnabled,
+    tokenMatches,
+} from "./lib/public-access"
 import { isLoopbackRequest } from "./lib/local-request"
+import { resolveLogLevel } from "./lib/log-level"
 
 export const server = new Hono()
 const PROVIDERS: AuthProvider[] = ["antigravity", "codex", "copilot", "zed", "kiro", "grok"]
@@ -48,7 +58,7 @@ interface ModelListEntry {
 
 initLogCapture()
 setLogCaptureEnabled(loadSettings().captureLogs)
-consola.level = 0
+consola.level = resolveLogLevel()
 
 // 中间件 - 请求日志 (只记录重要请求)
 server.use(async (c, next) => {
@@ -83,19 +93,20 @@ server.use(async (c, next) => {
         // All successful requests are silent (detailed 200 logs are handled elsewhere)
     })
 })
-server.use(cors({
-    // 只允许同源/本机来源跨域读取，阻止任意网页驱动本地代理
-    origin: (origin) => {
-        if (!origin) return origin
-        try {
-            const host = new URL(origin).hostname
-            if (host === "localhost" || host === "127.0.0.1" || host === "::1") return origin
-        } catch { }
-        return null
-    },
-}))
 server.use(async (c, next) => {
-    if (!isLoopbackRequest(c.req.raw)) {
+    if (isContainerControlPlaneEnabled()) {
+        const expectedToken = getControlPlaneToken()
+        const bootstrapToken = extractControlPlaneBootstrapToken(c.req.raw)
+        if (expectedToken && bootstrapToken && tokenMatches(expectedToken, bootstrapToken)) {
+            c.header("Set-Cookie", `${CONTROL_PLANE_COOKIE}=${encodeURIComponent(expectedToken)}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Strict`)
+            const cleanUrl = new URL(c.req.url)
+            cleanUrl.searchParams.delete("control_token")
+            return c.redirect(`${cleanUrl.pathname}${cleanUrl.search}`, 303)
+        }
+        if (!expectedToken || !tokenMatches(expectedToken, extractControlPlaneToken(c.req.raw))) {
+            return c.json({ success: false, error: "A valid container control-plane token is required." }, expectedToken ? 401 : 503)
+        }
+    } else if (!isLoopbackRequest(c.req.raw)) {
         return c.json({ success: false, error: "The local control plane is only available through a loopback host and origin." }, 403)
     }
     await next()
@@ -337,7 +348,7 @@ server.post("/accounts/ping", async (c) => {
             provider,
             accountId,
             modelId: modelId || null,
-            error: (error as Error).message,
+            error: safeErrorMessage(error),
         })
     }
 })
@@ -394,7 +405,7 @@ server.delete("/accounts/:id", async (c) => {
                 saveRoutingConfig(cleanedFlows, undefined, cleanedAccountRouting)
             }
         } catch (e) {
-            console.error("Failed to cleanup routing config:", e)
+            console.error("Failed to cleanup routing config:", safeErrorMessage(e))
         }
         return c.json({
             success: true,

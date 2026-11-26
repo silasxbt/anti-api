@@ -1,9 +1,11 @@
 import { CodeWhispererStreaming, AccessDeniedException, ThrottlingException, GenerateAssistantResponseCommand } from "@aws/codewhisperer-streaming-client"
-import type { ChatMessage, Tool, ToolResult } from "@aws/codewhisperer-streaming-client"
-import { Origin, ChatTriggerType, ToolResultStatus } from "@aws/codewhisperer-streaming-client"
+import type { ChatMessage, ImageBlock, Tool, ToolResult, ToolUse } from "@aws/codewhisperer-streaming-client"
+import { Origin, ChatTriggerType, ImageFormat, ToolResultStatus } from "@aws/codewhisperer-streaming-client"
 import { NodeHttpHandler } from "@smithy/node-http-handler"
 import https from "https"
-import { UpstreamError } from "~/lib/error"
+import { RequestValidationError, UpstreamError } from "~/lib/error"
+import { fetchRemoteImageAsBase64 } from "~/lib/remote-image"
+import { createImageInputBudget, decodedBase64ImageBytes, type ImageInputBudget } from "~/lib/image-input"
 import { authStore } from "~/services/auth/store"
 import type { ProviderAccount } from "~/services/auth/types"
 import type { ClaudeMessage, ClaudeTool, ContentBlock } from "~/lib/translator"
@@ -53,6 +55,107 @@ function toolResultsFromMessage(message: ClaudeMessage): ToolResult[] {
         }))
 }
 
+function toolUsesFromMessage(message: ClaudeMessage): ToolUse[] | undefined {
+    if (typeof message.content === "string") return undefined
+
+    const toolUses: ToolUse[] = []
+    for (const block of message.content) {
+        if (block.type !== "tool_use") continue
+        if (!block.id || !block.name) {
+            throw new RequestValidationError("Kiro assistant tool_use blocks must include id and name")
+        }
+        toolUses.push({
+            toolUseId: block.id,
+            name: block.name,
+            input: block.input ?? {},
+        })
+    }
+
+    return toolUses.length > 0 ? toolUses : undefined
+}
+
+function getKiroImageFormat(mediaType: unknown): ImageFormat {
+    if (typeof mediaType !== "string") {
+        throw new RequestValidationError("Kiro image blocks must include a media type")
+    }
+    switch (mediaType.trim().toLowerCase().split(";", 1)[0]) {
+        case "image/png":
+            return ImageFormat.PNG
+        case "image/jpeg":
+        case "image/jpg":
+            return ImageFormat.JPEG
+        case "image/gif":
+            return ImageFormat.GIF
+        case "image/webp":
+            return ImageFormat.WEBP
+        default:
+            throw new RequestValidationError("Kiro supports only PNG, JPEG, GIF, and WebP image blocks")
+    }
+}
+
+function decodeKiroImage(data: unknown): Uint8Array {
+    if (typeof data !== "string") {
+        throw new RequestValidationError("Kiro image blocks must include base64 image data")
+    }
+    const normalized = data.replace(/\s/g, "")
+    if (!normalized || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(normalized)) {
+        throw new RequestValidationError("Kiro image blocks must include valid base64 image data")
+    }
+    return new Uint8Array(Buffer.from(normalized, "base64"))
+}
+
+function createKiroImageBudget(messages: ClaudeMessage[]): ImageInputBudget {
+    try {
+        return createImageInputBudget(messages)
+    } catch (error) {
+        if (error instanceof RequestValidationError && error.message === "image source must include valid base64 data") {
+            throw new RequestValidationError("Kiro image blocks must include valid base64 image data")
+        }
+        throw error
+    }
+}
+
+type ImageConversionOptions = {
+    signal?: AbortSignal
+    imageBudget: ImageInputBudget
+}
+
+async function imagesFromMessage(message: ClaudeMessage, options: ImageConversionOptions): Promise<ImageBlock[] | undefined> {
+    if (typeof message.content === "string") return undefined
+
+    const images: ImageBlock[] = []
+    for (const block of message.content) {
+        if (block.type !== "image") continue
+        if (!block.source) {
+            throw new RequestValidationError("Kiro image blocks must include an image source")
+        }
+
+        let source: { media_type: string; data: string }
+        if (block.source.type === "url") {
+            if (options.imageBudget.remainingBytes <= 0) {
+                throw new RequestValidationError("image inputs exceed the 16 MiB per-request limit")
+            }
+            source = await fetchRemoteImageAsBase64(block.source.url, {
+                signal: options.signal,
+                maxBytes: options.imageBudget.remainingBytes,
+            })
+            options.imageBudget.addFetchedBytes(decodedBase64ImageBytes(source.data, true))
+        } else {
+            source = block.source
+        }
+        images.push({
+            format: getKiroImageFormat(source.media_type),
+            source: { bytes: decodeKiroImage(source.data) },
+        })
+    }
+
+    return images.length > 0 ? images : undefined
+}
+
+function hasImageBlocks(message: ClaudeMessage): boolean {
+    return typeof message.content !== "string" && message.content.some(block => block.type === "image")
+}
+
 function toKiroTools(tools?: ClaudeTool[]): Tool[] | undefined {
     if (!tools || tools.length === 0) return undefined
     return tools.map(tool => ({
@@ -64,25 +167,38 @@ function toKiroTools(tools?: ClaudeTool[]): Tool[] | undefined {
     }))
 }
 
-function toKiroMessages(messages: ClaudeMessage[], tools?: ClaudeTool[]): { history: ChatMessage[]; currentMessage: ChatMessage } {
+export async function toKiroMessages(
+    messages: ClaudeMessage[],
+    tools?: ClaudeTool[],
+    options: { signal?: AbortSignal; imageBudget?: ImageInputBudget } = {},
+): Promise<{ history: ChatMessage[]; currentMessage: ChatMessage }> {
     const history: ChatMessage[] = []
     const allTools = toKiroTools(tools)
+    const imageBudget = options.imageBudget ?? createKiroImageBudget(messages)
+    const imageOptions = { signal: options.signal, imageBudget }
 
     for (const message of messages.slice(0, -1)) {
         if (message.role === "assistant") {
+            if (hasImageBlocks(message)) {
+                throw new RequestValidationError("Kiro only supports image blocks in user messages")
+            }
+            const toolUses = toolUsesFromMessage(message)
             history.push({
                 assistantResponseMessage: {
                     content: messageText(message),
+                    ...(toolUses ? { toolUses } : {}),
                 },
             })
             continue
         }
 
         const toolResults = toolResultsFromMessage(message)
+        const images = await imagesFromMessage(message, imageOptions)
         history.push({
             userInputMessage: {
                 origin: Origin.AI_EDITOR,
                 content: messageText(message) || "continue",
+                ...(images ? { images } : {}),
                 userInputMessageContext: {
                     editorState: {},
                     ...(toolResults.length > 0 ? { toolResults } : {}),
@@ -94,12 +210,17 @@ function toKiroMessages(messages: ClaudeMessage[], tools?: ClaudeTool[]): { hist
 
     const latest = messages[messages.length - 1]
     const latestToolResults = latest ? toolResultsFromMessage(latest) : []
+    if (latest?.role === "assistant" && hasImageBlocks(latest)) {
+        throw new RequestValidationError("Kiro only supports image blocks in user messages")
+    }
+    const latestImages = latest?.role === "user" ? await imagesFromMessage(latest, imageOptions) : undefined
     return {
         history,
         currentMessage: {
             userInputMessage: {
                 origin: Origin.AI_EDITOR,
                 content: latest ? messageText(latest) || "continue" : "continue",
+                ...(latestImages ? { images: latestImages } : {}),
                 userInputMessageContext: {
                     editorState: {},
                     ...(latestToolResults.length > 0 ? { toolResults: latestToolResults } : {}),
@@ -126,6 +247,20 @@ function mapKiroError(error: unknown): never {
     throw new UpstreamError("kiro", status, message)
 }
 
+function createAbortError(): Error {
+    const error = new Error("Kiro request aborted")
+    error.name = "AbortError"
+    return error
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) throw createAbortError()
+}
+
+function isAbortError(error: unknown): boolean {
+    return !!error && typeof error === "object" && (error as { name?: unknown }).name === "AbortError"
+}
+
 export function listKiroModelsForAccount(_account: ProviderAccount): Promise<KiroModelInfo[]> {
     return Promise.resolve(KIRO_STATIC_MODELS)
 }
@@ -135,9 +270,13 @@ export async function createKiroCompletion(
     model: string,
     messages: ClaudeMessage[],
     tools?: ClaudeTool[],
-    maxTokens?: number
+    maxTokens?: number,
+    signal?: AbortSignal
 ) {
+    throwIfAborted(signal)
+    const imageBudget = createKiroImageBudget(messages)
     const effectiveAccount = await refreshKiroAccountIfNeeded(account)
+    throwIfAborted(signal)
     const client = new CodeWhispererStreaming({
         region: getKiroRegion(effectiveAccount),
         endpoint: getKiroEndpoint(effectiveAccount),
@@ -150,10 +289,11 @@ export async function createKiroCompletion(
         customUserAgent: `KiroIDE ${process.env.ANTI_API_KIRO_VERSION || "0.0.0"} anti-api`,
     })
 
-    const { history, currentMessage } = toKiroMessages(messages, tools)
+    const { history, currentMessage } = await toKiroMessages(messages, tools, { signal, imageBudget })
+    throwIfAborted(signal)
     const modelId = model || KIRO_DEFAULT_MODEL
     try {
-        const response = await client.send(new GenerateAssistantResponseCommand({
+        const command = new GenerateAssistantResponseCommand({
             profileArn: effectiveAccount.projectId,
             conversationState: {
                 conversationId: crypto.randomUUID(),
@@ -167,7 +307,11 @@ export async function createKiroCompletion(
                 chatTriggerType: ChatTriggerType.MANUAL,
             },
             ...(maxTokens ? { additionalModelRequestFields: { max_tokens: maxTokens } } : {}),
-        }))
+        })
+        const response = signal
+            ? await client.send(command, { abortSignal: signal })
+            : await client.send(command)
+        throwIfAborted(signal)
 
         const contentBlocks: ContentBlock[] = []
         const toolInputs = new Map<string, { name: string; input: string }>()
@@ -178,6 +322,7 @@ export async function createKiroCompletion(
         }
 
         for await (const event of response.generateAssistantResponseResponse) {
+            throwIfAborted(signal)
             if (event.assistantResponseEvent?.content) {
                 text += event.assistantResponseEvent.content
             }
@@ -207,6 +352,7 @@ export async function createKiroCompletion(
             contentBlocks.push({ type: "tool_use", id, name: tool.name, input: safeParseJson(tool.input) })
         }
 
+        throwIfAborted(signal)
         authStore.markSuccess("kiro", effectiveAccount.id)
         return {
             contentBlocks,
@@ -217,6 +363,7 @@ export async function createKiroCompletion(
             },
         }
     } catch (error) {
+        if (signal?.aborted || isAbortError(error)) throw error
         if (error instanceof UpstreamError) throw error
         mapKiroError(error)
     }

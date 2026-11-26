@@ -10,10 +10,11 @@ import { authStore } from "~/services/auth/store"
 import { debugCodexOAuth, importCodexAuthSources, startCodexCliLogin, getCodexCliLoginStatus } from "~/services/codex/oauth"
 import { startCopilotDeviceFlow, pollCopilotSession, importCopilotAuthFiles } from "~/services/copilot/oauth"
 import { getIdeAuthStatus, logoutIdeSession } from "~/services/antigravity/ide-switch"
-import { importZedLocalAccount } from "~/services/zed/oauth"
+import { importConfiguredZedAccount, ZedCredentialImportError } from "~/services/zed/oauth"
 import { importKiroAuthSources } from "~/services/kiro/oauth"
 import { runAccountDiagnostics } from "~/services/auth/diagnostics"
 import { isLoopbackHost } from "~/lib/local-request"
+import { safeErrorMessage } from "~/lib/redaction"
 
 export const authRouter = new Hono()
 
@@ -36,6 +37,7 @@ authRouter.get("/accounts", (c) => {
             copilot: authStore.listSummaries("copilot"),
             zed: authStore.listSummaries("zed"),
             kiro: authStore.listSummaries("kiro"),
+            grok: authStore.listSummaries("grok"),
         },
     })
 })
@@ -122,7 +124,7 @@ authRouter.post("/login", async (c) => {
                         },
                     })
                 } catch (error) {
-                    return c.json({ success: false, error: (error as Error).message }, 400)
+                    return c.json({ success: false, error: safeErrorMessage(error) }, 400)
                 }
             }
 
@@ -149,12 +151,20 @@ authRouter.post("/login", async (c) => {
         }
 
         if (provider === "zed") {
-            const account = await importZedLocalAccount()
+            let account
+            try {
+                account = await importConfiguredZedAccount()
+            } catch (error) {
+                if (error instanceof ZedCredentialImportError) {
+                    return c.json({ success: false, error: safeErrorMessage(error) }, 400)
+                }
+                throw error
+            }
             return c.json({
                 success: true,
                 provider: "zed",
                 status: "success",
-                source: "local-import",
+                source: "configured-file",
                 account: {
                     id: account.id,
                     login: account.login,
@@ -244,8 +254,8 @@ authRouter.post("/login", async (c) => {
             email: body.email,
             name: body.name,
         })
-    } catch (error) {
-        return c.json({ error: (error as Error).message }, 500)
+    } catch {
+        return c.json({ error: "Authentication request failed. Check provider setup and retry." }, 500)
     }
 })
 
@@ -292,7 +302,7 @@ authRouter.get("/codex/debug", async (c) => {
         const result = await debugCodexOAuth()
         return c.json({ success: true, ...result })
     } catch (error) {
-        return c.json({ success: false, error: (error as Error).message }, 500)
+        return c.json({ success: false, error: safeErrorMessage(error) }, 500)
     }
 })
 
@@ -304,7 +314,7 @@ authRouter.get("/diagnostics", async (c) => {
         const report = await runAccountDiagnostics()
         return c.json({ success: true, ...report })
     } catch (error) {
-        return c.json({ success: false, error: (error as Error).message }, 500)
+        return c.json({ success: false, error: safeErrorMessage(error) }, 500)
     }
 })
 
@@ -336,6 +346,6 @@ authRouter.post("/ide/logout", async (c) => {
         const result = await logoutIdeSession()
         return c.json(result)
     } catch (error) {
-        return c.json({ success: false, error: (error as Error).message }, 500)
+        return c.json({ success: false, error: safeErrorMessage(error) }, 500)
     }
 })

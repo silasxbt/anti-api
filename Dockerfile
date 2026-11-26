@@ -25,8 +25,10 @@ ENV NODE_ENV=production
 ENV HOME=/app/data
 ENV ANTI_API_DATA_DIR=/app/data
 ENV ANTI_API_HOST=0.0.0.0
+ENV ANTI_API_CONTAINER_CONTROL_PLANE=1
 ENV ANTI_API_NO_OPEN=1
 ENV ANTI_API_OAUTH_NO_OPEN=1
+ENV ANTI_API_DOCKER_OAUTH_CALLBACK=1
 ENV ANTI_API_PACKAGE_MANAGER=docker
 ENV ANTI_API_NO_SELF_UPDATE=1
 
@@ -35,6 +37,6 @@ RUN mkdir -p /app/data
 EXPOSE 8964 1455-1465 51121-51131
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8964/auth/status >/dev/null || exit 1
+    CMD test -n "$ANTI_API_CONTROL_TOKEN" && curl -fsS -H "x-api-key: $ANTI_API_CONTROL_TOKEN" http://127.0.0.1:8964/auth/status >/dev/null || exit 1
 
 CMD ["bun", "run", "src/main.ts", "start"]

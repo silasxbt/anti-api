@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs"
 import { join } from "path"
 import consola from "consola"
 import { getDataDir } from "~/lib/data-dir"
+import { safeErrorMessage } from "~/lib/redaction"
 
 const USAGE_DIR = getDataDir()
 const USAGE_FILE = join(USAGE_DIR, "usage.json")
@@ -58,7 +59,7 @@ export function loadUsage(): void {
             }
         }
     } catch (e) {
-        consola.warn("Failed to load usage data:", e)
+        consola.warn("Failed to load usage data:", safeErrorMessage(e))
     }
 }
 
@@ -73,7 +74,7 @@ function saveUsage(): void {
         writeFileSync(USAGE_FILE, JSON.stringify(usageCache, null, 2))
         isDirty = false
     } catch (e) {
-        consola.warn("Failed to save usage data:", e)
+        consola.warn("Failed to save usage data:", safeErrorMessage(e))
     }
 }
 

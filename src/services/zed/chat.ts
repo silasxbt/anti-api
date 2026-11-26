@@ -1,15 +1,15 @@
-import Database from "better-sqlite3"
 import type { ContentBlock, ClaudeMessage, ClaudeTool } from "~/lib/translator"
 import { UpstreamError } from "~/lib/error"
 import type { ProviderAccount } from "~/services/auth/types"
-import { toOpenAIMessages, toOpenAITools } from "~/services/providers/openai-adapter"
+import { toOpenAIMessages, toOpenAIResponsesContent, toOpenAITools } from "~/services/providers/openai-adapter"
 import { cleanJsonSchemaForGemini } from "~/lib/json-schema-cleaner"
 import { authStore } from "~/services/auth/store"
+import { createAbortError, raceWithAbort, throwIfAborted } from "~/lib/stream-cancellation"
 
 const ZED_DEFAULT_SERVER_URL = "https://zed.dev"
+const ZED_CLOUD_BASE_URL = "https://cloud.zed.dev"
 const ZED_MODELS_TTL_MS = 5 * 60 * 1000
 const ZED_LLM_TOKEN_TTL_MS = 15 * 60 * 1000
-const ZED_SYSTEM_DB_PATH = `${process.env.HOME || ""}/Library/Application Support/Zed/db/0-global/db.sqlite`
 const ZED_REQUEST_TIMEOUT_MS = 8_000
 const ZED_MODELS_TIMEOUT_MS = 8_000
 const ZED_COMPLETION_TIMEOUT_MS = 90_000
@@ -91,26 +91,16 @@ const zedModelCache = new Map<string, ZedModelCacheEntry>()
 const zedModelInFlight = new Map<string, Promise<ZedModelInfo[]>>()
 const zedTokenCache = new Map<string, ZedTokenCacheEntry>()
 
-let cachedSystemId: string | null | undefined
-
 function getAccountKey(account: ProviderAccount): string {
-    return `${account.serverUrl || ZED_DEFAULT_SERVER_URL}:${account.id}`
+    return `${ZED_DEFAULT_SERVER_URL}:${account.id}`
 }
 
-function getServerUrl(account: ProviderAccount): string {
-    return (account.serverUrl || ZED_DEFAULT_SERVER_URL).trim() || ZED_DEFAULT_SERVER_URL
+function buildZedCloudBase(): string {
+    return ZED_CLOUD_BASE_URL
 }
 
-function buildZedCloudBase(serverUrl: string): string {
-    if (serverUrl === "https://zed.dev") return "https://cloud.zed.dev"
-    if (serverUrl === "https://staging.zed.dev") return "https://cloud.zed.dev"
-    if (serverUrl === "http://localhost:3000") return "http://localhost:8787"
-    return serverUrl
-}
-
-function buildZedCloudUrl(account: ProviderAccount, path: string): string {
-    const base = buildZedCloudBase(getServerUrl(account))
-    return `${base}${path}`
+function buildZedCloudUrl(_account: ProviderAccount, path: string): string {
+    return `${buildZedCloudBase()}${path}`
 }
 
 function getAccountAuthHeader(account: ProviderAccount): string {
@@ -118,25 +108,27 @@ function getAccountAuthHeader(account: ProviderAccount): string {
 }
 
 function readLocalSystemId(): string | undefined {
-    if (cachedSystemId !== undefined) {
-        return cachedSystemId || undefined
-    }
-
-    try {
-        const db = new Database(ZED_SYSTEM_DB_PATH, { readonly: true })
-        const row = db.prepare("SELECT value FROM kv_store WHERE key = ?").get("system_id") as { value?: string } | undefined
-        db.close()
-        cachedSystemId = row?.value || null
-        return cachedSystemId || undefined
-    } catch {
-        cachedSystemId = null
-        return undefined
-    }
+    const value = process.env.ANTI_API_ZED_SYSTEM_ID?.trim()
+    if (!value || value.length > 256 || !/^[A-Za-z0-9._:-]+$/.test(value)) return undefined
+    return value
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number, label: string): Promise<Response> {
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(`${label} timed out after ${timeoutMs}ms`), timeoutMs)
+    let timedOut = false
+    let callerAborted = false
+    const onCallerAbort = () => {
+        callerAborted = true
+        controller.abort()
+    }
+    if (init.signal) {
+        if (init.signal.aborted) throw createAbortError()
+        init.signal.addEventListener("abort", onCallerAbort, { once: true })
+    }
+    const timer = setTimeout(() => {
+        timedOut = true
+        controller.abort()
+    }, timeoutMs)
 
     try {
         return await fetch(url, {
@@ -144,7 +136,10 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
             signal: controller.signal,
         })
     } catch (error) {
-        if (error instanceof Error && error.name === "AbortError") {
+        if (callerAborted || init.signal?.aborted) {
+            throw createAbortError()
+        }
+        if (timedOut || error instanceof Error && error.name === "AbortError") {
             throw new Error(`${label} timed out after ${timeoutMs}ms`)
         }
         if (typeof error === "string" && error.includes("timed out")) {
@@ -153,6 +148,7 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
         throw error
     } finally {
         clearTimeout(timer)
+        init.signal?.removeEventListener("abort", onCallerAbort)
     }
 }
 
@@ -188,7 +184,8 @@ function normalizeModels(models: ZedModelInfo[]): ZedModelInfo[] {
     return Array.from(deduped.values())
 }
 
-async function getZedLlmToken(account: ProviderAccount, forceRefresh = false): Promise<string> {
+async function getZedLlmToken(account: ProviderAccount, forceRefresh = false, signal?: AbortSignal): Promise<string> {
+    throwIfAborted(signal)
     const cacheKey = getAccountKey(account)
     const cached = zedTokenCache.get(cacheKey)
     if (!forceRefresh && cached && Date.now() - cached.fetchedAt < ZED_LLM_TOKEN_TTL_MS) {
@@ -210,6 +207,7 @@ async function getZedLlmToken(account: ProviderAccount, forceRefresh = false): P
         body: JSON.stringify({
             organization_id: account.organizationId || undefined,
         }),
+        signal,
     }, ZED_REQUEST_TIMEOUT_MS, "Zed LLM token request")
 
     if (!response.ok || !data?.token) {
@@ -222,10 +220,9 @@ async function getZedLlmToken(account: ProviderAccount, forceRefresh = false): P
 
 export async function fetchZedAuthenticatedUser(
     userId: string | number,
-    accessToken: string,
-    serverUrl = ZED_DEFAULT_SERVER_URL
+    accessToken: string
 ): Promise<ZedAuthenticatedUserResponse> {
-    const base = buildZedCloudBase(serverUrl)
+    const base = buildZedCloudBase()
     const { response, text, data } = await requestJson(`${base}/client/users/me`, {
         method: "GET",
         headers: {
@@ -241,10 +238,11 @@ export async function fetchZedAuthenticatedUser(
 }
 
 export async function fetchZedAccountOverview(account: ProviderAccount): Promise<ZedAuthenticatedUserResponse> {
-    return fetchZedAuthenticatedUser(account.id, account.accessToken, getServerUrl(account))
+    return fetchZedAuthenticatedUser(account.id, account.accessToken)
 }
 
-export async function listZedModelsForAccount(account: ProviderAccount): Promise<ZedModelInfo[]> {
+export async function listZedModelsForAccount(account: ProviderAccount, signal?: AbortSignal): Promise<ZedModelInfo[]> {
+    throwIfAborted(signal)
     const cacheKey = getAccountKey(account)
     const cached = zedModelCache.get(cacheKey)
     if (cached && Date.now() - cached.fetchedAt < ZED_MODELS_TTL_MS) {
@@ -252,11 +250,11 @@ export async function listZedModelsForAccount(account: ProviderAccount): Promise
     }
     const inFlight = zedModelInFlight.get(cacheKey)
     if (inFlight) {
-        return inFlight
+        return raceWithAbort(inFlight, signal)
     }
 
     const task = (async () => {
-        let llmToken = await getZedLlmToken(account)
+        let llmToken = await getZedLlmToken(account, false, signal)
         let refreshed = false
 
         while (true) {
@@ -266,6 +264,7 @@ export async function listZedModelsForAccount(account: ProviderAccount): Promise
                     "Authorization": `Bearer ${llmToken}`,
                     "x-zed-client-supports-x-ai": "true",
                 },
+                signal,
             }, ZED_MODELS_TIMEOUT_MS, "Zed models request")
             const text = await response.text()
             let data: ZedModelsResponse | null = null
@@ -282,7 +281,7 @@ export async function listZedModelsForAccount(account: ProviderAccount): Promise
             }
 
             if (!refreshed && maybeRefreshableLlmToken(response)) {
-                llmToken = await getZedLlmToken(account, true)
+                llmToken = await getZedLlmToken(account, true, signal)
                 refreshed = true
                 continue
             }
@@ -482,7 +481,7 @@ function toResponsesInput(messages: ReturnType<typeof toOpenAIMessages>): any[] 
             input.push({
                 type: "message",
                 role: "user",
-                content: [{ type: "input_text", text: msg.content || "" }],
+                content: toOpenAIResponsesContent(msg.content, "user"),
             })
             continue
         }
@@ -491,7 +490,7 @@ function toResponsesInput(messages: ReturnType<typeof toOpenAIMessages>): any[] 
             input.push({
                 type: "message",
                 role: "assistant",
-                content: [{ type: "output_text", text: msg.content || "" }],
+                content: toOpenAIResponsesContent(msg.content, "assistant"),
             })
             for (const toolCall of msg.tool_calls || []) {
                 input.push({
@@ -975,15 +974,17 @@ export async function createZedCompletion(
     messages: ClaudeMessage[],
     tools?: ClaudeTool[],
     maxTokens?: number,
-    reasoningEffort?: ReasoningEffort
+    reasoningEffort?: ReasoningEffort,
+    signal?: AbortSignal
 ): Promise<ZedCompletionResult> {
-    const remoteModels = await listZedModelsForAccount(account)
+    throwIfAborted(signal)
+    const remoteModels = await listZedModelsForAccount(account, signal)
     const model = remoteModels.find((entry) => entry.id === modelId)
     if (!model) {
         throw new UpstreamError("zed", 404, `Model not available for this Zed account: ${modelId}`)
     }
 
-    let llmToken = await getZedLlmToken(account)
+    let llmToken = await getZedLlmToken(account, false, signal)
     let refreshed = false
 
     const body: ZedCompletionBody = {
@@ -1002,6 +1003,7 @@ export async function createZedCompletion(
                 "x-zed-client-supports-stream-ended-request-completion-status": "true",
             },
             body: JSON.stringify(body),
+            signal,
         }, ZED_COMPLETION_TIMEOUT_MS, "Zed completion request")
 
         const text = await response.text()
@@ -1012,7 +1014,7 @@ export async function createZedCompletion(
         }
 
         if (!refreshed && maybeRefreshableLlmToken(response)) {
-            llmToken = await getZedLlmToken(account, true)
+            llmToken = await getZedLlmToken(account, true, signal)
             refreshed = true
             continue
         }

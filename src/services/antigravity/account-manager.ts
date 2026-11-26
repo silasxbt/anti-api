@@ -16,6 +16,7 @@ import { fetchAntigravityModels, pickResetTime } from "./quota-fetch"
 import { UpstreamError } from "~/lib/error"
 import { getDataDir } from "~/lib/data-dir"
 import { tightenPrivateFile, writePrivateFile } from "~/lib/private-file"
+import { safeErrorMessage } from "~/lib/redaction"
 
 type RateLimitReason =
     | "quota_exhausted"
@@ -233,7 +234,7 @@ export class AccountManager {
                 }
             }
         } catch (e) {
-            consola.warn("Failed to load accounts:", e)
+            consola.warn("Failed to load accounts:", safeErrorMessage(e))
         }
 
         if (this.accounts.size === 0) {
@@ -277,7 +278,7 @@ export class AccountManager {
             }))
             writePrivateFile(this.dataFile, JSON.stringify({ accounts }, null, 2))
         } catch (e) {
-            consola.warn("Failed to save accounts:", e)
+            consola.warn("Failed to save accounts:", safeErrorMessage(e))
         }
     }
 
@@ -735,7 +736,7 @@ export class AccountManager {
                         firstAccount.expiresAt = now + tokens.expiresIn * 1000
                         this.save()
                     } catch (e) {
-                        consola.warn(`Failed to refresh token for ${firstAccount.email}:`, e)
+                        consola.warn(`Failed to refresh token for ${firstAccount.email}:`, safeErrorMessage(e))
                     }
                 }
                 this.lastUsedAccount = { accountId: firstAccount.id, timestamp: now }
@@ -787,7 +788,7 @@ export class AccountManager {
                         label: account.email,
                     })
                 } catch (e) {
-                    consola.warn(`Failed to refresh token for ${account.email}:`, e)
+                    consola.warn(`Failed to refresh token for ${account.email}:`, safeErrorMessage(e))
                     account.rateLimitedUntil = now + 60000 // 标记为暂时不可用
                     continue
                 }
@@ -881,7 +882,7 @@ export class AccountManager {
                     label: account.email,
                 })
             } catch (e) {
-                consola.warn(`Failed to refresh token for ${account.email}:`, e)
+                consola.warn(`Failed to refresh token for ${account.email}:`, safeErrorMessage(e))
                 account.rateLimitedUntil = now + 60000
                 return null
             }
@@ -981,7 +982,7 @@ export class AccountManager {
                         refreshed = true
                         continue
                     } catch (refreshError) {
-                        consola.warn(`Failed to refresh token for ${account.email}:`, refreshError)
+                        consola.warn(`Failed to refresh token for ${account.email}:`, safeErrorMessage(refreshError))
                         return null
                     }
                 }

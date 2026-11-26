@@ -2,7 +2,7 @@ services:
   anti-api:
     # Default to the prebuilt multi-arch image from GHCR (no local build needed).
     # `docker compose pull` fetches it; `docker compose up --build` builds locally instead.
-    image: ghcr.io/ink1ing/anti-api:latest
+    image: ghcr.io/silasxbt/anti-api:latest
     build:
       context: .
       args:
@@ -17,6 +17,8 @@ services:
       ANTI_API_DATA_DIR: /app/data
       ANTI_API_HOST: "0.0.0.0"
       ANTI_API_CONTAINER_CONTROL_PLANE: "1"
+      ANTI_API_CONTROL_TOKEN: "${ANTI_API_CONTROL_TOKEN:?set ANTI_API_CONTROL_TOKEN to protect the container control plane}"
+      ANTI_API_DOCKER_OAUTH_CALLBACK: "1"
       ANTI_API_PUBLIC_HOST: "0.0.0.0"
       ANTI_API_PUBLIC_PORT: "8966"
       # ANTI_API_PUBLIC_TOKEN: ${ANTI_API_PUBLIC_TOKEN:?set ANTI_API_PUBLIC_TOKEN}

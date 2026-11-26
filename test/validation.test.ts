@@ -1,5 +1,6 @@
 import { test, expect } from "bun:test"
 import { validateChatRequest, validateAnthropicRequest, validateAccountId, sanitizeString } from "../src/lib/validation"
+import { MAX_MESSAGES_PER_REQUEST, MAX_TOOLS_PER_REQUEST } from "../src/lib/constants"
 
 test("validateChatRequest accepts valid request", () => {
     const result = validateChatRequest({
@@ -70,6 +71,27 @@ test("validateAnthropicRequest rejects missing model", () => {
         messages: [{ role: "user", content: "Hello" }]
     })
     expect(result.valid).toBe(false)
+})
+
+test("validateAnthropicRequest rejects too many messages", () => {
+    const result = validateAnthropicRequest({
+        model: "claude-sonnet-4-5",
+        max_tokens: 1024,
+        messages: Array.from({ length: MAX_MESSAGES_PER_REQUEST + 1 }, () => ({ role: "user", content: "Hello" })),
+    })
+    expect(result.valid).toBe(false)
+    expect(result.error).toBe(`Too many messages (max ${MAX_MESSAGES_PER_REQUEST})`)
+})
+
+test("validateAnthropicRequest rejects too many tools", () => {
+    const result = validateAnthropicRequest({
+        model: "claude-sonnet-4-5",
+        max_tokens: 1024,
+        messages: [{ role: "user", content: "Hello" }],
+        tools: Array.from({ length: MAX_TOOLS_PER_REQUEST + 1 }, () => ({})),
+    })
+    expect(result.valid).toBe(false)
+    expect(result.error).toBe(`Too many tools (max ${MAX_TOOLS_PER_REQUEST})`)
 })
 
 test("validateAccountId accepts valid IDs", () => {

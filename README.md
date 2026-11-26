@@ -19,6 +19,35 @@
 
 > **Scope and authorization**: Anti-API is an independent, unofficial interoperability project. Some integrations use provider CLI, web, or internal endpoints and may break without notice. Compatibility does not imply provider affiliation or endorsement. Use only accounts and services you own or are explicitly authorized to administer, subject to each provider's current terms. Do not disable security updates or provider controls to preserve compatibility.
 
+## What's New (v3.2.2)
+
+- **Docker release fix** - Corrected the Dockerfile health-check instruction so multi-architecture GHCR images build successfully with Docker Buildx.
+- **Packaged runtime fixes from v3.2.1** - Includes the sidecar lifecycle and deterministic Bun test-suite fixes described below.
+
+<details>
+<summary>v3.2.1</summary>
+
+- **Packaged sidecar lifecycle** - Compiled `start` and `remote` commands now keep the Rust proxy alive for the full server lifetime, while one-shot commands never start it. Signals, startup exceptions, and direct CLI exits all clean up the child process.
+- **Deterministic Bun test suite** - Shared Codex and Copilot module mocks expose the complete runtime surface used by later server imports, preventing test-file order from producing false missing-export failures.
+- **Release validation** - Verified 196 Bun tests, Rust release compilation, both Bun entrypoint bundles, and a compiled-runtime smoke test covering both loopback listeners, sidecar authentication, graceful shutdown, one-shot behavior, and forced-startup cleanup.
+
+</details>
+
+<details>
+<summary>v3.2.0</summary>
+
+- **Provider compatibility and routing** - Improved Antigravity Gemini 3.1 request encoding, dynamic Copilot/model normalization, Codex reasoning-effort handling, and Responses API multimodal conversion for Zed, Codex, and Grok. Flow and account routes now preserve a sticky cursor and wrap through every eligible fallback entry.
+- **Six supported providers** - Antigravity, ChatGPT Codex, GitHub Copilot, Zed hosted models, Amazon Kiro, and xAI Grok can be imported, listed, quota-checked, and routed from the dashboard (subject to each provider's current access and terms).
+- **Multimodal input safety** - OpenAI `image_url` and Anthropic base64/remote image blocks are validated, size-bounded, SSRF-protected, and converted to provider-native inputs without dropping supported image parts.
+- **Reliable OAuth and account flows** - Hardened PKCE/state validation, loopback callback handling, Antigravity client-version refresh with pin/disable overrides, explicit Zed credential import, and sanitized login/diagnostic errors.
+- **Remote inference and Docker hardening** - The public listener is inference-only (default `8966`) and token-gated with `ANTI_API_PUBLIC_TOKEN`; the dashboard and management API remain loopback/token protected, including in container mode.
+- **Windows packaging and Kiro support** - Added platform-safe browser launching, resilient `start.bat` behavior, portable/WinGet bundles with checksums, and Kiro tool/image/cancellation handling; removed obsolete macOS language-server probing.
+- **Cancellation, limits, and log safety** - Propagated request aborts through routed providers, bounded request bodies and streams, applied cooldown-aware 404/429 failover, and removed upstream response bodies and credential material from logs.
+
+Release verification covered the TypeScript check, 190 Bun tests, Rust tests and release build, production dashboard bundle, archive layout, checksum generation, and local HTTP smoke checks. Live provider calls still require credentials owned or administered by the operator.
+
+</details>
+
 ## What's New (v3.1.0)
 
 - **Grok provider support** - Added xAI Grok via the Grok CLI reverse proxy (`cli-chat-proxy.grok.com`, OpenAI Responses API), with account import, model routing, and quota-store integration alongside existing providers
@@ -50,7 +79,7 @@
 <details>
 <summary>v2.8.0</summary>
 
-- **Zed hosted-model support** - Anti-API can now import the current Zed.app login state and route requests to Zed-hosted models
+- **Zed hosted-model support** - Anti-API can route authorized Zed-hosted accounts and models
 - **Per-account dynamic model fetch** - Routing fetches live models from each available Codex and Copilot account, and now includes Zed account-level model sync
 - **Zed account behavior clarified** - Zed accounts can be imported one by one and kept in Anti-API, but they cannot be bulk auto-discovered like Codex/Copilot
 - **Zed quota widget updated** - The Zed card now shows shared all-model support status and billing-period timing instead of misleading remaining-credit percentages
@@ -92,12 +121,14 @@
 ## Features
 
 - **Flow + Account Routing** - Custom flows for non-official models, account chains for provider-native model IDs
-- **Six Providers** - Antigravity, Codex, GitHub Copilot, Zed hosted models, Kiro, and Grok
+- **Six Providers** - Antigravity, ChatGPT Codex, GitHub Copilot, Zed hosted models, Amazon Kiro, and xAI Grok
 - **Remote Access** - ngrok/cloudflared/localtunnel with one-click setup
+- **Inference-only public gateway** - Separate token-gated listener for remote clients; dashboard, credentials, logs, settings, and updater stay private
 - **Full Dashboard** - Quota monitoring, routing config, settings panel
-- **Cooldown-aware failover** - Cooldown-aware selection among authorized accounts after quota, auth, or transient upstream failures
+- **Cooldown-aware failover** - Sticky, circular account selection after quota, auth, 404, 429, or transient upstream failures
 - **Dual Format** - OpenAI and Anthropic API compatible
 - **Tool Calling** - Function calling for Claude Code and CLI tools
+- **Multimodal requests** - Validated text, image, tool, and streaming content across compatible provider adapters
 
 ### Security boundary
 
@@ -105,12 +136,12 @@ The complete dashboard and management API bind to loopback by default. Remote ac
 
 ## Zed Account Notes
 
-- **Import model** - Anti-API reads the currently signed-in `Zed.app` account from macOS Keychain when you click `Add Account -> Zed`
-- **Why it differs from Codex/Copilot** - Zed does not expose multiple local auth files that can be scanned in bulk; the local desktop state is effectively a single current login
-- **What multi-account means for Zed here** - You can switch accounts inside Zed and import them one at a time into Anti-API; imported Zed accounts remain stored in Anti-API afterwards
-- **What is not supported** - Automatic bulk discovery of many Zed accounts from one machine is not available in the same way as Codex/Copilot
-- **Quota monitor behavior** - Zed hosted models share one monthly spend pool across the account. Anti-API currently shows hosted access status and billing period, not exact remaining dollar credits
-- **Credit note** - Zed plan credit depends on the plan type. For example, Zed Student is documented by Zed as including $10/month in AI token credits, while standard Pro pages may show different included credit values
+- **Explicit import only** - Set `ANTI_API_ZED_CREDENTIALS_FILE` to an absolute, owner-only JSON file, then click `Add Account -> Zed`. Anti-API does not inspect Zed.app, Keychain, or another application's database.
+- **Credential format** - The file must be no larger than 64 KiB and contain `{"type":"zed","id":"...","access_token":"..."}`. Unknown fields are ignored; keep the file readable only by its owner (`chmod 600` on Unix).
+- **Fixed services** - Imported accounts use the fixed Zed identity service at `https://zed.dev` and the fixed hosted API at `https://cloud.zed.dev`; request data cannot redirect either host.
+- **Credential expiry** - Zed source access tokens are imported as-is. If a request returns `401` or `403`, update the credential file and use `Add Account -> Zed` to re-import it; Anti-API never scans or refreshes another application's credentials automatically.
+- **Multiple accounts** - Switch accounts in Zed, export each authorized credential file, and import them one at a time. Imported accounts remain stored in Anti-API.
+- **Quota monitor behavior** - Zed hosted models share one monthly spend pool across the account. Anti-API currently shows hosted access status and billing period, not exact remaining dollar credits.
 
 ## Quick Start
 
@@ -127,6 +158,7 @@ bun run src/main.ts start
 ### Windows
 
 Double-click `start.bat` to launch.
+If startup fails, the window stays open so the error remains visible. Set `ANTI_API_NO_PAUSE=1` only for unattended scripts.
 
 WinGet packaging is prepared in this repository. After the `winget-pkgs` submission is merged, the install path will be:
 
@@ -147,28 +179,40 @@ Multi-arch images (`linux/amd64`, `linux/arm64`) are published to GHCR, so most 
 
 #### Quick start (recommended)
 
+Create a long random control-plane token before starting the container. The
+dashboard and management API require this token even when the Docker port is
+published only on localhost.
+
 ```bash
+export ANTI_API_CONTROL_TOKEN='replace-with-a-long-random-secret'
+
 docker run -d --name anti-api \
   -p 127.0.0.1:8964:8964 -p 127.0.0.1:1455-1465:1455-1465 -p 127.0.0.1:51121-51131:51121-51131 \
   -e ANTI_API_CONTAINER_CONTROL_PLANE=1 \
+  -e ANTI_API_CONTROL_TOKEN="$ANTI_API_CONTROL_TOKEN" \
   -v anti-api-data:/app/data \
-  ghcr.io/ink1ing/anti-api:latest
+  ghcr.io/silasxbt/anti-api:latest
 ```
 
 Or with Compose (pulls the prebuilt image, then runs in the background):
 
 ```bash
+# Set ANTI_API_CONTROL_TOKEN in the shell or in a .env file first.
 docker compose pull
 docker compose up -d
 ```
 
-On **Windows**, run the exact same commands in PowerShell. The named volume `anti-api-data` is managed by Docker, so there is no `$HOME`/path setup to get wrong.
+On **Windows**, set `$env:ANTI_API_CONTROL_TOKEN` to a long random value first, then run the same Docker command in PowerShell (use `$env:ANTI_API_CONTROL_TOKEN` in the `-e` argument). The named volume `anti-api-data` is managed by Docker, so there is no `$HOME`/path setup to get wrong.
 
 #### First login (once)
 
-The container can't read your local IDE credentials, so sign in via OAuth:
+The container can't read your local IDE credentials, so sign in via OAuth. To
+bootstrap the browser session, open the dashboard once with the token query
+parameter, for example `http://localhost:8964/quota?control_token=<your-token>`.
+The server immediately removes the parameter and stores an HttpOnly cookie;
+do not share or publish that URL.
 
-1. Open the dashboard: <http://localhost:8964/quota>
+1. After the one-time bootstrap redirect above, open the dashboard at <http://localhost:8964/quota>
 2. Click **Login** for a provider:
    - **GitHub Copilot** — easiest in Docker: enter the shown device code at <https://github.com/login/device>.
    - **Antigravity / Codex** — the panel (and `docker logs anti-api`) prints an `Open this URL to login: ...` link. Open it in your browser; the callback returns to `localhost` and is captured by the mapped ports.
@@ -189,11 +233,12 @@ Copilot uses a device-code flow and needs no callback port.
 
 #### Running on a remote host (NAS / VPS)
 
-OAuth callbacks redirect to `localhost`, which won't reach a remote box from your laptop's browser. Either:
+OAuth callbacks redirect to loopback (`127.0.0.1` by default), which won't reach a remote box from your laptop's browser. Either:
 
-- set `ANTI_API_OAUTH_REDIRECT_URL=http://YOUR_HOST:51121/oauth-callback` and open the printed URL, or
 - use **Copilot** (device flow, no callback), or
-- SSH-forward the ports: `ssh -L 8964:localhost:8964 -L 51121:localhost:51121 user@host`.
+- SSH-forward the ports: `ssh -L 8964:localhost:8964 -L 51121:localhost:51121 user@host`, then set `ANTI_API_OAUTH_REDIRECT_URL=http://127.0.0.1:51121/oauth-callback` on the server before starting the login flow.
+
+An explicit `ANTI_API_OAUTH_REDIRECT_URL` binds exactly the loopback callback port in that URL. In Docker, the image uses a container-only callback relay (`ANTI_API_DOCKER_OAUTH_CALLBACK=1`) for Antigravity and Codex so a host-mapped loopback port can reach the container; the host port mappings above must remain bound to `127.0.0.1`. Public callback hosts are rejected: both flows bind callbacks to login state, and Antigravity also uses PKCE; do not publish callback ports on a public interface.
 
 The complete control plane is loopback-only by default. For remote inference, expose only the separate public gateway with `ANTI_API_PUBLIC_TOKEN`; do not publish the dashboard, logs, settings, accounts, or updater.
 
@@ -221,6 +266,9 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 - In-panel self-update is disabled in Docker; upgrade with `docker compose pull && docker compose up -d`.
 - Restricted networks: `ANTI_API_COPILOT_INSECURE_TLS=1` / `ANTI_API_CODEX_INSECURE_TLS=1` bypass TLS verification (not recommended generally).
 - `ANTI_API_CODEX_REASONING_EFFORT=low|medium|high` sets Codex default effort (default `medium`).
+- Error-level logging is enabled by default. Set `ANTI_API_LOG_LEVEL=error|warn|info|debug` (or `ANTI_API_DEBUG=1`) to enable more detail; logs never include credential file contents.
+- In containers and headless hosts, set `ANTI_API_NO_OPEN=1` or `ANTI_API_OAUTH_NO_OPEN=1` to skip browser launch. Browser opening uses native commands without a shell.
+- Antigravity starts with a current client-version fallback and refreshes the public version manifest periodically. Set `ANTIGRAVITY_IDE_VERSION` to pin a known-good version, or `ANTI_API_DISABLE_ANTIGRAVITY_VERSION_REFRESH=1` to disable that check.
 - Override the base image if a registry is slow: `BUN_IMAGE=oven/bun:1.3.5 docker compose build`.
 - ngrok is bundled for Linux amd64/arm64.
 
@@ -448,6 +496,35 @@ MIT
 
 > **范围与授权说明**：Anti-API 是独立、非官方的互操作项目。部分集成使用提供商的 CLI、网页或内部端点，可能随时失效。兼容性不代表提供商隶属或背书。仅可使用本人拥有或被明确授权管理的账号与服务，并须遵守各提供商现行条款；不得为维持兼容而停用安全更新或提供商控制。
 
+## 更新内容 (v3.2.2)
+
+- **Docker 发布修复** - 修正 Dockerfile 健康检查指令，确保 Docker Buildx 可以成功构建并发布多架构 GHCR 镜像。
+- **包含 v3.2.1 打包运行时修复** - 包含下面列出的 sidecar 生命周期与 Bun 测试稳定性修复。
+
+<details>
+<summary>v3.2.1</summary>
+
+- **打包版 sidecar 生命周期** - 编译后的 `start` 与 `remote` 命令会在服务器整个生命周期内保留 Rust proxy；单次命令不会启动 sidecar。信号退出、启动异常以及 CLI 直接退出都会清理子进程。
+- **稳定的 Bun 测试套件** - Codex 与 Copilot 的共享模块 mock 现在提供后续 server 导入所需的完整运行时导出，避免测试文件顺序造成虚假的缺失导出错误。
+- **发布验证** - 已通过 196 个 Bun 测试、Rust release 编译、两个 Bun 入口构建，以及编译运行时冒烟测试；覆盖双回环监听、sidecar 鉴权、优雅关闭、单次命令和强制启动失败清理。
+
+</details>
+
+<details>
+<summary>v3.2.0</summary>
+
+- **Provider 兼容性与路由** - 改进 Antigravity Gemini 3.1 请求编码、Copilot/模型动态规范化、Codex reasoning effort，以及 Zed、Codex、Grok 的 Responses 多模态转换；Flow 与 Account 路由现在保留粘性游标，并循环尝试所有可用的回退条目。
+- **六家 Provider** - 支持 Antigravity、ChatGPT Codex、GitHub Copilot、Zed 托管模型、Amazon Kiro 与 xAI Grok 的账号导入、列表、额度检查和路由（仍受各提供商当前权限与条款约束）。
+- **多模态输入安全** - 对 OpenAI `image_url` 以及 Anthropic base64/远程图片进行格式校验、大小限制和 SSRF 防护，并转换为 provider 原生输入，不再丢失受支持的图片部分。
+- **OAuth 与账号流程加固** - 加强 PKCE/state 校验、回环回调、Antigravity 客户端版本刷新（支持固定或禁用刷新）、显式 Zed 凭证导入，并清洗登录和诊断错误。
+- **远程推理与 Docker 安全边界** - 公共监听器是独立的仅推理网关（默认 `8966`），必须设置 `ANTI_API_PUBLIC_TOKEN`；控制面板和管理 API 在容器模式下也保持回环/token 保护。
+- **Windows 打包与 Kiro 支持** - 增加跨平台浏览器启动、可靠的 `start.bat` 行为、带校验和的 portable/WinGet 包，以及 Kiro 工具/图片/取消请求处理；移除废弃的 macOS language-server 探测。
+- **取消、限制与日志安全** - 将请求取消传播到各路由 provider，限制请求体和流大小，对 404/429 应用冷却与故障转移，并移除日志中的上游响应正文和凭证材料。
+
+发布前已完成 TypeScript 检查、190 个 Bun 测试、Rust 测试与 release 构建、生产面板打包、归档布局、校验和生成及本地 HTTP 冒烟测试。真实 Provider 请求仍需由操作者提供本人拥有或获授权管理的凭证。
+
+</details>
+
 ## 更新内容 (v3.1.0)
 
 - **新增 Grok Provider 支持** - 通过 Grok CLI 的反向代理（`cli-chat-proxy.grok.com`，OpenAI Responses API）接入 xAI Grok，包含账号导入、模型路由与配额体系集成
@@ -479,7 +556,7 @@ MIT
 <details>
 <summary>v2.8.0</summary>
 
-- **新增 Zed 托管模型支持** - Anti-API 现在可以导入当前 Zed.app 的登录态，并将请求路由到 Zed 提供的模型
+- **新增 Zed 托管模型支持** - Anti-API 现在可以导入已授权的 Zed 账号，并将请求路由到 Zed 提供的模型
 - **按账号动态拉取模型** - Routing 会从每个可用的 Codex 和 Copilot 账号实时拉取模型，并加入 Zed 的账号级模型同步
 - **明确 Zed 账号边界** - Zed 账号可以逐个导入并保存在 Anti-API 中，但不能像 Codex/Copilot 一样自动批量发现
 - **更新 Zed 配额卡片** - Zed 卡片改为展示共享的 all models 支持状态和订阅周期时间，不再用误导性的剩余额度百分比
@@ -490,27 +567,30 @@ MIT
 ## 特性
 
 - **Flow + Account 路由** - 自定义流控制非官方模型，官方模型使用账号链
-- **五家 Provider** - Antigravity、Codex、GitHub Copilot、Zed 托管模型、Kiro
+- **六家 Provider** - Antigravity、ChatGPT Codex、GitHub Copilot、Zed 托管模型、Amazon Kiro、xAI Grok
 - **远程访问** - ngrok/cloudflared/localtunnel 一键设置
+- **仅推理公共网关** - 独立且必须 token 鉴权的远程监听器；面板、凭证、日志、设置和更新器保持私有
 - **完整面板** - 配额监控、路由配置、设置面板
-- **自动轮换** - 429 错误时切换账号
+- **冷却感知故障转移** - 账号选择器保留粘性游标，并在额度、认证、404、429 或临时上游错误后循环切换
 - **双格式支持** - OpenAI 和 Anthropic API 兼容
 - **工具调用** - 支持 function calling，兼容 Claude Code
+- **多模态请求** - 在兼容的 provider 适配器之间校验并传递文本、图片、工具和流式内容
 
 ## Zed 账号说明
 
-- **导入方式** - 点击 `Add Account -> Zed` 时，Anti-API 会读取当前 `Zed.app` 在 macOS Keychain 中的登录态
-- **为什么和 Codex/Copilot 不同** - Zed 本地没有像 Codex/Copilot 那样可批量扫描的多账号认证文件，桌面端本质上更接近“当前单登录态”
-- **这里的多账号含义** - 你可以先在 Zed 内切换账号，再逐个导入到 Anti-API；导入后的 Zed 账号会继续保存在 Anti-API 内
-- **当前不支持的能力** - 不能像 Codex/Copilot 一样，直接从一台机器上自动批量发现多个 Zed 本地账号
-- **额度监控说明** - Zed 的 hosted models 共用同一个月度消耗池。Anti-API 当前展示的是 hosted access 状态和订阅周期，不是精确的剩余美元额度
-- **Credit 说明** - Zed 的月度 credit 取决于具体计划类型。例如 Zed Student 官方说明为每月 $10 AI token credits，而普通 Pro 页面可能显示不同额度
+- **仅显式导入** - 将 `ANTI_API_ZED_CREDENTIALS_FILE` 设置为绝对路径、仅所有者可读的 JSON 文件，再点击 `Add Account -> Zed`。Anti-API 不会扫描 Zed.app、Keychain 或其他应用数据库。
+- **凭据格式** - 文件不得超过 64 KiB，并包含 `{"type":"zed","id":"...","access_token":"..."}`；未知字段会被忽略。Unix 下请使用 `chmod 600`。
+- **固定服务地址** - 导入账号固定使用 Zed 身份服务 `https://zed.dev` 与 hosted API `https://cloud.zed.dev`；请求体不能覆盖这两个地址。
+- **凭据过期** - Zed 源 access token 按原样导入。若请求返回 `401` 或 `403`，请更新凭据文件并使用 `Add Account -> Zed` 重新导入；Anti-API 不会扫描或自动刷新其他应用的凭据。
+- **多账号** - 在 Zed 中切换已获授权的账号，为每个账号准备凭据文件后逐个导入；已导入账号会保存在 Anti-API 中。
+- **额度监控** - Zed hosted models 共用同一个月度消耗池，面板展示 hosted access 状态和订阅周期，不显示精确剩余美元额度。
 
 ## 快速开始
 
 ### Windows
 
 双击 `start.bat` 启动。
+启动失败时窗口会保留，方便查看错误；只有无人值守脚本才应设置 `ANTI_API_NO_PAUSE=1`。
 
 仓库内已经补齐 WinGet 打包与 manifest 生成链路。待 `winget-pkgs` 合并后，可直接使用：
 
@@ -546,16 +626,20 @@ docker build -t anti-api .
 运行：
 
 ```bash
-docker run --rm -it \\
-  -p 8964:8964 \\
-  -p 1455-1465:1455-1465 \\
-  -p 51121-51131:51121-51131 \\
-  -e ANTI_API_DATA_DIR=/app/data \\
-  -e ANTI_API_NO_OPEN=1 \\
-  -e ANTI_API_OAUTH_NO_OPEN=1 \\
-  -e ANTI_API_PACKAGE_MANAGER=docker \\
-  -e ANTI_API_NO_SELF_UPDATE=1 \\
-  -v $HOME/.anti-api:/app/data \\
+export ANTI_API_CONTROL_TOKEN='replace-with-a-long-random-secret'
+
+docker run --rm -it \
+  -p 127.0.0.1:8964:8964 \
+  -p 127.0.0.1:1455-1465:1455-1465 \
+  -p 127.0.0.1:51121-51131:51121-51131 \
+  -e ANTI_API_CONTAINER_CONTROL_PLANE=1 \
+  -e ANTI_API_CONTROL_TOKEN="$ANTI_API_CONTROL_TOKEN" \
+  -e ANTI_API_DATA_DIR=/app/data \
+  -e ANTI_API_NO_OPEN=1 \
+  -e ANTI_API_OAUTH_NO_OPEN=1 \
+  -e ANTI_API_PACKAGE_MANAGER=docker \
+  -e ANTI_API_NO_SELF_UPDATE=1 \
+  -v $HOME/.anti-api:/app/data \
   anti-api
 ```
 
@@ -572,8 +656,11 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --no-build
 ```
 
 说明：
+- Docker 控制面要求设置 `ANTI_API_CONTROL_TOKEN`；首次打开面板时使用 `http://localhost:8964/quota?control_token=<你的Token>` 完成一次性引导，随后地址栏中的参数会被移除并写入 HttpOnly Cookie。不要分享或公开这个 URL。
 - OAuth 回调使用 `51121-51131`（Antigravity）和 `1455-1465`（Codex 浏览器 OAuth），请确保已映射这些端口。
-- 如果运行在远程主机，请将 `ANTI_API_OAUTH_REDIRECT_URL` 设置为公网地址，例如 `http://YOUR_HOST:51121/oauth-callback`。
+- 如果运行在远程主机，请使用 `ssh -L 8964:localhost:8964 -L 51121:localhost:51121 user@host` 转发端口，并在服务器上设置 `ANTI_API_OAUTH_REDIRECT_URL=http://127.0.0.1:51121/oauth-callback` 后再发起登录。
+- Docker 镜像会在容器内启用回调中继（`ANTI_API_DOCKER_OAUTH_CALLBACK=1`），但宿主机映射仍必须绑定 `127.0.0.1`；不要把 OAuth 回调端口发布到公网。
+- 显式设置 `ANTI_API_OAUTH_REDIRECT_URL` 后，程序只会监听该 URL 指定的回环回调端口。两个流程都会校验登录 state，Antigravity 还使用 PKCE；公网回调地址仍会被拒绝，不要将授权码经过公网 HTTP 监听器传输。
 - 挂载 `~/.anti-api` 后，Docker 会复用本地账号和路由配置。
 - 本地导入类 provider 默认看不到宿主机凭据；如需导入，请按 `docker-compose.yml` 里的注释示例挂载 `.codex`、`.cli-proxy-api`、`.aws`、Kiro CLI 或 Amazon Q 目录。
 - 设置 `ANTI_API_NO_OPEN=1` 可避免容器内尝试自动打开浏览器。
@@ -581,6 +668,8 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --no-build
 - 如果受限网络下 Copilot TLS 失败，可设置 `ANTI_API_COPILOT_INSECURE_TLS=1`（不建议常规使用）。
 - 如果受限网络下 Codex TLS 失败，可设置 `ANTI_API_CODEX_INSECURE_TLS=1`（不建议常规使用）。
 - 可通过 `ANTI_API_CODEX_REASONING_EFFORT=low|medium|high` 设置 Codex 默认推理强度（默认 `medium`）。
+- 默认只记录错误。设置 `ANTI_API_LOG_LEVEL=error|warn|info|debug` 或 `ANTI_API_DEBUG=1` 可增加诊断日志；日志不会输出凭据文件内容。
+- Antigravity 使用当前客户端版本兜底，并会定期刷新公开版本清单；可设置 `ANTIGRAVITY_IDE_VERSION` 固定版本，或设置 `ANTI_API_DISABLE_ANTIGRAVITY_VERSION_REFRESH=1` 禁用刷新。
 - 如果 Docker Hub 不稳定，默认基础镜像已使用 GHCR；可用 `BUN_IMAGE=oven/bun:1.3.5` 覆盖。
 - 镜像内已为 Linux amd64/arm64 安装 ngrok。
 

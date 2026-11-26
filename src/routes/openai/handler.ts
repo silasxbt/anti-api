@@ -17,7 +17,11 @@ import {
     mapStopReason,
 } from "./translator"
 import { validateChatRequest } from "~/lib/validation"
-import { forwardError, summarizeUpstreamError, UpstreamError } from "~/lib/error"
+import { forwardError, RequestValidationError, summarizeUpstreamError, UpstreamError } from "~/lib/error"
+import { parseBoundedJson } from "~/lib/request-body"
+import { isStreamCancellation, onRequestAbort, returnStream } from "~/lib/stream-cancellation"
+import { createImageInputBudget } from "~/lib/image-input"
+import { safeErrorMessage } from "~/lib/redaction"
 
 type ReasoningEffort = "low" | "medium" | "high"
 
@@ -52,7 +56,7 @@ function buildValidationReason(message?: string): string {
 
 export async function handleChatCompletion(c: Context): Promise<Response> {
     try {
-        const payload = await c.req.json<OpenAIChatCompletionRequest>()
+        const payload = await parseBoundedJson<OpenAIChatCompletionRequest>(c.req.raw)
         if (payload && typeof payload === "object") {
             normalizeChatPayload(payload)
         }
@@ -66,6 +70,8 @@ export async function handleChatCompletion(c: Context): Promise<Response> {
 
         const anthropicModel = mapModel(payload.model)
         const messages = translateMessages(payload.messages)
+        // Validate image count and inline byte budgets before routing to any provider.
+        createImageInputBudget(messages)
         const tools = translateTools(payload.tools)
         const reasoningEffort = extractReasoningEffort(payload)
 
@@ -81,6 +87,7 @@ export async function handleChatCompletion(c: Context): Promise<Response> {
                 tools,
                 maxTokens: payload.max_tokens || 4096,
                 reasoningEffort,
+                signal: c.req.raw.signal,
             })
         } catch (error) {
             if (error instanceof RoutingError) {
@@ -133,11 +140,15 @@ export async function handleChatCompletion(c: Context): Promise<Response> {
             },
         })
     } catch (error) {
+        if (error instanceof RequestValidationError) {
+            c.header("X-Log-Reason", buildValidationReason(error.message))
+            return c.json({ error: { type: "invalid_request_error", message: error.message } }, 400)
+        }
         if (error instanceof UpstreamError) {
             return await forwardError(c, error)
         }
-        consola.error("OpenAI completion error:", error)
-        return c.json({ error: { message: (error as Error).message, type: "api_error" } }, 500)
+        consola.error("OpenAI completion error:", safeErrorMessage(error))
+        return c.json({ error: { message: "Internal server error", type: "api_error" } }, 500)
     } finally {
         // no-op
     }
@@ -154,13 +165,34 @@ async function handleStreamCompletion(
     const chatId = generateChatId()
 
     return streamSSE(c, async (stream) => {
+        const requestSignal = c.req.raw.signal
+        let cancelled = requestSignal.aborted
+        let chatStream: AsyncGenerator<string, void, unknown> | null = null
+        const markCancelled = () => {
+            cancelled = true
+            void returnStream(chatStream)
+        }
+        const removeRequestAbort = onRequestAbort(requestSignal, () => {
+            markCancelled()
+            stream.abort()
+        })
+        stream.onAbort(markCancelled)
+
+        const writeData = async (data: string): Promise<boolean> => {
+            if (cancelled || isStreamCancellation(undefined, requestSignal, stream)) return false
+            await stream.writeSSE({ data })
+            return !(cancelled || isStreamCancellation(undefined, requestSignal, stream))
+        }
+
         try {
-            const chatStream = createRoutedCompletionStream({
+            if (cancelled) return
+            chatStream = createRoutedCompletionStream({
                 model: anthropicModel,
                 messages,
                 tools,
                 maxTokens: payload.max_tokens || 4096,
                 reasoningEffort,
+                signal: requestSignal,
             })
 
             let sentRole = false
@@ -170,20 +202,32 @@ async function handleStreamCompletion(
             let streamOutputTokens = 0
 
             for await (const event of chatStream) {
+                if (cancelled) return
                 const lines = event.split("\n")
                 for (const line of lines) {
+                    if (cancelled) return
                     if (!line.startsWith("data: ")) continue
                     const data = line.slice(6)
                     if (data === "[DONE]") continue
 
+                    let parsed: any
                     try {
-                        const parsed = JSON.parse(data)
-                        const eventType = parsed.type
+                        parsed = JSON.parse(data)
+                    } catch {
+                        // Do not turn a truncated or malformed upstream event into a
+                        // successful-looking stream. The outer handler will emit a
+                        // sanitized error and close the SSE response.
+                        throw new UpstreamError("antigravity", 502, "Malformed streaming event")
+                    }
+                    if (!parsed || typeof parsed !== "object") {
+                        throw new UpstreamError("antigravity", 502, "Malformed streaming event")
+                    }
+                    const eventType = parsed.type
 
-                        switch (eventType) {
+                    switch (eventType) {
                             case "message_start":
                                 if (!sentRole) {
-                                    await stream.writeSSE({ data: buildStreamChunk(chatId, payload.model, undefined, "assistant") })
+                                    if (!await writeData(buildStreamChunk(chatId, payload.model, undefined, "assistant"))) return
                                     sentRole = true
                                 }
                                 // Capture input tokens from message_start
@@ -206,7 +250,7 @@ async function handleStreamCompletion(
 
                             case "content_block_delta":
                                 if (parsed.delta?.type === "text_delta" && parsed.delta?.text) {
-                                    await stream.writeSSE({ data: buildStreamChunk(chatId, payload.model, parsed.delta.text) })
+                                    if (!await writeData(buildStreamChunk(chatId, payload.model, parsed.delta.text))) return
                                 } else if (parsed.delta?.type === "input_json_delta" && currentToolCall) {
                                     currentToolCall.arguments += parsed.delta.partial_json || ""
                                 }
@@ -214,7 +258,14 @@ async function handleStreamCompletion(
 
                             case "content_block_stop":
                                 if (currentToolCall) {
-                                    try { currentToolCall.input = JSON.parse(currentToolCall.arguments || "{}") } catch { currentToolCall.input = {} }
+                                    try {
+                                        currentToolCall.input = JSON.parse(currentToolCall.arguments || "{}")
+                                    } catch {
+                                        // A partial tool argument stream is not a valid function
+                                        // call. Surface it as an upstream failure instead of
+                                        // silently invoking the caller's tool with an empty object.
+                                        throw new UpstreamError("antigravity", 502, "Malformed streaming tool arguments")
+                                    }
                                     accumulatedToolCalls.push(currentToolCall)
                                     currentToolCall = null
                                 }
@@ -227,37 +278,40 @@ async function handleStreamCompletion(
                                     streamOutputTokens = parsed.usage.output_tokens
                                 }
                                 if (accumulatedToolCalls.length > 0) {
-                                    await stream.writeSSE({ data: buildStreamChunk(chatId, payload.model, undefined, undefined, "tool_use", accumulatedToolCalls) })
+                                    if (!await writeData(buildStreamChunk(chatId, payload.model, undefined, undefined, "tool_use", accumulatedToolCalls))) return
                                 }
-                                await stream.writeSSE({ data: buildStreamChunk(chatId, payload.model, undefined, undefined, stopReason) })
+                                if (!await writeData(buildStreamChunk(chatId, payload.model, undefined, undefined, stopReason))) return
                                 break
-                        }
-                    } catch (e) { }
+                    }
                 }
             }
 
 
             // Note: Usage recording is handled in chat.ts with the actual native model ID
 
-            await stream.writeSSE({ data: "[DONE]" })
+            if (!cancelled) {
+                await writeData("[DONE]")
+            }
         } catch (error) {
+            if (isStreamCancellation(error, requestSignal, stream)) return
             if (error instanceof UpstreamError) {
                 const summary = summarizeUpstreamError(error)
                 consola.error("OpenAI stream error:", summary.message)
-                await stream.writeSSE({
-                    data: JSON.stringify({
+                await writeData(JSON.stringify({
                         error: {
                             type: "upstream_error",
                             message: summary.message,
                             provider: error.provider,
                             ...(summary.reason ? { reason: summary.reason } : {}),
                         },
-                    }),
-                })
+                    }))
             } else {
-                consola.error("OpenAI stream error:", error)
-                await stream.writeSSE({ data: JSON.stringify({ error: { message: (error as Error).message, type: "api_error" } }) })
+                consola.error("OpenAI stream error:", safeErrorMessage(error))
+                await writeData(JSON.stringify({ error: { message: "Internal server error", type: "api_error" } }))
             }
-        } finally { }
+        } finally {
+            removeRequestAbort()
+            await returnStream(chatStream)
+        }
     })
 }

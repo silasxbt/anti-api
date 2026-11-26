@@ -5,6 +5,7 @@ import { ensurePrivateDir, tightenPrivateFile, writePrivateFile } from "~/lib/pr
 import { parseRetryDelay } from "~/lib/retry"
 import type { AuthProvider, ProviderAccount, ProviderAccountSummary } from "./types"
 import { getDataDir } from "~/lib/data-dir"
+import { safeErrorMessage } from "~/lib/redaction"
 
 const AUTH_DIR = join(getDataDir(), "auth")
 
@@ -111,7 +112,7 @@ function loadAccountFromFile(path: string): ProviderAccount | null {
             updatedAt: raw.updated_at,
         }
     } catch (error) {
-        consola.warn("Failed to parse auth file:", path, error)
+        consola.warn("Failed to parse auth file:", path, safeErrorMessage(error))
         return null
     }
 }
@@ -209,7 +210,7 @@ export const authStore = {
             invalidateAccountCache()
             return true
         } catch (error) {
-            consola.warn("Failed to delete auth file:", path, error)
+            consola.warn("Failed to delete auth file:", path, safeErrorMessage(error))
             return false
         }
     },

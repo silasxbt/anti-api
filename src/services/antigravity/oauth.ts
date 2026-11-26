@@ -5,6 +5,7 @@
 
 import { state } from "~/lib/state"
 import { getAntigravityUserAgent } from "~/lib/antigravity-client"
+import { createHash, randomBytes } from "node:crypto"
 
 // OAuth 配置（来自 CLIProxyAPI）
 export const OAUTH_CONFIG = {
@@ -24,7 +25,71 @@ export const OAUTH_CONFIG = {
     ],
 }
 
-const PROJECT_USER_AGENT = getAntigravityUserAgent()
+export interface OAuthCallbackServerOptions {
+    hostname?: string
+    port?: number
+    fixedPort?: boolean
+    expectedState?: string
+}
+
+type OAuthPkceSession = {
+    codeVerifier: string
+    expiresAt: number
+}
+
+const OAUTH_PKCE_SESSION_TTL_MS = 5 * 60 * 1000
+const oauthPkceSessions = new Map<string, OAuthPkceSession>()
+
+function useDockerCallbackRelay(): boolean {
+    return process.env.ANTI_API_DOCKER_OAUTH_CALLBACK === "1"
+}
+
+/**
+ * A configured loopback redirect must be bound exactly; silently falling back
+ * to the next port would produce a redirect URL that can never complete.
+ * Public callbacks are intentionally rejected. PKCE binds the authorization
+ * code to this process, but it does not make a public clear-text callback safe.
+ */
+export function resolveOAuthCallbackServerOptions(redirectUrl?: string): OAuthCallbackServerOptions {
+    if (!redirectUrl) return { hostname: useDockerCallbackRelay() ? "0.0.0.0" : "127.0.0.1" }
+
+    let redirect: URL
+    try {
+        redirect = new URL(redirectUrl)
+    } catch {
+        throw new Error("ANTI_API_OAUTH_REDIRECT_URL must be a valid http:// URL ending in /oauth-callback.")
+    }
+    if (redirect.protocol !== "http:" || redirect.pathname !== "/oauth-callback" || redirect.username || redirect.password) {
+        throw new Error("ANTI_API_OAUTH_REDIRECT_URL must be an http:// URL ending in /oauth-callback without credentials.")
+    }
+
+    const port = Number(redirect.port || "80")
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error("ANTI_API_OAUTH_REDIRECT_URL must use a valid callback port.")
+    }
+
+    const hostname = redirect.hostname.toLowerCase()
+    const isLoopback = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1"
+    if (!isLoopback) {
+        throw new Error("ANTI_API_OAUTH_REDIRECT_URL must use a loopback host. Use SSH port forwarding for a remote server.")
+    }
+    if (useDockerCallbackRelay() && (hostname === "[::1]" || hostname === "::1")) {
+        throw new Error("Docker OAuth callbacks must use http://localhost or http://127.0.0.1.")
+    }
+    const loopbackHostname = useDockerCallbackRelay()
+        ? "0.0.0.0"
+        : (hostname === "[::1]" || hostname === "::1" ? "::1" : "127.0.0.1")
+    return {
+        hostname: loopbackHostname,
+        port,
+        fixedPort: true,
+    }
+}
+
+/** Return the exact loopback redirect URI served by the default callback listener. */
+export function getAntigravityOAuthRedirectUri(port: number, configuredRedirect?: string): string {
+    return configuredRedirect || `http://127.0.0.1:${port}/oauth-callback`
+}
 
 /**
  * 生成随机 state 用于 CSRF 保护
@@ -33,10 +98,60 @@ export function generateState(): string {
     return crypto.randomUUID()
 }
 
+function base64Url(value: Buffer): string {
+    return value.toString("base64url")
+}
+
+/** Generate an in-memory PKCE verifier for one OAuth attempt. */
+export function generateCodeVerifier(): string {
+    return base64Url(randomBytes(32))
+}
+
+export function generateCodeChallenge(verifier: string): string {
+    return base64Url(createHash("sha256").update(verifier).digest())
+}
+
+function pruneExpiredOAuthPkceSessions(now = Date.now()): void {
+    for (const [oauthState, session] of oauthPkceSessions) {
+        if (session.expiresAt <= now) oauthPkceSessions.delete(oauthState)
+    }
+}
+
+/**
+ * Create the short-lived, process-local state/verifier pair for one login.
+ * The verifier is consumed only after that exact state has returned.
+ */
+export function createOAuthPkceSession(): { state: string; codeVerifier: string } {
+    pruneExpiredOAuthPkceSessions()
+
+    let oauthState = generateState()
+    while (oauthPkceSessions.has(oauthState)) oauthState = generateState()
+
+    const codeVerifier = generateCodeVerifier()
+    oauthPkceSessions.set(oauthState, {
+        codeVerifier,
+        expiresAt: Date.now() + OAUTH_PKCE_SESSION_TTL_MS,
+    })
+    return { state: oauthState, codeVerifier }
+}
+
+/** Consume an OAuth verifier once so an authorization code cannot be replayed. */
+export function consumeOAuthPkceVerifier(oauthState: string): string | null {
+    const session = oauthPkceSessions.get(oauthState)
+    oauthPkceSessions.delete(oauthState)
+    if (!session || session.expiresAt <= Date.now()) return null
+    return session.codeVerifier
+}
+
+/** Remove an abandoned login session after an error, timeout, or cancellation. */
+export function discardOAuthPkceSession(oauthState: string): void {
+    oauthPkceSessions.delete(oauthState)
+}
+
 /**
  * 生成 OAuth 授权 URL
  */
-export function generateAuthURL(redirectUri: string, state: string): string {
+export function generateAuthURL(redirectUri: string, state: string, codeVerifier: string): string {
     const params = new URLSearchParams({
         client_id: OAUTH_CONFIG.clientId,
         redirect_uri: redirectUri,
@@ -46,13 +161,15 @@ export function generateAuthURL(redirectUri: string, state: string): string {
         prompt: "consent",
         state,
     })
+    params.set("code_challenge", generateCodeChallenge(codeVerifier))
+    params.set("code_challenge_method", "S256")
     return `${OAUTH_CONFIG.authUrl}?${params.toString()}`
 }
 
 /**
  * 交换 authorization code 获取 tokens
  */
-export async function exchangeCode(code: string, redirectUri: string): Promise<{
+export async function exchangeCode(code: string, redirectUri: string, codeVerifier: string): Promise<{
     accessToken: string
     refreshToken: string
     expiresIn: number
@@ -64,6 +181,7 @@ export async function exchangeCode(code: string, redirectUri: string): Promise<{
         redirect_uri: redirectUri,
         grant_type: "authorization_code",
     })
+    params.set("code_verifier", codeVerifier)
 
     const response = await fetchJson(OAUTH_CONFIG.tokenUrl, {
         method: "POST",
@@ -74,7 +192,7 @@ export async function exchangeCode(code: string, redirectUri: string): Promise<{
     })
 
     if (response.status < 200 || response.status >= 300) {
-        throw new Error(`Token exchange failed: ${response.status} ${response.text}`)
+        throw new Error(`Token exchange failed (${response.status}).`)
     }
 
     const data = response.data as {
@@ -117,7 +235,7 @@ export async function getProjectID(accessToken: string): Promise<string | null> 
             headers: {
                 Authorization: `Bearer ${accessToken}`,
                 "Content-Type": "application/json",
-                "User-Agent": PROJECT_USER_AGENT,
+                "User-Agent": getAntigravityUserAgent(),
             },
             body: JSON.stringify({
                 metadata: {
@@ -160,7 +278,7 @@ export async function refreshAccessToken(refreshToken: string): Promise<{
     })
 
     if (response.status < 200 || response.status >= 300) {
-        throw new Error(`Token refresh failed: ${response.status} ${response.text}`)
+        throw new Error(`Token refresh failed (${response.status}).`)
     }
 
     const data = response.data as {
@@ -240,7 +358,7 @@ interface OAuthCallbackResult {
     error?: string
 }
 
-export function startOAuthCallbackServer(): Promise<{
+export function startOAuthCallbackServer(options: OAuthCallbackServerOptions = {}): Promise<{
     server: any
     port: number
     waitForCallback: () => Promise<OAuthCallbackResult>
@@ -251,8 +369,9 @@ export function startOAuthCallbackServer(): Promise<{
             callbackResolve = res
         })
 
-        const startPort = OAUTH_CONFIG.callbackPort
-        const maxOffset = 10
+        const startPort = options.port || OAUTH_CONFIG.callbackPort
+        const maxOffset = options.fixedPort ? 0 : 10
+        const hostname = options.hostname || "127.0.0.1"
         let server: any = null
         let boundPort = startPort
 
@@ -260,6 +379,7 @@ export function startOAuthCallbackServer(): Promise<{
             const port = startPort + offset
             try {
                 server = Bun.serve({
+                    hostname,
                     port,
                     fetch(req) {
                         const url = new URL(req.url)
@@ -269,8 +389,13 @@ export function startOAuthCallbackServer(): Promise<{
                             const state = url.searchParams.get("state")
                             const error = url.searchParams.get("error")
 
+                            if (options.expectedState && state !== options.expectedState) {
+                                return new Response("Invalid OAuth callback.", { status: 400 })
+                            }
+
                             if (callbackResolve) {
                                 callbackResolve({ code: code || undefined, state: state || undefined, error: error || undefined })
+                                callbackResolve = null
                             }
 
                             // Redirect to official success page

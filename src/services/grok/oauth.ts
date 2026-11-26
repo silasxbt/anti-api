@@ -16,6 +16,7 @@ import { join } from "path"
 import consola from "consola"
 import { authStore } from "~/services/auth/store"
 import type { AuthProvider, ProviderAccount } from "~/services/auth/types"
+import { safeErrorMessage } from "~/lib/redaction"
 
 const GROK_HOME = process.env.GROK_HOME || join(homedir(), ".grok")
 const GROK_AUTH_FILE = process.env.GROK_AUTH_PATH || join(GROK_HOME, "auth.json")
@@ -125,7 +126,7 @@ function readGrokAuthFile(): ProviderAccount[] {
         }
         return accounts
     } catch (error) {
-        consola.warn("Failed to parse Grok auth file:", GROK_AUTH_FILE, error)
+        consola.warn("Failed to parse Grok auth file:", safeErrorMessage(error))
         return []
     }
 }
@@ -186,7 +187,7 @@ export async function refreshGrokAccessToken(
 
             const text = await response.text()
             if (response.status < 200 || response.status >= 300) {
-                throw new Error(`Grok token refresh failed (${response.status}): ${text.slice(0, 200)}`)
+                throw new Error(`Grok token refresh failed (${response.status})`)
             }
 
             const data = (text ? JSON.parse(text) : {}) as {

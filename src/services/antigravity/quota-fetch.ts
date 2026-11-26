@@ -9,7 +9,6 @@ const ANTIGRAVITY_BASE_URLS = [
     "https://daily-cloudcode-pa.sandbox.googleapis.com",
     "https://cloudcode-pa.googleapis.com",
 ]
-const USER_AGENT = getAntigravityUserAgent()
 
 export type AntigravityModelInfo = {
     remainingFraction?: number
@@ -46,7 +45,7 @@ export async function fetchAntigravityModels(
                 headers: {
                     Authorization: `Bearer ${accessToken}`,
                     "Content-Type": "application/json",
-                    "User-Agent": USER_AGENT,
+                    "User-Agent": getAntigravityUserAgent(),
                 },
                 body: JSON.stringify({ project }),
             })
@@ -92,7 +91,7 @@ export async function fetchAntigravityQuotaSummary(
                 headers: {
                     Authorization: `Bearer ${accessToken}`,
                     "Content-Type": "application/json",
-                    "User-Agent": USER_AGENT,
+                    "User-Agent": getAntigravityUserAgent(),
                 },
                 body: JSON.stringify({ project }),
             })

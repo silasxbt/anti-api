@@ -10,6 +10,8 @@ mkdirSync(tempDataDir, { recursive: true })
 const prevHome = process.env.HOME
 const prevProfile = process.env.USERPROFILE
 const prevDataDir = process.env.ANTI_API_DATA_DIR
+const prevContainerControlPlane = process.env.ANTI_API_CONTAINER_CONTROL_PLANE
+const prevControlToken = process.env.ANTI_API_CONTROL_TOKEN
 process.env.HOME = tempHome
 process.env.USERPROFILE = tempHome
 process.env.ANTI_API_DATA_DIR = tempDataDir
@@ -26,6 +28,10 @@ afterAll(() => {
     else process.env.USERPROFILE = prevProfile
     if (prevDataDir === undefined) delete process.env.ANTI_API_DATA_DIR
     else process.env.ANTI_API_DATA_DIR = prevDataDir
+    if (prevContainerControlPlane === undefined) delete process.env.ANTI_API_CONTAINER_CONTROL_PLANE
+    else process.env.ANTI_API_CONTAINER_CONTROL_PLANE = prevContainerControlPlane
+    if (prevControlToken === undefined) delete process.env.ANTI_API_CONTROL_TOKEN
+    else process.env.ANTI_API_CONTROL_TOKEN = prevControlToken
 })
 
 test("bundle export endpoint is disabled", async () => {
@@ -70,6 +76,54 @@ test("auth status endpoint is still available", async () => {
     expect(res.status).toBe(200)
     const body = await res.json()
     expect(typeof body.authenticated).toBe("boolean")
+})
+
+test("control plane does not grant CORS to arbitrary localhost ports", async () => {
+    const server = await serverPromise
+    const res = await server.request("/auth/status", {
+        headers: { ...LOCAL_HEADERS, origin: "http://localhost:12345" },
+    })
+    expect(res.status).toBe(403)
+    expect(res.headers.get("access-control-allow-origin")).toBeNull()
+})
+
+test("container control plane requires a token instead of trusting Host", async () => {
+    const server = await serverPromise
+    process.env.ANTI_API_CONTAINER_CONTROL_PLANE = "1"
+    process.env.ANTI_API_CONTROL_TOKEN = "container-test-token"
+    try {
+        const denied = await server.request("/auth/status", { headers: { host: "localhost:8964" } })
+        expect(denied.status).toBe(401)
+
+        const allowed = await server.request("/auth/status", {
+            headers: { host: "attacker.example", "x-api-key": "container-test-token" },
+        })
+        expect(allowed.status).toBe(200)
+
+        const bootstrap = await server.request("/health?control_token=container-test-token", {
+            headers: { host: "attacker.example" },
+        })
+        expect(bootstrap.status).toBe(303)
+        expect(bootstrap.headers.get("location")).toBe("/health")
+        expect(bootstrap.headers.get("set-cookie")).toContain("anti_api_control=")
+    } finally {
+        delete process.env.ANTI_API_CONTAINER_CONTROL_PLANE
+        delete process.env.ANTI_API_CONTROL_TOKEN
+    }
+})
+
+test("Zed import requires an explicit credential file", async () => {
+    const server = await serverPromise
+    const res = await server.request("/auth/login", {
+        method: "POST",
+        headers: { ...LOCAL_HEADERS, "content-type": "application/json" },
+        body: JSON.stringify({ provider: "zed" }),
+    })
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.success).toBe(false)
+    expect(body.error).toBe("Set ANTI_API_ZED_CREDENTIALS_FILE to an absolute, owner-only Zed credential JSON file.")
+    expect(JSON.stringify(body)).not.toContain("token")
 })
 
 test("diagnostics endpoint rejects non-local hosts", async () => {

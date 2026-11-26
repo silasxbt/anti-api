@@ -6,6 +6,21 @@ The complete Anti-API application listens on loopback by default. On this local-
 
 Anti-API 完整应用默认只监听回环地址。在这个仅限本机的监听器上，`Authorization` 和 `x-api-key` 可能只是兼容客户端要求的协议占位字段，**不构成**访问控制。
 
+Docker runs the control plane in an explicit token-protected mode. Set
+`ANTI_API_CONTAINER_CONTROL_PLANE=1` and a long random
+`ANTI_API_CONTROL_TOKEN`; send that token in `Authorization: Bearer` or
+`x-api-key`. For a browser-only first visit, use a local
+`/quota?control_token=...` URL once; the server replaces it with an HttpOnly
+cookie and redirects to the clean path. Keep Docker's management and OAuth
+callback ports bound to host loopback.
+
+Docker 显式启用控制面令牌保护。设置
+`ANTI_API_CONTAINER_CONTROL_PLANE=1` 和足够长的随机
+`ANTI_API_CONTROL_TOKEN`，请求通过 `Authorization: Bearer` 或 `x-api-key`
+携带该令牌。浏览器首次访问可在本机使用一次
+`/quota?control_token=...`，服务端会换成 HttpOnly Cookie 并重定向到干净地址。
+Docker 的管理端口和 OAuth 回调端口应始终绑定宿主机回环地址。
+
 For LAN, reverse-proxy, or tunnel access, configure the separate inference-only gateway:
 
 ```bash
@@ -13,6 +28,10 @@ export ANTI_API_PUBLIC_TOKEN='replace-with-a-long-random-secret'
 export ANTI_API_PUBLIC_PORT=8966
 bun run src/main.ts start
 ```
+
+The token-gated gateway binds to `0.0.0.0` by default. Set
+`ANTI_API_PUBLIC_HOST=127.0.0.1` when a local reverse proxy or tunnel is the
+only intended caller; do not expose it without `ANTI_API_PUBLIC_TOKEN`.
 
 Public clients must send the configured token in one of these headers:
 

@@ -5,6 +5,8 @@ import { UpstreamError } from "~/lib/error"
 import type { ProviderAccount } from "~/services/auth/types"
 import type { ClaudeMessage, ClaudeTool } from "~/lib/translator"
 import { toOpenAIMessages, toOpenAITools } from "~/services/providers/openai-adapter"
+import { createAbortError, isAbortError, throwIfAborted } from "~/lib/stream-cancellation"
+import { safeErrorMessage } from "~/lib/redaction"
 
 const COPILOT_INSECURE_TLS = process.env.ANTI_API_COPILOT_INSECURE_TLS === "1"
 const COPILOT_INSECURE_AGENT = COPILOT_INSECURE_TLS ? new https.Agent({ rejectUnauthorized: false }) : undefined
@@ -101,12 +103,15 @@ export async function createCopilotCompletion(
     model: string,
     messages: ClaudeMessage[],
     tools?: ClaudeTool[],
-    maxTokens?: number
+    maxTokens?: number,
+    signal?: AbortSignal
 ) {
-    const apiToken = await getCopilotApiToken(account)
+    throwIfAborted(signal)
+    const apiToken = await getCopilotApiToken(account, signal)
 
     // Fetch and log available models (first call will log, subsequent uses cache)
-    await fetchCopilotModels(apiToken)
+    await fetchCopilotModels(apiToken, signal)
+    throwIfAborted(signal)
 
     // Map model name to Copilot-compatible format
     const mappedModel = mapCopilotModelName(model)
@@ -128,10 +133,11 @@ export async function createCopilotCompletion(
             "Editor-Plugin-Version": "copilot/1.300.0",
         },
         body: JSON.stringify(requestBody),
+        signal,
     })
 
     if (response.status < 200 || response.status >= 300) {
-        consola.error(`Copilot error ${response.status} for model ${mappedModel}:`, response.text.slice(0, 500))
+        consola.error(`Copilot error ${response.status} for model ${mappedModel}`)
         throw new UpstreamError("copilot", response.status, response.text, undefined)
     }
 
@@ -167,12 +173,13 @@ export async function createCopilotCompletion(
     }
 }
 
-export async function listCopilotModelsForAccount(account: ProviderAccount): Promise<CopilotModelInfo[]> {
-    const apiToken = await getCopilotApiToken(account)
-    return fetchCopilotModels(apiToken)
+export async function listCopilotModelsForAccount(account: ProviderAccount, signal?: AbortSignal): Promise<CopilotModelInfo[]> {
+    const apiToken = await getCopilotApiToken(account, signal)
+    return fetchCopilotModels(apiToken, signal)
 }
 
-async function getCopilotApiToken(account: ProviderAccount): Promise<string> {
+async function getCopilotApiToken(account: ProviderAccount, signal?: AbortSignal): Promise<string> {
+    throwIfAborted(signal)
     const cached = tokenCache.get(account.id)
     if (cached && cached.expiresAt > Date.now()) {
         return cached.token
@@ -185,11 +192,12 @@ async function getCopilotApiToken(account: ProviderAccount): Promise<string> {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         },
+        signal,
     })
 
     const data = response.data as CopilotTokenResponse
     if (response.status < 200 || response.status >= 300 || !data?.token) {
-        throw new Error(`copilot:token:${response.status}:${response.text}`)
+        throw new Error(`copilot:token:${response.status}`)
     }
 
     const expiresAt = data.expires_at ? data.expires_at * 1000 : Date.now() + 10 * 60 * 1000
@@ -202,7 +210,7 @@ function safeParse(value: string | undefined): any {
     try {
         return JSON.parse(value)
     } catch (error) {
-        consola.warn("Copilot tool args parse failed:", error)
+        consola.warn("Copilot tool args parse failed:", safeErrorMessage(error))
         return {}
     }
 }
@@ -214,7 +222,8 @@ function mapFinishReason(reason?: string | null): string {
     return reason
 }
 
-async function fetchCopilotModels(apiToken: string): Promise<CopilotModelInfo[]> {
+async function fetchCopilotModels(apiToken: string, signal?: AbortSignal): Promise<CopilotModelInfo[]> {
+    throwIfAborted(signal)
     const cached = modelsCache.get(apiToken)
     if (cached && cached.expiresAt > Date.now()) {
         return cached.models
@@ -230,6 +239,7 @@ async function fetchCopilotModels(apiToken: string): Promise<CopilotModelInfo[]>
                 "Editor-Version": "vscode/1.100.0",
                 "Editor-Plugin-Version": "copilot/1.300.0",
             },
+            signal,
         })
 
         if (response.status < 200 || response.status >= 300) {
@@ -243,7 +253,10 @@ async function fetchCopilotModels(apiToken: string): Promise<CopilotModelInfo[]>
         modelsCache.set(apiToken, { models, expiresAt: Date.now() + 5 * 60 * 1000 })
         return models
     } catch (error) {
-        consola.warn("Error fetching Copilot models:", error)
+        if (signal?.aborted || isAbortError(error)) {
+            throw createAbortError()
+        }
+        consola.warn("Error fetching Copilot models:", safeErrorMessage(error))
         return []
     }
 }
@@ -253,8 +266,9 @@ type InsecureResponse = { status: number; data: any; text: string }
 
 async function fetchInsecureJson(
     url: string,
-    options: { method?: string; headers?: Record<string, string>; body?: string }
+    options: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal }
 ): Promise<InsecureResponse> {
+    throwIfAborted(options.signal)
     const target = new URL(url)
     const method = options.method || "GET"
     const headers = {
@@ -264,7 +278,28 @@ async function fetchInsecureJson(
     const agent = COPILOT_INSECURE_AGENT
 
     return new Promise((resolve, reject) => {
-        const req = https.request(
+        let settled = false
+        let req: ReturnType<typeof https.request>
+        const cleanup = () => options.signal?.removeEventListener("abort", onAbort)
+        const resolveOnce = (value: InsecureResponse) => {
+            if (settled) return
+            settled = true
+            cleanup()
+            resolve(value)
+        }
+        const rejectOnce = (error: unknown) => {
+            if (settled) return
+            settled = true
+            cleanup()
+            reject(error)
+        }
+        const onAbort = () => {
+            if (settled) return
+            req?.destroy()
+            rejectOnce(createAbortError())
+        }
+
+        req = https.request(
             {
                 protocol: target.protocol,
                 hostname: target.hostname,
@@ -290,7 +325,7 @@ async function fetchInsecureJson(
                             data = null
                         }
                     }
-                    resolve({
+                    resolveOnce({
                         status: res.statusCode || 0,
                         data,
                         text: body,
@@ -300,15 +335,27 @@ async function fetchInsecureJson(
         )
 
         req.on("error", (error) => {
-            if (!COPILOT_INSECURE_TLS && /certificate|self signed/i.test(error.message)) {
-                reject(new Error("Copilot TLS certificate error. Set ANTI_API_COPILOT_INSECURE_TLS=1 to bypass."))
+            if (options.signal?.aborted || isAbortError(error)) {
+                rejectOnce(createAbortError())
                 return
             }
-            reject(error)
+            if (!COPILOT_INSECURE_TLS && /certificate|self signed/i.test(error.message)) {
+                rejectOnce(new Error("Copilot TLS certificate error. Set ANTI_API_COPILOT_INSECURE_TLS=1 to bypass."))
+                return
+            }
+            rejectOnce(error)
         })
         req.on("timeout", () => {
             req.destroy(new Error("Request timed out"))
         })
+
+        if (options.signal) {
+            if (options.signal.aborted) {
+                onAbort()
+                return
+            }
+            options.signal.addEventListener("abort", onAbort, { once: true })
+        }
 
         if (options.body) {
             req.write(options.body)

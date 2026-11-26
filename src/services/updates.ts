@@ -25,7 +25,7 @@ export interface UpdateApplyResult extends UpdateCheckResult {
     restartScheduled: boolean
 }
 
-const REPO = "ink1ing/anti-api"
+const REPO = "silasxbt/anti-api"
 const COMMAND_TIMEOUT_MS = 45_000
 const MAX_OUTPUT_LENGTH = 4000
 

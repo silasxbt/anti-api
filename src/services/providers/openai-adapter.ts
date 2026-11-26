@@ -3,10 +3,18 @@ import { cleanJsonSchemaForGemini } from "~/lib/json-schema-cleaner"
 
 export interface OpenAIChatMessage {
     role: "user" | "assistant" | "system" | "tool"
-    content?: string | null
+    content?: string | OpenAIContentPart[] | null
     tool_calls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }>
     tool_call_id?: string
 }
+
+export type OpenAIResponsesContentPart =
+    | { type: "input_text" | "output_text"; text: string }
+    | { type: "input_image"; image_url: string }
+
+export type OpenAIContentPart =
+    | { type: "text"; text: string }
+    | { type: "image_url"; image_url: { url: string } }
 
 export interface OpenAIToolDefinition {
     type: "function"
@@ -77,6 +85,35 @@ function collectText(blocks: ClaudeContentBlock[]): string {
         .join("")
 }
 
+function toOpenAIContent(blocks: ClaudeContentBlock[]): string | OpenAIContentPart[] {
+    const parts: OpenAIContentPart[] = []
+    let hasImage = false
+
+    for (const block of blocks) {
+        if (block.type === "text" && block.text) {
+            parts.push({ type: "text", text: block.text })
+            continue
+        }
+        if (block.type === "image" && block.source?.type === "base64") {
+            hasImage = true
+            parts.push({
+                type: "image_url",
+                image_url: {
+                    url: `data:${block.source.media_type};base64,${block.source.data}`,
+                },
+            })
+            continue
+        }
+        if (block.type === "image" && block.source?.type === "url") {
+            hasImage = true
+            parts.push({ type: "image_url", image_url: { url: block.source.url } })
+        }
+    }
+
+    if (!hasImage) return collectText(blocks)
+    return parts
+}
+
 export function toOpenAIMessages(messages: ClaudeMessage[]): OpenAIChatMessage[] {
     const result: OpenAIChatMessage[] = []
 
@@ -121,13 +158,43 @@ export function toOpenAIMessages(messages: ClaudeMessage[]): OpenAIChatMessage[]
                 }
             }
 
-            // Then add any text content as a separate user message
-            const textBlocks = blocks.filter(block => block.type === "text")
-            if (textBlocks.length > 0) {
-                result.push({ role: "user", content: collectText(textBlocks) })
+            // Then add text and image input together as one multimodal user message.
+            const inputBlocks = blocks.filter(block => block.type === "text" || block.type === "image")
+            if (inputBlocks.length > 0) {
+                result.push({ role: "user", content: toOpenAIContent(inputBlocks) })
             }
         }
     }
 
     return result
+}
+
+/** Convert Chat Completions content parts to the Responses API content shape. */
+export function toOpenAIResponsesContent(
+    content: OpenAIChatMessage["content"],
+    role: "user" | "assistant"
+): OpenAIResponsesContentPart[] {
+    const textType = role === "user" ? "input_text" : "output_text"
+    if (typeof content === "string") {
+        return [{ type: textType, text: content }]
+    }
+
+    const converted: OpenAIResponsesContentPart[] = []
+    if (Array.isArray(content)) {
+        for (const part of content) {
+            if (part?.type === "text" && typeof part.text === "string") {
+                converted.push({ type: textType, text: part.text })
+                continue
+            }
+            if (
+                role === "user" &&
+                part?.type === "image_url" &&
+                typeof part.image_url?.url === "string"
+            ) {
+                converted.push({ type: "input_image", image_url: part.image_url.url })
+            }
+        }
+    }
+
+    return converted.length > 0 ? converted : [{ type: textType, text: "" }]
 }

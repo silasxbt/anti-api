@@ -9,7 +9,8 @@ Anti-API proxies Antigravity's internal AI models as an Anthropic-compatible API
 - `src/server.ts` - Hono HTTP server setup
 - `src/services/antigravity/chat.ts` - Core chat logic
 - `src/proto/encoder.ts` - Protobuf encoding with model selection
-- `src/lib/port-finder.ts` - Antigravity port discovery
+- Antigravity requests use the provider API directly; the old local
+  language-server port discovery path is intentionally not part of the runtime.
 
 ## Model Selection
 

@@ -5,6 +5,7 @@ import consola from "consola"
 import type { AuthProvider } from "~/services/auth/types"
 import { isHiddenCodexModel } from "./models"
 import { getDataDir } from "~/lib/data-dir"
+import { safeErrorMessage } from "~/lib/redaction"
 
 export interface RoutingEntry {
     id: string
@@ -162,7 +163,7 @@ export function loadRoutingConfig(): RoutingConfig {
         }
         return normalizeConfig(raw)
     } catch (error) {
-        consola.warn("Failed to load routing config:", error)
+        consola.warn("Failed to load routing config:", safeErrorMessage(error))
         return { version: CURRENT_VERSION, updatedAt: new Date().toISOString(), flows: [], accountRouting: { smartSwitch: false, routes: [] } }
     }
 }

@@ -8,7 +8,7 @@ Security fixes are applied to the current `main` branch and the latest release. 
 
 Use GitHub Private Vulnerability Reporting:
 
-<https://github.com/ink1ing/anti-api/security/advisories/new>
+<https://github.com/silasxbt/anti-api/security/advisories/new>
 
 Do not open a public issue containing access tokens, refresh tokens, OAuth codes or state values, cookies, account files, tunnel tokens, private prompts, or unredacted logs.
 
@@ -27,7 +27,12 @@ Anti-API is an independent, unofficial local interoperability proxy. Some provid
 
 ### Local control plane
 
-The complete dashboard and management API are designed to bind to loopback. They include account, routing, logs, settings, tunnel, diagnostic, and update operations and must not be exposed through a public reverse proxy.
+The complete dashboard and management API are designed to bind to loopback. They include account, routing, logs, settings, tunnel, diagnostic, and update operations and must not be exposed through a public reverse proxy. Docker is the one explicit exception: its control-plane listener binds inside the container, but every request must present `ANTI_API_CONTROL_TOKEN` (as `Authorization: Bearer`, `x-api-key`, or the bootstrap cookie). Compose maps the port to host loopback only; if you publish it on a LAN or public interface, treat the token as the sole authentication boundary and use a long random value.
+
+To open a Docker dashboard in a browser, visit a one-time local URL with
+`?control_token=...`; Anti-API replaces it with an HttpOnly, SameSite cookie and
+redirects to a clean URL. Never share that bootstrap URL or put it in a public
+bookmark, proxy log, or screenshot.
 
 ### Public inference gateway
 

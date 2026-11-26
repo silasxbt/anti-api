@@ -28,7 +28,7 @@ const compile = Bun.spawn([
     "--windows-title",
     "Anti-API",
     "--windows-publisher",
-    "ink1ing",
+    "silasxbt",
     "--windows-description",
     "Independent local protocol-compatibility proxy for authorized provider connections",
     "--windows-version",

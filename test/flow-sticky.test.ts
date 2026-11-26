@@ -22,7 +22,11 @@ function makeQuotaError(): UpstreamError {
     return new UpstreamError("antigravity", 429, quotaErrorBody)
 }
 
-let scenario: "none" | "head-exhausted" | "probe-head" = "head-exhausted"
+function makeModelMismatchError(): UpstreamError {
+    return new UpstreamError("antigravity", 404, "model-account mismatch")
+}
+
+let scenario: "none" | "head-exhausted" | "probe-head" | "stream-wrap" = "head-exhausted"
 const callOrder: string[] = []
 const callCounts = new Map<string, number>()
 let rateLimitAll = false
@@ -54,6 +58,15 @@ const routingConfig: RoutingConfig = {
             entries: [
                 { id: "r1", provider: "antigravity", accountId: "r1", modelId: "claude-opus-4-5-thinking", label: "Opus 1" },
                 { id: "r2", provider: "antigravity", accountId: "r2", modelId: "claude-opus-4-5-thinking", label: "Opus 2" },
+            ],
+        },
+        {
+            id: "flow-stream-wrap",
+            name: "flow-stream-wrap",
+            entries: [
+                { id: "s1", provider: "antigravity", accountId: "s1", modelId: "claude-opus-4-5-thinking", label: "Opus 1" },
+                { id: "s2", provider: "antigravity", accountId: "s2", modelId: "claude-opus-4-5-thinking", label: "Opus 2" },
+                { id: "s3", provider: "antigravity", accountId: "s3", modelId: "claude-opus-4-5-thinking", label: "Opus 3" },
             ],
         },
     ],
@@ -91,7 +104,17 @@ mock.module("~/services/antigravity/chat", () => ({
             usage: { inputTokens: 1, outputTokens: 1 },
         }
     },
-    createChatCompletionStreamWithOptions: async function* () {
+    createChatCompletionStreamWithOptions: async function* (_request: any, options?: { accountId?: string }) {
+        const accountId = options?.accountId || "auto"
+        callOrder.push(accountId)
+        const count = (callCounts.get(accountId) ?? 0) + 1
+        callCounts.set(accountId, count)
+
+        if (scenario === "stream-wrap") {
+            if (accountId === "s1" && count === 1) throw makeModelMismatchError()
+            if (accountId === "s2" && count >= 2) throw makeModelMismatchError()
+            if (accountId === "s3") throw makeModelMismatchError()
+        }
         yield ""
     },
 }))
@@ -111,10 +134,12 @@ mock.module("~/services/routing/config", () => ({
 }))
 
 let createRoutedCompletion: (request: any) => Promise<any>
+let createRoutedCompletionStream: (request: any) => AsyncGenerator<string, void, unknown>
 
 beforeAll(async () => {
     const router = await import(`../src/services/routing/router.ts?${Date.now()}-${Math.random()}`)
     createRoutedCompletion = router.createRoutedCompletion
+    createRoutedCompletionStream = router.createRoutedCompletionStream
 })
 
 afterAll(() => {
@@ -176,4 +201,28 @@ test("flow sticky falls back to cursor when all entries are rate limited", async
         messages: [{ role: "user", content: "rate limit" }],
     })
     expect(callOrder).toEqual(["r1"])
+})
+
+test("flow sticky stream failover wraps around the sticky cursor", async () => {
+    scenario = "stream-wrap"
+    rateLimitAll = false
+    resetTracking(true)
+
+    const consume = async () => {
+        const chunks: string[] = []
+        for await (const chunk of createRoutedCompletionStream({
+            model: "flow-stream-wrap",
+            messages: [{ role: "user", content: "stream" }],
+        })) {
+            chunks.push(chunk)
+        }
+        return chunks
+    }
+
+    await consume()
+    expect(callOrder).toEqual(["s1", "s2"])
+
+    resetTracking(false)
+    await consume()
+    expect(callOrder).toEqual(["s2", "s3", "s1"])
 })

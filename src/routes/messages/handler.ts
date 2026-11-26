@@ -12,7 +12,11 @@ import consola from "consola"
 import { createRoutedCompletion, createRoutedCompletionStream, RoutingError } from "~/services/routing/router"
 import type { ClaudeMessage, ClaudeTool } from "~/lib/translator"
 import { validateAnthropicRequest } from "~/lib/validation"
-import { UpstreamError } from "~/lib/error"
+import { forwardError, RequestValidationError, UpstreamError } from "~/lib/error"
+import { parseBoundedJson } from "~/lib/request-body"
+import { isStreamCancellation, onRequestAbort, returnStream } from "~/lib/stream-cancellation"
+import { createImageInputBudget } from "~/lib/image-input"
+import { safeErrorMessage } from "~/lib/redaction"
 import { state } from "~/lib/state"
 import type {
     AnthropicMessagesPayload,
@@ -67,7 +71,7 @@ function generateMessageId(): string {
  */
 export async function handleCompletion(c: Context): Promise<Response> {
     try {
-        const payload = await c.req.json<AnthropicMessagesPayload>()
+        const payload = await parseBoundedJson<AnthropicMessagesPayload>(c.req.raw)
 
         // Input validation
         const validation = validateAnthropicRequest(payload)
@@ -76,6 +80,8 @@ export async function handleCompletion(c: Context): Promise<Response> {
         }
 
         const messages = translateMessages(payload)
+        // Validate image count and inline byte budgets before routing to any provider.
+        createImageInputBudget(messages)
         const tools = extractTools(payload)
         const toolChoice = payload.tool_choice
         if (state.verbose) {
@@ -102,7 +108,7 @@ export async function handleCompletion(c: Context): Promise<Response> {
         }
 
         // 非流式请求
-            let result
+        let result
         try {
             result = await createRoutedCompletion({
                 model: payload.model,
@@ -110,6 +116,7 @@ export async function handleCompletion(c: Context): Promise<Response> {
                 tools,
                 toolChoice,
                 maxTokens: payload.max_tokens,
+                signal: c.req.raw.signal,
             })
         } catch (error) {
             if (error instanceof RoutingError) {
@@ -153,6 +160,18 @@ export async function handleCompletion(c: Context): Promise<Response> {
         // Note: Usage recording is handled in chat.ts with the actual native model ID
 
         return c.json(response)
+    } catch (error) {
+        if (error instanceof RequestValidationError) {
+            return c.json({ error: { type: "invalid_request_error", message: error.message } }, 400)
+        }
+        if (error instanceof RoutingError) {
+            return c.json({ error: { type: "invalid_request_error", message: error.message } }, error.status as any)
+        }
+        if (error instanceof UpstreamError) {
+            return await forwardError(c, error)
+        }
+        consola.error("Messages completion error:", safeErrorMessage(error))
+        return c.json({ error: { type: "api_error", message: "Internal server error" } }, 500)
     } finally {
         // no-op
     }
@@ -170,38 +189,65 @@ async function handleStreamCompletion(
     toolChoice: AnthropicMessagesPayload["tool_choice"] | undefined
 ): Promise<Response> {
     return streamSSE(c, async (stream) => {
+        const requestSignal = c.req.raw.signal
+        let cancelled = requestSignal.aborted
+        let chatStream: AsyncGenerator<string, void, unknown> | null = null
+        const markCancelled = () => {
+            cancelled = true
+            void returnStream(chatStream)
+        }
+        const removeRequestAbort = onRequestAbort(requestSignal, () => {
+            markCancelled()
+            stream.abort()
+        })
+        stream.onAbort(markCancelled)
+
+        const writeEvent = async (event: string, data: string): Promise<boolean> => {
+            if (cancelled || isStreamCancellation(undefined, requestSignal, stream)) return false
+            await stream.writeSSE({ event, data })
+            return !(cancelled || isStreamCancellation(undefined, requestSignal, stream))
+        }
+
         const pingInterval = setInterval(() => {
+            if (cancelled || isStreamCancellation(undefined, requestSignal, stream)) return
             stream.write(": ping\n\n").catch(() => { })
         }, 15000)
         try {
-            const chatStream = createRoutedCompletionStream({
+            if (cancelled) return
+            chatStream = createRoutedCompletionStream({
                 model: payload.model,
                 messages,
                 tools,
                 toolChoice,
                 maxTokens: payload.max_tokens,
+                signal: requestSignal,
             })
 
             // 直接写入来自翻译器的 SSE 事件
             for await (const event of chatStream) {
+                if (cancelled) return
                 await stream.write(event)
             }
 
         } catch (error) {
+            if (isStreamCancellation(error, requestSignal, stream)) return
             if (error instanceof UpstreamError && error.provider === "antigravity" && error.status === 429) {
                 consola.warn("Stream error: Antigravity 429 rate limit (auto-rotation may continue)")
             } else {
-                consola.error("Stream error:", error)
+                consola.error("Stream error:", safeErrorMessage(error))
             }
-            await stream.writeSSE({
-                event: "error",
-                data: JSON.stringify({
+            const isRequestError = error instanceof RequestValidationError
+            await writeEvent("error", JSON.stringify({
                     type: "error",
-                    error: { type: "api_error", message: (error as Error).message },
-                }),
-            })
+                    error: {
+                        type: isRequestError ? "invalid_request_error" : "api_error",
+                        message: isRequestError ? error.message : "Upstream request failed",
+                    },
+                }))
         } finally {
             clearInterval(pingInterval)
+            removeRequestAbort()
+            await returnStream(chatStream)
         }
     })
 }

@@ -66,6 +66,15 @@ export const MAX_SANITIZED_STRING_LENGTH = 10000
 /** Maximum max_tokens value */
 export const MAX_TOKENS_LIMIT = 1000000
 
+/** Maximum image blocks accepted in one inference request. */
+export const MAX_IMAGES_PER_REQUEST = 16
+
+/** Maximum decoded bytes accepted for a single image block. */
+export const MAX_IMAGE_BYTES_PER_IMAGE = 10 * 1024 * 1024
+
+/** Maximum decoded/fetched image bytes accepted across one inference request. */
+export const MAX_IMAGE_BYTES_PER_REQUEST = 16 * 1024 * 1024
+
 // ============================================
 // Rate Limit Durations
 // ============================================

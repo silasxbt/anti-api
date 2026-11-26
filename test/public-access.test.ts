@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { createPublicServer } from "../src/server"
-import { extractPublicToken, getPublicGatewayPort, tokenMatches } from "../src/lib/public-access"
+import { extractPublicToken, getPublicGatewayHost, getPublicGatewayPort, tokenMatches } from "../src/lib/public-access"
 import { isLoopbackHost, isLoopbackOrigin, isLoopbackRequest } from "../src/lib/local-request"
 
 const publicPortKey = ["ANTI", "API", "PUBLIC", "PORT"].join("_")
@@ -55,6 +55,19 @@ test("public port does not collide with the Rust sidecar", () => {
     expect(getPublicGatewayPort(8964)).toBe(9100)
 })
 
+test("public gateway defaults to a bindable host when it is enabled", () => {
+    const original = process.env.ANTI_API_PUBLIC_HOST
+    try {
+        delete process.env.ANTI_API_PUBLIC_HOST
+        expect(getPublicGatewayHost()).toBe("0.0.0.0")
+        process.env.ANTI_API_PUBLIC_HOST = "127.0.0.1"
+        expect(getPublicGatewayHost()).toBe("127.0.0.1")
+    } finally {
+        if (original === undefined) delete process.env.ANTI_API_PUBLIC_HOST
+        else process.env.ANTI_API_PUBLIC_HOST = original
+    }
+})
+
 test("loopback checks fail closed", () => {
     expect(isLoopbackHost(undefined)).toBe(false)
     expect(isLoopbackHost("localhost:8964")).toBe(true)
@@ -64,5 +77,14 @@ test("loopback checks fail closed", () => {
     expect(isLoopbackOrigin("http://localhost:8964")).toBe(true)
     expect(isLoopbackOrigin("https://example.com")).toBe(false)
     expect(isLoopbackRequest(new Request("http://localhost:8964", { headers: { host: "localhost:8964" } }))).toBe(true)
+    expect(isLoopbackRequest(new Request("http://localhost:8964", {
+        headers: { host: "localhost:8964", origin: "http://localhost:8964" },
+    }))).toBe(true)
+    expect(isLoopbackRequest(new Request("http://localhost:8964", {
+        headers: { host: "localhost:8964", origin: "http://localhost:3000" },
+    }))).toBe(false)
+    expect(isLoopbackRequest(new Request("http://127.0.0.1:8964", {
+        headers: { host: "127.0.0.1:8964", origin: "http://localhost:8964" },
+    }))).toBe(false)
     expect(isLoopbackRequest(new Request("https://example.com", { headers: { host: "example.com" } }))).toBe(false)
 })

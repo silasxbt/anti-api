@@ -24,6 +24,21 @@ export class AntigravityError extends Error {
     }
 }
 
+/**
+ * A request is structurally valid JSON but contains an unsupported or unsafe
+ * value for a provider conversion. Handlers return these as HTTP 400 rather
+ * than treating them as upstream failures.
+ */
+export class RequestValidationError extends Error {
+    status: number
+
+    constructor(message: string) {
+        super(message)
+        this.name = "RequestValidationError"
+        this.status = 400
+    }
+}
+
 export class UpstreamError extends Error {
     status: number
     provider: string
@@ -125,6 +140,11 @@ export function summarizeUpstreamError(error: UpstreamError): { message: string;
     if (error.status === 429) {
         const summary = summarizeUpstream429(error)
         return { message: summary.message, reason: summary.reason }
+    }
+    if (error.provider === "zed" && (error.status === 401 || error.status === 403)) {
+        return {
+            message: "Zed authorization is no longer valid for this account. Update the configured credentials file, then re-import the account.",
+        }
     }
     return { message: `${error.provider} upstream error (${error.status}). Body: ${error.body?.substring(0, 500)}` }
 }

@@ -36,18 +36,30 @@ test("redaction removes common credential material", () => {
 
 test("source contains secure defaults for high-risk credential paths", () => {
     const rootDir = join(import.meta.dir, "..")
+    const dockerfile = readFileSync(join(rootDir, "Dockerfile"), "utf8")
     const codex = readFileSync(join(rootDir, "src/services/codex/oauth.ts"), "utf8")
     const kiro = readFileSync(join(rootDir, "src/services/kiro/oauth.ts"), "utf8")
     const antigravity = readFileSync(join(rootDir, "src/services/antigravity/oauth.ts"), "utf8")
     const copilot = readFileSync(join(rootDir, "src/services/copilot/oauth.ts"), "utf8")
     const quota = readFileSync(join(rootDir, "src/services/quota-aggregator.ts"), "utf8")
 
+    expect(dockerfile).toContain("ENV ANTI_API_CONTAINER_CONTROL_PLANE=1")
+    expect(dockerfile).toContain('test -n "$ANTI_API_CONTROL_TOKEN"')
     expect(codex).not.toContain("token.oaifree.com")
     expect(codex).toContain("ANTI_API_ALLOW_THIRD_PARTY_CODEX_REFRESH")
     expect(kiro).toContain('ANTI_API_KIRO_WRITEBACK !== "1"')
     expect(antigravity).not.toContain("rejectUnauthorized: false")
     expect(copilot).not.toContain("rejectUnauthorized: false")
     expect(quota).not.toContain("rejectUnauthorized: false")
+})
+
+test("diagnostic error responses use redacted messages", () => {
+    const rootDir = join(import.meta.dir, "..")
+    const authRoute = readFileSync(join(rootDir, "src/routes/auth/route.ts"), "utf8")
+
+    expect(authRoute).toContain('import { safeErrorMessage } from "~/lib/redaction"')
+    expect(authRoute).not.toContain('error: (error as Error).message')
+    expect(authRoute).not.toContain('error: error.message')
 })
 
 test("remote controls mask saved tokens and require a public gateway token", () => {

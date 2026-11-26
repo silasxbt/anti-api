@@ -2,6 +2,7 @@ import consola from "consola"
 import { readdirSync, readFileSync } from "fs"
 import { authStore } from "~/services/auth/store"
 import type { ProviderAccount } from "~/services/auth/types"
+import { redactSensitiveText, safeErrorMessage } from "~/lib/redaction"
 
 const DEFAULT_COPILOT_CLIENT_ID = "01ab8ac9400c4e429b23"
 const COPILOT_CLIENT_ID = process.env.COPILOT_CLIENT_ID || DEFAULT_COPILOT_CLIENT_ID
@@ -73,7 +74,8 @@ export async function startCopilotDeviceFlow(): Promise<CopilotAuthSession> {
 
     const data = response.data as any
     if (response.status < 200 || response.status >= 300) {
-        throw new Error(data?.error_description || data?.error || response.text || "Failed to start Copilot device flow")
+        const reason = data?.error_description || data?.error || "Failed to start Copilot device flow"
+        throw new Error(redactSensitiveText(String(reason)))
     }
 
     const session: CopilotAuthSession = {
@@ -113,7 +115,7 @@ export function importCopilotAuthFiles(): ProviderAccount[] {
         }
         return accounts
     } catch (error) {
-        consola.warn("Copilot auth file import failed:", error)
+        consola.warn("Copilot auth file import failed:", safeErrorMessage(error))
         return []
     }
 }
@@ -162,7 +164,7 @@ export async function pollCopilotSession(deviceCode: string): Promise<CopilotAut
     }
     if (response.status < 200 || response.status >= 300 || data?.error) {
         session.status = "error"
-        session.message = data?.error_description || data?.error || response.text || "Copilot authorization failed"
+        session.message = redactSensitiveText(String(data?.error_description || data?.error || "Copilot authorization failed"))
         sessions.set(deviceCode, session)
         return session
     }
@@ -196,7 +198,7 @@ async function fetchCopilotAccount(accessToken: string): Promise<ProviderAccount
 
         const data = response.data as any
         if (response.status < 200 || response.status >= 300) {
-            consola.warn("Copilot user profile fetch failed:", data || response.text)
+            consola.warn(`Copilot user profile fetch failed (${response.status})`)
             return null
         }
 
@@ -210,7 +212,7 @@ async function fetchCopilotAccount(accessToken: string): Promise<ProviderAccount
             label: data.login || "Copilot Account",
         }
     } catch (error) {
-        consola.warn("Copilot user fetch error:", error)
+        consola.warn("Copilot user fetch error:", safeErrorMessage(error))
         return null
     }
 }

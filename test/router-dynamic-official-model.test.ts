@@ -28,12 +28,16 @@ mock.module("~/services/antigravity/account-manager", () => ({
 
 mock.module("~/services/codex/chat", () => ({
     createCodexCompletion: async () => ({ contentBlocks: [], stopReason: "end_turn", usage: {} }),
+    isCodexInsecureTlsEnabled: () => false,
+    listCodexModelsForAccount: async () => [],
     isCodexModelSupportedForAccount: () => undefined,
     isCodexUnsupportedModelError: () => false,
 }))
 
 mock.module("~/services/copilot/chat", () => ({
     createCopilotCompletion: async () => ({ contentBlocks: [], stopReason: "end_turn", usage: {} }),
+    isCopilotInsecureTlsEnabled: () => false,
+    listCopilotModelsForAccount: async () => [],
 }))
 
 mock.module("~/services/auth/store", () => ({
@@ -65,4 +69,22 @@ test("dynamic copilot model is treated as official model by router", async () =>
             messages: [],
         })
     ).rejects.toThrow('No account routing configured for model "gpt-5.2-new"')
+})
+
+test("official model aliases use one routing key", async () => {
+    const router = await import(`../src/services/routing/router.ts?${Date.now()}-${Math.random()}`)
+
+    expect(router.normalizeOfficialModelId("claude-sonnet-4.5")).toBe("claude-sonnet-4-5")
+    expect(router.modelIdsMatch("claude-sonnet-4.5", "claude-sonnet-4-5")).toBe(true)
+    expect(router.modelIdsMatch("CLAUDE-SONNET-4-5", "claude-sonnet-4.5")).toBe(true)
+})
+
+test("streaming normalizes the dotted Copilot model before route selection", async () => {
+    const router = await import(`../src/services/routing/router.ts?${Date.now()}-${Math.random()}`)
+    const stream = router.createRoutedCompletionStream({
+        model: "claude-sonnet-4.5",
+        messages: [],
+    })
+
+    await expect(stream.next()).rejects.toThrow('No account routing configured for model "claude-sonnet-4-5"')
 })

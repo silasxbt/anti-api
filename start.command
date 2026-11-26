@@ -61,7 +61,7 @@ do_update() {
         return 1
     fi
 
-    API_URL="https://api.github.com/repos/ink1ing/anti-api/releases/latest"
+    API_URL="https://api.github.com/repos/silasxbt/anti-api/releases/latest"
     RELEASE_JSON="$(curl -fsSL "$API_URL")" || return 1
 
     ASSET_META="$(RELEASE_JSON="$RELEASE_JSON" python3 - <<'PY'
@@ -134,7 +134,7 @@ PY
     unzip -q "$ZIP_FILE" -d "$TMP_DIR" || { rm -rf "$TMP_DIR"; return 1; }
     # 兼容两种目录格式：
     #   - 自定义 asset: anti-api-v*
-    #   - GitHub zipball: ink1ing-anti-api-*（或 <owner>-<repo>-<sha>）
+    #   - GitHub zipball: silasxbt-anti-api-*（或 <owner>-<repo>-<sha>）
     TOP_DIR="$(find "$TMP_DIR" -maxdepth 1 -type d ! -path "$TMP_DIR" | head -n 1)"
     if [ -z "$TOP_DIR" ]; then
         echo "[错误] 解压后的目录结构不符合预期"

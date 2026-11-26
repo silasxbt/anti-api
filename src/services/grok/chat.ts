@@ -18,7 +18,9 @@ import { UpstreamError } from "~/lib/error"
 import { importGrokAuthSources, refreshGrokAccountIfNeeded, refreshGrokAccessToken, getGrokClientId, GROK_PROVIDER } from "~/services/grok/oauth"
 import type { ProviderAccount } from "~/services/auth/types"
 import type { ClaudeMessage, ClaudeTool } from "~/lib/translator"
-import { toOpenAIMessages, toOpenAITools } from "~/services/providers/openai-adapter"
+import { toOpenAIMessages, toOpenAIResponsesContent, toOpenAITools } from "~/services/providers/openai-adapter"
+import { createAbortError, isAbortError, sleepWithAbort, throwIfAborted } from "~/lib/stream-cancellation"
+import { safeErrorMessage } from "~/lib/redaction"
 
 const GROK_API_BASE = process.env.ANTI_API_GROK_BASE_URL || "https://cli-chat-proxy.grok.com/v1"
 const RESPONSES_PATH = "/responses"
@@ -188,10 +190,6 @@ export function isGrokUnsupportedModelError(error: UpstreamError): boolean {
     )
 }
 
-function sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms))
-}
-
 function getRetryDelay(attempt: number): number {
     const jitter = Math.floor(Math.random() * GROK_RETRY_JITTER_MS)
     return GROK_RETRY_BASE_MS * Math.pow(2, attempt) + jitter
@@ -285,9 +283,9 @@ function toGrokResponsesInput(messages: ReturnType<typeof toOpenAIMessages>): an
     const input: any[] = []
     for (const msg of messages) {
         if (msg.role === "user") {
-            input.push({ type: "message", role: "user", content: [{ type: "input_text", text: msg.content || "" }] })
+            input.push({ type: "message", role: "user", content: toOpenAIResponsesContent(msg.content, "user") })
         } else if (msg.role === "assistant") {
-            input.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: msg.content || "" }] })
+            input.push({ type: "message", role: "assistant", content: toOpenAIResponsesContent(msg.content, "assistant") })
             if (msg.tool_calls && msg.tool_calls.length > 0) {
                 for (const tc of msg.tool_calls) {
                     input.push({ type: "function_call", call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments })
@@ -304,8 +302,10 @@ async function requestResponsesCompletion(
     account: ProviderAccount,
     model: string,
     messages: ClaudeMessage[],
-    tools?: ClaudeTool[]
+    tools?: ClaudeTool[],
+    signal?: AbortSignal
 ): Promise<OpenAIResponse> {
+    throwIfAborted(signal)
     const systemMessage = messages.find(m => (m.role as string) === "system")
     const instructions = systemMessage && typeof systemMessage.content === "string"
         ? systemMessage.content
@@ -336,25 +336,30 @@ async function requestResponsesCompletion(
 
     let lastError: unknown
     for (let attempt = 0; attempt <= GROK_MAX_RETRIES; attempt++) {
+        throwIfAborted(signal)
         try {
-            const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(requestBody) })
+            const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(requestBody), signal })
             const text = await response.text()
+            throwIfAborted(signal)
             if (!response.ok) {
                 lastError = new UpstreamError(GROK_PROVIDER, response.status, text, response.headers.get("retry-after") || undefined)
                 if (isRetryableStatus(response.status) && attempt < GROK_MAX_RETRIES) {
-                    await sleep(getRetryDelay(attempt))
+                    await sleepWithAbort(getRetryDelay(attempt), signal)
                     continue
                 }
-                consola.error(`Grok error ${response.status}:`, text.slice(0, 500))
+                consola.error(`Grok error ${response.status}`)
                 throw lastError
             }
             const data = text ? JSON.parse(text) : {}
             return buildCompletionFromResponses(data)
         } catch (error) {
             lastError = error
+            if (signal?.aborted || isAbortError(error)) {
+                throw createAbortError()
+            }
             if (error instanceof UpstreamError) throw error
             if (attempt < GROK_MAX_RETRIES) {
-                await sleep(getRetryDelay(attempt))
+                await sleepWithAbort(getRetryDelay(attempt), signal)
                 continue
             }
             throw error
@@ -369,9 +374,12 @@ export async function createGrokCompletion(
     messages: ClaudeMessage[],
     tools?: ClaudeTool[],
     _maxTokens?: number,
-    _reasoningEffort?: "low" | "medium" | "high"
+    _reasoningEffort?: "low" | "medium" | "high",
+    signal?: AbortSignal
 ) {
+    throwIfAborted(signal)
     const effectiveAccount = await refreshGrokAccountIfNeeded(account)
+    throwIfAborted(signal)
 
     let completion: OpenAIResponse | undefined
     let refreshedOnce = false
@@ -379,7 +387,7 @@ export async function createGrokCompletion(
 
     const attempt = async (): Promise<OpenAIResponse> => {
         try {
-            const result = await requestResponsesCompletion(effectiveAccount, model, messages, tools)
+            const result = await requestResponsesCompletion(effectiveAccount, model, messages, tools, signal)
             markGrokModelSupported(effectiveAccount.id, model)
             return result
         } catch (error) {
@@ -394,6 +402,9 @@ export async function createGrokCompletion(
         completion = await attempt()
     } catch (error) {
         lastError = error
+        if (signal?.aborted || isAbortError(error)) {
+            throw createAbortError()
+        }
         if (error instanceof UpstreamError && isAuthStatus(error) && !refreshedOnce) {
             refreshedOnce = true
             // Re-reading another CLI credential store is opt-in.
@@ -411,6 +422,7 @@ export async function createGrokCompletion(
                     }
                 } catch {
                     // ignore import failures
+                    throwIfAborted(signal)
                 }
             }
             // 仍失败则用 refresh_token 兜底
@@ -424,6 +436,9 @@ export async function createGrokCompletion(
                     completion = await attempt()
                     lastError = null
                 } catch (retryError) {
+                    if (signal?.aborted || isAbortError(retryError)) {
+                        throw createAbortError()
+                    }
                     lastError = retryError
                 }
             }
@@ -476,7 +491,7 @@ function safeParse(value: string | undefined): any {
     try {
         return JSON.parse(value)
     } catch (error) {
-        consola.warn("Grok tool args parse failed:", error)
+        consola.warn("Grok tool args parse failed:", safeErrorMessage(error))
         return {}
     }
 }

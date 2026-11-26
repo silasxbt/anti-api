@@ -46,4 +46,4 @@ Tests must not contact real providers, start public tunnels, modify real CLI/IDE
 
 ## Reporting Security Issues
 
-Do not place credentials, private account data, or unredacted logs in a public issue. Use GitHub's private vulnerability reporting form at <https://github.com/ink1ing/anti-api/security/advisories/new>. See `SECURITY.md` for the expected report contents.
+Do not place credentials, private account data, or unredacted logs in a public issue. Use GitHub's private vulnerability reporting form at <https://github.com/silasxbt/anti-api/security/advisories/new>. See `SECURITY.md` for the expected report contents.

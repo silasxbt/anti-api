@@ -1,0 +1,71 @@
+name: release-assets
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build source archives
+        id: package
+        shell: bash
+        run: |
+          TAG="$GITHUB_REF_NAME"
+          VERSION="${TAG#v}"
+          git archive --format=zip --prefix="anti-api-v${VERSION}/" HEAD > "anti-api-v${VERSION}.zip"
+          git archive --format=zip --prefix="anti-api-v${VERSION}-source/" HEAD > "anti-api-v${VERSION}-source.zip"
+          git archive --format=tar --prefix="anti-api-v${VERSION}/" HEAD | gzip -n > "anti-api-v${VERSION}-source.tar.gz"
+          sha256sum "anti-api-v${VERSION}.zip" "anti-api-v${VERSION}-source.zip" "anti-api-v${VERSION}-source.tar.gz" > SHA256SUMS.txt
+          printf 'tag=%s\nversion=%s\n' "$TAG" "$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          cat > RELEASE_NOTES.md <<EOF
+          ## Anti-API v${{ steps.package.outputs.version }}
+
+          This patch fixes the Docker health-check syntax required for multi-architecture GHCR builds and includes the packaged Rust-sidecar lifecycle and Bun test-isolation fixes from v3.2.1.
+
+          Packaged start and remote commands now keep the sidecar alive until shutdown, one-shot commands do not spawn it, and startup failures cannot orphan it. Codex and Copilot test mocks now expose the runtime exports required by later server imports.
+
+          Validation completed before publishing: 196 Bun tests, Rust release build, main and packaged Bun bundles, source archive checks, and compiled-runtime smoke tests for listeners, sidecar authentication, graceful shutdown, one-shot behavior, and forced-startup cleanup.
+
+          Source package checksums are in SHA256SUMS.txt; Windows updater and WinGet packages include adjacent .sha256 files.
+          EOF
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.package.outputs.tag }}
+          VERSION: ${{ steps.package.outputs.version }}
+        shell: bash
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "Anti-API v${VERSION}" \
+              --notes-file RELEASE_NOTES.md
+          else
+            gh release create "$TAG" \
+              --title "Anti-API v${VERSION}" \
+              --notes-file RELEASE_NOTES.md \
+              --verify-tag
+          fi
+          gh release upload "$TAG" \
+            "anti-api-v${VERSION}.zip" \
+            "anti-api-v${VERSION}-source.zip" \
+            "anti-api-v${VERSION}-source.tar.gz" \
+            SHA256SUMS.txt \
+            --clobber

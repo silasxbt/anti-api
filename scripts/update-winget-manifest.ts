@@ -21,13 +21,14 @@ const args = parseArgs(process.argv.slice(2))
 const packageJson = await Bun.file(join(repoRoot, "package.json")).json()
 const version = (args.version || packageJson.version).replace(/^v/, "")
 const arch = (args.arch || "x64").toLowerCase()
+// Keep the published package ID and manifest path stable for existing WinGet installs.
 const packageIdentifier = "Ink1ing.AntiAPI"
 const packageName = "Anti-API"
-const publisher = "ink1ing"
+const publisher = "silasxbt"
 const manifestVersion = "1.12.0"
 const manifestRoot = resolve(repoRoot, "packaging", "winget", "manifests", "i", "Ink1ing", "AntiAPI", version)
 const zipPath = args["zip-path"] ? resolve(repoRoot, args["zip-path"]) : resolve(repoRoot, "dist", `anti-api-winget-${arch}.zip`)
-const defaultUrl = `https://github.com/ink1ing/anti-api/releases/download/v${version}/anti-api-winget-${arch}.zip`
+const defaultUrl = `https://github.com/silasxbt/anti-api/releases/download/v${version}/anti-api-winget-${arch}.zip`
 const installerUrl = args.url || defaultUrl
 
 let sha256 = args.sha256
@@ -52,13 +53,13 @@ const defaultLocaleManifest = `PackageIdentifier: ${packageIdentifier}
 PackageVersion: ${version}
 PackageLocale: en-US
 Publisher: ${publisher}
-PublisherUrl: https://github.com/ink1ing
-PublisherSupportUrl: https://github.com/ink1ing/anti-api/issues
+PublisherUrl: https://github.com/silasxbt
+PublisherSupportUrl: https://github.com/silasxbt/anti-api/issues
 Author: ${publisher}
 PackageName: ${packageName}
-PackageUrl: https://github.com/ink1ing/anti-api
+PackageUrl: https://github.com/silasxbt/anti-api
 License: MIT
-LicenseUrl: https://github.com/ink1ing/anti-api/blob/main/LICENSE
+LicenseUrl: https://github.com/silasxbt/anti-api/blob/main/LICENSE
 ShortDescription: Independent local protocol-compatibility proxy for authorized provider connections.
 Description: Anti-API provides local OpenAI-compatible and Anthropic-compatible protocol translation, explicit account management, routing, and quota visibility for configured provider connections. It is independent and not provider-endorsed.
 Moniker: anti-api

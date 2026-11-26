@@ -139,6 +139,9 @@ ANTI_API_HOST must be a loopback address
    export ANTI_API_PUBLIC_TOKEN='replace-with-a-long-random-secret'
    export ANTI_API_PUBLIC_PORT=8966
    ```
+   With a configured token, the separate inference listener defaults to
+   `0.0.0.0`. Set `ANTI_API_PUBLIC_HOST=127.0.0.1` when a local reverse proxy
+   or tunnel is the only intended caller.
 3. Docker Compose publishes management ports to host loopback by default. Do not publish them to all interfaces.
 
 ---

@@ -9,10 +9,13 @@ import { accountManager } from "./account-manager"
 import { state } from "~/lib/state"
 import { type ClaudeMessage, type ClaudeTool } from "~/lib/translator"
 import { determineRetryStrategy, applyRetryDelay } from "~/lib/retry"
-import { UpstreamError } from "~/lib/error"
+import { RequestValidationError, UpstreamError } from "~/lib/error"
 import { cleanJsonSchemaForGemini } from "~/lib/json-schema-cleaner"
 import { formatSuccessLine, setRequestLogContext } from "~/lib/logger"
 import { getAntigravityUserAgent } from "~/lib/antigravity-client"
+import { fetchRemoteImageAsBase64 } from "~/lib/remote-image"
+import { createImageInputBudget, decodedBase64ImageBytes, type ImageInputBudget } from "~/lib/image-input"
+import { safeErrorMessage } from "~/lib/redaction"
 
 accountManager.load()
 
@@ -22,7 +25,6 @@ const ANTIGRAVITY_BASE_URLS = [
     "https://cloudcode-pa.googleapis.com",
 ]
 const STREAM_ENDPOINT = "/v1internal:streamGenerateContent"
-const DEFAULT_USER_AGENT = getAntigravityUserAgent()
 const MAX_RETRY_ATTEMPTS = 1  // v2.0.1 恢复：简化重试，避免级联 429
 const MAX_NON_QUOTA_429_RETRIES = 2  // Non-quota 429 retries before switching accounts
 const MAX_NON_QUOTA_429_WAIT_MS = 4000  // Upper bound for non-quota 429 wait time
@@ -130,17 +132,20 @@ function parseDurationString(s: string): number | null {
 async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: number): Promise<Response> {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
-    if (options.signal) {
-        if (options.signal.aborted) {
+    const requestSignal = options.signal
+    const abortFromRequest = () => controller.abort()
+    if (requestSignal) {
+        if (requestSignal.aborted) {
             controller.abort()
         } else {
-            options.signal.addEventListener("abort", () => controller.abort(), { once: true })
+            requestSignal.addEventListener("abort", abortFromRequest, { once: true })
         }
     }
     try {
         return await fetch(url, { ...options, signal: controller.signal })
     } finally {
         clearTimeout(timeoutId)
+        requestSignal?.removeEventListener("abort", abortFromRequest)
     }
 }
 
@@ -167,10 +172,20 @@ const MODEL_MAPPING: Record<string, string> = {
     "gemini-3-pro-high": "gemini-3-pro-high",
     "gemini-3-pro-low": "gemini-3-pro-low",
     "gemini-3-flash": "gemini-3-flash",
+    "gemini-3.1-pro": "gemini-3.1-pro",
+    "gemini-3.1-pro-preview": "gemini-3.1-pro-preview",
+    // Antigravity exposes the public "Pro (High)" tier as this native ID.
+    "gemini-3.1-pro-high": "gemini-pro-agent",
+    "gemini-3.1-pro-low": "gemini-3.1-pro-low",
+    "gemini-3.1-flash": "gemini-3.1-flash",
+    "gemini-3.1-flash-lite": "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-lite-preview": "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-flash-image": "gemini-3.1-flash-image",
+    "gemini-3.1-flash-image-preview": "gemini-3.1-flash-image-preview",
     "gpt-oss-120b": "gpt-oss-120b-medium",
 }
 
-function getAntigravityModelName(userModel: string): string {
+export function getAntigravityModelName(userModel: string): string {
     return MODEL_MAPPING[userModel] || userModel
 }
 
@@ -183,6 +198,8 @@ export interface ChatRequest {
         name?: string
     }
     maxTokens?: number
+    /** Optional downstream cancellation signal for streaming requests. */
+    signal?: AbortSignal
 }
 
 export interface ContentBlock {
@@ -294,7 +311,13 @@ function parseFunctionCallArgs(args: unknown): any {
     return args
 }
 
-function buildAntigravityParts(content: ClaudeMessage["content"], toolIdToName: Map<string, string>, modelName: string): any[] {
+export async function buildAntigravityParts(
+    content: ClaudeMessage["content"],
+    toolIdToName: Map<string, string>,
+    options: { signal?: AbortSignal; imageBudget?: ImageInputBudget; modelName?: string } = {},
+): Promise<any[]> {
+    const imageBudget = options.imageBudget ?? createImageInputBudget([{ role: "user", content }])
+    const modelName = options.modelName || ""
     if (typeof content === "string") {
         return [{ text: content }]
     }
@@ -318,6 +341,24 @@ function buildAntigravityParts(content: ClaudeMessage["content"], toolIdToName: 
                 inlineData: {
                     mimeType: block.source.media_type,
                     data: block.source.data,
+                },
+            })
+            continue
+        }
+
+        if (block.type === "image" && block.source?.type === "url") {
+            if (imageBudget.remainingBytes <= 0) {
+                throw new RequestValidationError("image inputs exceed the 16 MiB per-request limit")
+            }
+            const image = await fetchRemoteImageAsBase64(block.source.url, {
+                signal: options.signal,
+                maxBytes: imageBudget.remainingBytes,
+            })
+            imageBudget.addFetchedBytes(decodedBase64ImageBytes(image.data, true))
+            parts.push({
+                inlineData: {
+                    mimeType: image.media_type,
+                    data: image.data,
                 },
             })
             continue
@@ -466,17 +507,41 @@ function buildFunctionCallingConfig(toolChoice?: ChatRequest["toolChoice"]): any
     }
 }
 
-function claudeToAntigravity(
+function isGemini31Model(model: string): boolean {
+    return /^gemini-3\.1-/i.test(model) || model === "gemini-pro-agent"
+}
+
+/** Keep generation settings within the limits accepted by each native model family. */
+export function buildGenerationConfig(model: string, maxTokens?: number): Record<string, unknown> {
+    const modelLimit = isGemini31Model(model) ? 65536 : 64000
+    const requested = Number.isFinite(maxTokens) ? Math.floor(maxTokens as number) : modelLimit
+    const maxOutputTokens = Math.max(1, Math.min(requested, modelLimit))
+    if (isGemini31Model(model)) {
+        return { maxOutputTokens }
+    }
+    return {
+        maxOutputTokens,
+        stopSequences: ["\n\nHuman:", "[DONE]"],
+    }
+}
+
+export async function claudeToAntigravity(
     model: string,
     messages: ClaudeMessage[],
     tools?: ClaudeTool[],
-    toolChoice?: ChatRequest["toolChoice"]
-): any {
+    toolChoice?: ChatRequest["toolChoice"],
+    maxTokens?: number,
+    signal?: AbortSignal,
+): Promise<any> {
     const toolIdToName = new Map<string, string>()
-    const contents = messages.map((msg) => ({
-        role: msg.role === "assistant" ? "model" : msg.role,
-        parts: buildAntigravityParts(msg.content, toolIdToName, model),
-    }))
+    const imageBudget = createImageInputBudget(messages)
+    const contents = []
+    for (const msg of messages) {
+        contents.push({
+            role: msg.role === "assistant" ? "model" : msg.role,
+            parts: await buildAntigravityParts(msg.content, toolIdToName, { signal, imageBudget, modelName: model }),
+        })
+    }
 
     const sessionId = generateStableSessionId(messages)
     const projectId = state.cloudaicompanionProject || "unknown"
@@ -484,13 +549,13 @@ function claudeToAntigravity(
     const innerRequest: any = {
         contents,
         sessionId,
-        safetySettings: buildSafetySettings(),
         systemInstruction: buildSystemInstruction(),
-        generationConfig: {
-            maxOutputTokens: 64000,
-            stopSequences: ["\n\nHuman:", "[DONE]"],
-        },
+        generationConfig: buildGenerationConfig(model, maxTokens),
     }
+
+    // Gemini 3.1 uses the native safety policy. Sending the legacy OFF enum
+    // causes INVALID_ARGUMENT on current Antigravity endpoints.
+    if (!isGemini31Model(model)) innerRequest.safetySettings = buildSafetySettings()
 
     if (model.includes("claude") || model.includes("gemini")) {
         innerRequest.toolConfig = { functionCallingConfig: buildFunctionCallingConfig(toolChoice) }
@@ -508,7 +573,7 @@ function claudeToAntigravity(
 
     return {
         model,
-        userAgent: DEFAULT_USER_AGENT,
+        userAgent: getAntigravityUserAgent(),
         requestType: "agent",
         project: projectId,
         requestId: "agent-" + crypto.randomUUID(),
@@ -657,7 +722,7 @@ async function sendRequestSse(
                     headers: {
                         "Content-Type": "application/json",
                         "Authorization": "Bearer " + currentAccessToken,
-                        "User-Agent": DEFAULT_USER_AGENT,
+                        "User-Agent": getAntigravityUserAgent(),
                         "Accept": "text/event-stream",
                     },
                     body: JSON.stringify(antigravityRequest),
@@ -689,7 +754,7 @@ async function sendRequestSse(
                 lastStatusCode = response.status
                 lastRetryAfterHeader = response.headers.get("retry-after") || undefined
                 lastErrorText = await response.text()
-                consola.warn("SSE error " + response.status, lastErrorText.substring(0, 200))
+                consola.warn("SSE error " + response.status)
 
                 if (response.status === 404 && currentAccountId && !projectRefreshAttempts.has(currentAccountId)) {
                     projectRefreshAttempts.add(currentAccountId)
@@ -789,7 +854,7 @@ async function sendRequestSse(
                             break
                         }
                     } catch (e) {
-                        consola.warn(`Failed to refresh token for ${currentAccountId}:`, e)
+                        consola.warn(`Failed to refresh token for ${currentAccountId}:`, safeErrorMessage(e))
                     }
                     // If refresh failed, try next account
                     if (allowRotation && accountManager.count() > 1) {
@@ -849,6 +914,24 @@ async function sendRequestSse(
     throw lastError || new Error("All endpoints failed")
 }
 
+function waitWithAbort(delayMs: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+        return Promise.reject(new DOMException("The upstream stream was aborted", "AbortError"))
+    }
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            signal?.removeEventListener("abort", onAbort)
+            resolve()
+        }, delayMs)
+        const onAbort = () => {
+            clearTimeout(timer)
+            signal?.removeEventListener("abort", onAbort)
+            reject(new DOMException("The upstream stream was aborted", "AbortError"))
+        }
+        signal?.addEventListener("abort", onAbort, { once: true })
+    })
+}
+
 /**
  * 🆕 真正的流式 SSE 请求 - 边读边 yield
  * 参考 proj-1 的 create_claude_sse_stream 实现
@@ -861,7 +944,8 @@ async function* sendRequestSseStreaming(
     accountId?: string,
     allowRotation: boolean = true,
     modelName?: string,
-    routeTag?: string
+    routeTag?: string,
+    signal?: AbortSignal
 ): AsyncGenerator<string, void, unknown> {
     const startTime = Date.now()
     const IDLE_TIMEOUT_MS = 900000  // 超过 15 分钟无数据则中断
@@ -877,15 +961,27 @@ async function* sendRequestSseStreaming(
     const rotationBudget = allowRotation ? Math.max(0, accountManager.count() - 1) : 0
     const maxAttempts = MAX_NON_QUOTA_429_RETRIES + 1 + rotationBudget
 
+    const abortError = () => new DOMException("The upstream stream was aborted", "AbortError")
+    const throwIfAborted = () => {
+        if (signal?.aborted) throw abortError()
+    }
+
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        throwIfAborted()
         let retryAttempt = false
         for (const baseUrl of ANTIGRAVITY_BASE_URLS) {
+            throwIfAborted()
             const url = baseUrl + endpoint + "?alt=sse"
 
             let hasYielded = false
             let lastChunkAt = Date.now()
             let idleTimedOut = false
             const idleController = new AbortController()
+            const abortListener = () => idleController.abort()
+            if (signal) {
+                if (signal.aborted) idleController.abort()
+                else signal.addEventListener("abort", abortListener, { once: true })
+            }
 
             try {
                 const response = await fetchWithTimeout(url, {
@@ -893,7 +989,7 @@ async function* sendRequestSseStreaming(
                     headers: {
                         "Content-Type": "application/json",
                         "Authorization": "Bearer " + currentAccessToken,
-                        "User-Agent": DEFAULT_USER_AGENT,
+                        "User-Agent": getAntigravityUserAgent(),
                         "Accept": "text/event-stream",
                     },
                     body: JSON.stringify(antigravityRequest),
@@ -930,7 +1026,7 @@ async function* sendRequestSseStreaming(
 
                         const waitMs = Math.min(parsedDelay ?? 2000, MAX_NON_QUOTA_429_WAIT_MS)
                         if (nonQuota429Count < MAX_NON_QUOTA_429_RETRIES) {
-                            await new Promise(resolve => setTimeout(resolve, waitMs))
+                            await waitWithAbort(waitMs, signal)
                             nonQuota429Count += 1
                             lastError = new UpstreamError("antigravity", response.status, errorText, retryAfter)
                             retryAttempt = true
@@ -996,6 +1092,7 @@ async function* sendRequestSseStreaming(
 
                 try {
                     while (true) {
+                        throwIfAborted()
                         let result: any
                         try {
                             result = await reader.read()
@@ -1003,7 +1100,7 @@ async function* sendRequestSseStreaming(
                             if (idleTimedOut) {
                                 throw new Error("Stream idle timeout")
                             }
-                            consola.warn("[SSE Streaming] Read error:", readError)
+                            consola.warn("[SSE Streaming] Read error:", safeErrorMessage(readError))
                             throw readError
                         }
 
@@ -1020,6 +1117,7 @@ async function* sendRequestSseStreaming(
                         buffer = events.pop() || ""  // Keep incomplete tail
 
                         for (const event of events) {
+                            throwIfAborted()
                             const data = extractSseEventData(event)
                             if (!data) continue
 
@@ -1038,6 +1136,7 @@ async function* sendRequestSseStreaming(
 
                     // Handle any leftover event data
                     const tailData = extractSseEventData(buffer)
+                    throwIfAborted()
                     if (tailData) {
                         const trimmed = tailData.trim()
                         if (trimmed && trimmed !== "[DONE]") {
@@ -1058,6 +1157,7 @@ async function* sendRequestSseStreaming(
 
                 } finally {
                     clearInterval(idleTimer)
+                    signal?.removeEventListener("abort", abortListener)
                     try {
                         reader.releaseLock()
                     } catch {
@@ -1079,6 +1179,8 @@ async function* sendRequestSseStreaming(
                 return
 
             } catch (error) {
+                signal?.removeEventListener("abort", abortListener)
+                if (signal?.aborted) throw abortError()
                 if (error instanceof UpstreamError) {
                     if (hasYielded) {
                         ;(error as any).streamingStarted = true
@@ -1086,7 +1188,7 @@ async function* sendRequestSseStreaming(
                     throw error
                 }
                 if (hasYielded) throw error
-                consola.warn("[SSE Streaming] Error on", baseUrl, error)
+                consola.warn("[SSE Streaming] Upstream request failed:", safeErrorMessage(error))
                 continue
             }
         }
@@ -1216,12 +1318,14 @@ export async function createChatCompletionWithOptions(
     }
 
     try {
-    const antigravityRequest = claudeToAntigravity(
-        targetModel,
-        request.messages,
-        request.tools,
-        request.toolChoice
-    )
+        const antigravityRequest = await claudeToAntigravity(
+            targetModel,
+            request.messages,
+            request.tools,
+            request.toolChoice,
+            request.maxTokens,
+            request.signal,
+        )
 
         if (projectId) antigravityRequest.project = projectId
 
@@ -1300,11 +1404,13 @@ export async function* createChatCompletionStreamWithOptions(
     }
 
     try {
-        const antigravityRequest = claudeToAntigravity(
+        const antigravityRequest = await claudeToAntigravity(
             targetModel,
             request.messages,
             request.tools,
-            request.toolChoice
+            request.toolChoice,
+            request.maxTokens,
+            request.signal,
         )
 
         if (projectId) antigravityRequest.project = projectId
@@ -1317,7 +1423,8 @@ export async function* createChatCompletionStreamWithOptions(
             accountId,
             options.allowRotation ?? true,
             request.model,
-            options.routeTag
+            options.routeTag,
+            request.signal
         )
 
         let blockIndex = 0

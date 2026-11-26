@@ -5,7 +5,9 @@ import { UpstreamError } from "~/lib/error"
 import { importCodexAuthSources, refreshCodexAccountIfNeeded, refreshCodexAccessToken } from "~/services/codex/oauth"
 import type { ProviderAccount } from "~/services/auth/types"
 import type { ClaudeMessage, ClaudeTool } from "~/lib/translator"
-import { toOpenAIMessages, toOpenAITools } from "~/services/providers/openai-adapter"
+import { toOpenAIMessages, toOpenAIResponsesContent, toOpenAITools } from "~/services/providers/openai-adapter"
+import { createAbortError, isAbortError, sleepWithAbort, throwIfAborted } from "~/lib/stream-cancellation"
+import { safeErrorMessage } from "~/lib/redaction"
 
 const CODEX_API_BASE = "https://chatgpt.com/backend-api/codex"
 const CHAT_COMPLETIONS_PATH = "/chat/completions"
@@ -266,6 +268,7 @@ type FetchOptions = {
     method?: string
     headers?: Record<string, string>
     body?: string
+    signal?: AbortSignal
 }
 
 function getErrorCode(error: unknown): string | undefined {
@@ -305,10 +308,6 @@ function shouldRetryInsecure(error: unknown): boolean {
     return fallback.includes("fetch failed") || fallback.includes("network") || fallback.includes("connection")
 }
 
-function sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms))
-}
-
 function getRetryDelay(attempt: number): number {
     const jitter = Math.floor(Math.random() * CODEX_RETRY_JITTER_MS)
     return CODEX_RETRY_BASE_MS * Math.pow(2, attempt) + jitter
@@ -320,17 +319,19 @@ function isRetryableStatus(status: number): boolean {
 
 async function fetchInsecureJson(
     url: string,
-    options: { method?: string; headers?: Record<string, string>; body?: string }
+    options: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal }
 ): Promise<InsecureResponse> {
     if (!CODEX_INSECURE_TLS) {
         throw new Error(CODEX_TLS_HINT)
     }
+    throwIfAborted(options.signal)
     const bunFetch = (globalThis as { Bun?: { fetch?: typeof fetch } }).Bun?.fetch
     if (bunFetch) {
         const response = await bunFetch(url, {
             method: options.method,
             headers: options.headers,
             body: options.body,
+            signal: options.signal,
             tls: { rejectUnauthorized: false },
         })
         const text = await response.text()
@@ -354,7 +355,28 @@ async function fetchInsecureJson(
     const insecureAgent = new https.Agent({ rejectUnauthorized: false })
 
     return new Promise((resolve, reject) => {
-        const req = https.request(
+        let settled = false
+        let req: ReturnType<typeof https.request>
+        const cleanup = () => options.signal?.removeEventListener("abort", onAbort)
+        const resolveOnce = (value: InsecureResponse) => {
+            if (settled) return
+            settled = true
+            cleanup()
+            resolve(value)
+        }
+        const rejectOnce = (error: unknown) => {
+            if (settled) return
+            settled = true
+            cleanup()
+            reject(error)
+        }
+        const onAbort = () => {
+            if (settled) return
+            req?.destroy()
+            rejectOnce(createAbortError())
+        }
+
+        req = https.request(
             {
                 protocol: target.protocol,
                 hostname: target.hostname,
@@ -380,7 +402,7 @@ async function fetchInsecureJson(
                             data = null
                         }
                     }
-                    resolve({
+                    resolveOnce({
                         status: res.statusCode || 0,
                         data,
                         text: body,
@@ -389,10 +411,24 @@ async function fetchInsecureJson(
             }
         )
 
-        req.on("error", reject)
+        req.on("error", (error) => {
+            if (options.signal?.aborted || isAbortError(error)) {
+                rejectOnce(createAbortError())
+                return
+            }
+            rejectOnce(error)
+        })
         req.on("timeout", () => {
             req.destroy(new Error("Request timed out"))
         })
+
+        if (options.signal) {
+            if (options.signal.aborted) {
+                onAbort()
+                return
+            }
+            options.signal.addEventListener("abort", onAbort, { once: true })
+        }
 
         if (options.body) {
             req.write(options.body)
@@ -409,6 +445,7 @@ async function fetchWithOptionalTls(url: string, options: FetchOptions) {
             method: options.method,
             headers: options.headers,
             body: options.body,
+            signal: options.signal,
             ...(tls ? { tls } : {}),
         })
     }
@@ -416,6 +453,7 @@ async function fetchWithOptionalTls(url: string, options: FetchOptions) {
         method: options.method,
         headers: options.headers,
         body: options.body,
+        signal: options.signal,
     })
 }
 
@@ -480,8 +518,7 @@ function parseCodexSSEResponse(sseText: string): any {
     if (lastResponse) {
         return { ...lastResponse, output: [] }
     }
-    // Log the raw SSE for debugging
-    consola.error("Codex SSE parse failed. Raw SSE (first 1000 chars):", sseText.slice(0, 1000))
+    consola.error("Codex SSE parse failed; upstream response was not parseable")
     throw new Error("No valid response found in SSE stream")
 }
 
@@ -603,14 +640,14 @@ function toCodexResponsesInput(messages: ReturnType<typeof toOpenAIMessages>): a
             input.push({
                 type: "message",
                 role: "user",
-                content: [{ type: "input_text", text: msg.content || "" }]
+                content: toOpenAIResponsesContent(msg.content, "user")
             })
         } else if (msg.role === "assistant") {
             // Add message content (without tool_calls, as they go separately)
             input.push({
                 type: "message",
                 role: "assistant",
-                content: [{ type: "output_text", text: msg.content || "" }]
+                content: toOpenAIResponsesContent(msg.content, "assistant")
             })
 
             // Convert tool_calls to separate function_call objects
@@ -645,8 +682,10 @@ async function requestChatCompletion(
     model: string,
     messages: ClaudeMessage[],
     tools?: ClaudeTool[],
-    maxTokens?: number
+    maxTokens?: number,
+    signal?: AbortSignal
 ): Promise<{ completion: OpenAIResponse; model: string }> {
+    throwIfAborted(signal)
     const requestBody = {
         model,
         messages: toOpenAIMessages(messages),
@@ -658,18 +697,20 @@ async function requestChatCompletion(
 
     let lastError: unknown
     for (let attempt = 0; attempt <= CODEX_MAX_RETRIES; attempt++) {
+        throwIfAborted(signal)
         try {
             const response = await fetchWithOptionalTls(url, {
                 method: "POST",
                 headers,
                 body: JSON.stringify(requestBody),
+                signal,
             })
 
             if (!response.ok) {
                 const errorText = await response.text()
                 const retryAfter = response.headers.get("retry-after") || undefined
                 if (isRetryableStatus(response.status) && attempt < CODEX_MAX_RETRIES) {
-                    await sleep(getRetryDelay(attempt))
+                    await sleepWithAbort(getRetryDelay(attempt), signal)
                     continue
                 }
                 throw new UpstreamError("codex", response.status, errorText, retryAfter)
@@ -679,6 +720,9 @@ async function requestChatCompletion(
             return { completion: data, model }
         } catch (error) {
             lastError = error
+            if (signal?.aborted || isAbortError(error)) {
+                throw createAbortError()
+            }
             if (!CODEX_INSECURE_TLS && isCertificateError(error)) {
                 throw new Error(CODEX_TLS_HINT)
             }
@@ -692,10 +736,11 @@ async function requestChatCompletion(
                     method: "POST",
                     headers,
                     body: JSON.stringify(requestBody),
+                    signal,
                 })
                 if (insecure.status < 200 || insecure.status >= 300) {
                     if (isRetryableStatus(insecure.status) && attempt < CODEX_MAX_RETRIES) {
-                        await sleep(getRetryDelay(attempt))
+                        await sleepWithAbort(getRetryDelay(attempt), signal)
                         continue
                     }
                     throw new UpstreamError("codex", insecure.status, insecure.text)
@@ -707,7 +752,7 @@ async function requestChatCompletion(
                 return { completion: data, model }
             }
             if (attempt < CODEX_MAX_RETRIES) {
-                await sleep(getRetryDelay(attempt))
+                await sleepWithAbort(getRetryDelay(attempt), signal)
                 continue
             }
             throw error
@@ -722,8 +767,10 @@ async function requestResponsesCompletion(
     messages: ClaudeMessage[],
     tools?: ClaudeTool[],
     maxTokens?: number,
-    reasoningEffort?: CodexReasoningEffort
+    reasoningEffort?: CodexReasoningEffort,
+    signal?: AbortSignal
 ): Promise<{ completion: OpenAIResponse; model: string }> {
+    throwIfAborted(signal)
     // CLIProxyAPI format: Codex Responses API requires specific fields
     // Extract system message as instructions, or use default
     const systemMessage = messages.find(m => (m.role as string) === "system")
@@ -758,21 +805,23 @@ async function requestResponsesCompletion(
 
     let lastError: unknown
     for (let attempt = 0; attempt <= CODEX_MAX_RETRIES; attempt++) {
+        throwIfAborted(signal)
         try {
             const response = await fetchWithOptionalTls(url, {
                 method: "POST",
                 headers,
                 body: JSON.stringify(requestBody),
+                signal,
             })
             const text = await response.text()
 
             if (!response.ok) {
                 lastError = new UpstreamError("codex", response.status, text, response.headers.get("retry-after") || undefined)
                 if (isRetryableStatus(response.status) && attempt < CODEX_MAX_RETRIES) {
-                    await sleep(getRetryDelay(attempt))
+                    await sleepWithAbort(getRetryDelay(attempt), signal)
                     continue
                 }
-                consola.error(`Codex error ${response.status}:`, text.slice(0, 500))
+                consola.error(`Codex error ${response.status}`)
                 throw lastError
             }
 
@@ -781,6 +830,9 @@ async function requestResponsesCompletion(
             return { completion: buildCompletionFromResponses(data), model }
         } catch (error) {
             lastError = error
+            if (signal?.aborted || isAbortError(error)) {
+                throw createAbortError()
+            }
             if (!CODEX_INSECURE_TLS && isCertificateError(error)) {
                 throw new Error(CODEX_TLS_HINT)
             }
@@ -789,21 +841,22 @@ async function requestResponsesCompletion(
                     method: "POST",
                     headers,
                     body: JSON.stringify(requestBody),
+                    signal,
                 })
                 if (insecure.status < 200 || insecure.status >= 300) {
                     lastError = new UpstreamError("codex", insecure.status, insecure.text)
                     if (isRetryableStatus(insecure.status) && attempt < CODEX_MAX_RETRIES) {
-                        await sleep(getRetryDelay(attempt))
+                        await sleepWithAbort(getRetryDelay(attempt), signal)
                         continue
                     }
-                    consola.error(`Codex error ${insecure.status}:`, insecure.text.slice(0, 500))
+                    consola.error(`Codex error ${insecure.status}`)
                     throw lastError
                 }
                 const data = parseCodexSSEResponse(insecure.text)
                 return { completion: buildCompletionFromResponses(data), model }
             }
             if (attempt < CODEX_MAX_RETRIES) {
-                await sleep(getRetryDelay(attempt))
+                await sleepWithAbort(getRetryDelay(attempt), signal)
                 continue
             }
             throw error
@@ -819,9 +872,12 @@ export async function createCodexCompletion(
     messages: ClaudeMessage[],
     tools?: ClaudeTool[],
     maxTokens?: number,
-    reasoningEffort?: CodexReasoningEffort
+    reasoningEffort?: CodexReasoningEffort,
+    signal?: AbortSignal
 ) {
+    throwIfAborted(signal)
     const effectiveAccount = await refreshCodexAccountIfNeeded(account)
+    throwIfAborted(signal)
 
     let completion: OpenAIResponse | undefined
     let resolvedModel = model
@@ -831,11 +887,11 @@ export async function createCodexCompletion(
     const attempt = async (targetModel: string): Promise<OpenAIResponse> => {
         try {
             if (shouldUseResponses(targetModel)) {
-                const result = await requestResponsesCompletion(effectiveAccount, targetModel, messages, tools, maxTokens, reasoningEffort)
+                const result = await requestResponsesCompletion(effectiveAccount, targetModel, messages, tools, maxTokens, reasoningEffort, signal)
                 markCodexModelSupported(effectiveAccount.id, targetModel)
                 return result.completion
             }
-            const result = await requestChatCompletion(effectiveAccount, targetModel, messages, tools, maxTokens)
+            const result = await requestChatCompletion(effectiveAccount, targetModel, messages, tools, maxTokens, signal)
             markCodexModelSupported(effectiveAccount.id, targetModel)
             return result.completion
         } catch (error) {
@@ -850,6 +906,9 @@ export async function createCodexCompletion(
         completion = await attempt(model)
     } catch (error) {
         lastError = error
+        if (signal?.aborted || isAbortError(error)) {
+            throw createAbortError()
+        }
         if (error instanceof UpstreamError && isAuthStatus(error) && effectiveAccount.refreshToken && !refreshedOnce) {
             refreshedOnce = true
             try {
@@ -873,6 +932,7 @@ export async function createCodexCompletion(
                 }
             } catch {
                 // ignore import failures
+                throwIfAborted(signal)
             }
 
             if (completion) {
@@ -891,6 +951,9 @@ export async function createCodexCompletion(
                     completion = await attempt(model)
                     lastError = null
                 } catch (retryError) {
+                    if (signal?.aborted || isAbortError(retryError)) {
+                        throw createAbortError()
+                    }
                     if (isRefreshTokenReuseError(retryError)) {
                         effectiveAccount.refreshToken = undefined
                         authStore.saveAccount(effectiveAccount)
@@ -950,7 +1013,7 @@ export async function createCodexCompletion(
     // Debug log to understand why completion is considered empty
     const isEmpty1 = isEmptyCompletion(completion)
     if (isEmpty1) {
-        consola.warn("Codex completion considered empty (first check). Structure:", JSON.stringify(completion).slice(0, 800))
+            consola.warn("Codex completion considered empty (first check)")
     }
 
     if (isEmpty1 && resolvedModel !== DEFAULT_FALLBACK_MODEL) {
@@ -959,14 +1022,14 @@ export async function createCodexCompletion(
             completion = await attempt(DEFAULT_FALLBACK_MODEL)
             resolvedModel = DEFAULT_FALLBACK_MODEL
         } catch (fallbackError) {
-            consola.error("Codex fallback attempt failed:", fallbackError)
+            consola.error("Codex fallback attempt failed:", safeErrorMessage(fallbackError))
             throw fallbackError
         }
     }
 
     const isEmpty2 = isEmptyCompletion(completion)
     if (isEmpty2) {
-        consola.warn("Codex completion still empty after fallback. Returning empty response.", JSON.stringify(completion).slice(0, 400))
+        consola.warn("Codex completion still empty after fallback. Returning empty response.")
         return {
             contentBlocks: [{ type: "text" as const, text: "" }],
             stopReason: "end_turn" as const,
@@ -1015,7 +1078,7 @@ function safeParse(value: string | undefined): any {
     try {
         return JSON.parse(value)
     } catch (error) {
-        consola.warn("Codex tool args parse failed:", error)
+        consola.warn("Codex tool args parse failed:", safeErrorMessage(error))
         return {}
     }
 }

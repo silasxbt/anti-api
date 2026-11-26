@@ -353,7 +353,7 @@ async function refreshKiroDesktopToken(credential: KiroCredential): Promise<Kiro
     const text = await response.text()
     const data = text ? JSON.parse(text) : null
     if (!response.ok || !data?.accessToken) {
-        throw new Error(`Kiro token refresh failed (${response.status}): ${text.slice(0, 300)}`)
+        throw new Error(`Kiro token refresh failed (${response.status})`)
     }
     return {
         ...credential,
@@ -382,7 +382,7 @@ async function refreshAwsSsoOidcToken(credential: KiroCredential): Promise<KiroC
     const text = await response.text()
     const data = text ? JSON.parse(text) : null
     if (!response.ok || !data?.accessToken) {
-        throw new Error(`Kiro AWS SSO token refresh failed (${response.status}): ${text.slice(0, 300)}`)
+        throw new Error(`Kiro AWS SSO token refresh failed (${response.status})`)
     }
     return {
         ...credential,

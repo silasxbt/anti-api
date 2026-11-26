@@ -1,10 +1,13 @@
 import { execFile } from "node:child_process"
 import { accessSync, constants, existsSync, readdirSync, statSync } from "fs"
 import { homedir } from "os"
+import { createServer } from "node:net"
 import { join } from "path"
 import { getDataDir } from "~/lib/data-dir"
 import { authStore } from "./store"
 import type { AuthProvider } from "./types"
+import { getZedCredentialsStatus } from "~/services/zed/oauth"
+import { OAUTH_CONFIG } from "~/services/antigravity/oauth"
 
 type DiagnosticStatus = "pass" | "warn" | "fail"
 
@@ -38,6 +41,20 @@ function redactOutput(value: string): string {
         .slice(0, MAX_OUTPUT_LENGTH)
 }
 
+function safeRedirectDisplay(value: string | undefined): string {
+    if (!value) return ""
+    try {
+        const url = new URL(value)
+        url.username = ""
+        url.password = ""
+        url.search = ""
+        url.hash = ""
+        return url.toString()
+    } catch {
+        return "configured (invalid URL)"
+    }
+}
+
 function fileSummary(path: string): string {
     if (!existsSync(path)) return "missing"
     try {
@@ -62,9 +79,9 @@ function pushCheck(checks: DiagnosticCheck[], check: DiagnosticCheck): void {
     checks.push(check)
 }
 
-async function runShell(command: string, timeoutMs = COMMAND_TIMEOUT_MS): Promise<{ ok: boolean; output: string }> {
+async function runCommand(command: string, args: string[] = [], timeoutMs = COMMAND_TIMEOUT_MS): Promise<{ ok: boolean; output: string }> {
     return new Promise((resolve) => {
-        execFile("/bin/zsh", ["-lc", command], { timeout: timeoutMs }, (error, stdout, stderr) => {
+        execFile(command, args, { timeout: timeoutMs, windowsHide: true }, (error, stdout, stderr) => {
             const output = redactOutput(`${stdout || ""}${stderr ? `\n${stderr}` : ""}`.trim())
             resolve({ ok: !error, output })
         })
@@ -77,19 +94,65 @@ async function commandCheck(
     provider: DiagnosticCheck["provider"],
     title: string,
     command: string,
+    args: string[],
     detailWhenOk: string,
     detailWhenFail: string,
     failStatus: DiagnosticStatus = "warn"
 ): Promise<void> {
-    const result = await runShell(command)
+    const commandDisplay = [command, ...args].join(" ")
+    const result = await runCommand(command, args)
     pushCheck(checks, {
         id,
         provider,
         status: result.ok && result.output ? "pass" : failStatus,
         title,
         detail: result.ok && result.output ? detailWhenOk : detailWhenFail,
-        command,
+        command: commandDisplay,
         output: result.output || "(no output)",
+    })
+}
+
+type CommandCandidate = {
+    command: string
+    args: string[]
+}
+
+async function commandAnyCheck(
+    checks: DiagnosticCheck[],
+    id: string,
+    provider: DiagnosticCheck["provider"],
+    title: string,
+    candidates: CommandCandidate[],
+    detailWhenOk: string,
+    detailWhenFail: string,
+    failStatus: DiagnosticStatus = "warn"
+): Promise<void> {
+    let lastOutput = ""
+    for (const candidate of candidates) {
+        const result = await runCommand(candidate.command, candidate.args)
+        if (result.output) lastOutput = result.output
+        if (result.ok && result.output) {
+            pushCheck(checks, {
+                id,
+                provider,
+                status: "pass",
+                title,
+                detail: detailWhenOk,
+                command: [candidate.command, ...candidate.args].join(" "),
+                output: result.output,
+            })
+            return
+        }
+    }
+
+    pushCheck(checks, {
+        id,
+        provider,
+        status: failStatus,
+        title,
+        detail: detailWhenFail,
+        command: candidates.map(candidate => [candidate.command, ...candidate.args].join(" ")).join(" or "),
+        output: lastOutput || "(no output)",
     })
 }
 
@@ -125,19 +188,9 @@ function dataDirDiagnostics(checks: DiagnosticCheck[]): void {
 function pathDiagnostics(checks: DiagnosticCheck[]): void {
     const codexAuthPath = homePath(".codex", "auth.json")
     const proxyDir = homePath(".cli-proxy-api")
-    const zedApp = "/Applications/Zed.app"
-    const antigravityApp = "/Applications/Antigravity.app"
     const kiroJson = homePath(".aws", "sso", "cache", "kiro-auth-token.json")
     const kiroDb = homePath(".local", "share", "kiro-cli", "data.sqlite3")
     const amazonQDb = homePath(".local", "share", "amazon-q", "data.sqlite3")
-
-    pushCheck(checks, {
-        id: "antigravity.app",
-        provider: "antigravity",
-        status: existsSync(antigravityApp) ? "pass" : "warn",
-        title: "Antigravity app",
-        detail: `${antigravityApp}: ${fileSummary(antigravityApp)}`,
-    })
 
     pushCheck(checks, {
         id: "codex.authFile",
@@ -163,14 +216,6 @@ function pathDiagnostics(checks: DiagnosticCheck[]): void {
         status: copilotProxyCount > 0 ? "pass" : "warn",
         title: "GitHub Copilot local auth files",
         detail: `${proxyDir}: ${copilotProxyCount} GitHub Copilot auth file(s) found`,
-    })
-
-    pushCheck(checks, {
-        id: "zed.app",
-        provider: "zed",
-        status: existsSync(zedApp) ? "pass" : "warn",
-        title: "Zed app",
-        detail: `${zedApp}: ${fileSummary(zedApp)}`,
     })
 
     const kiroSources = [
@@ -207,8 +252,8 @@ function envDiagnostics(checks: DiagnosticCheck[]): void {
         status: redirect ? "pass" : "pass",
         title: "Antigravity OAuth redirect",
         detail: redirect
-            ? `Using override: ${redirect}`
-            : "No override set. Anti-API will bind a local callback port starting at 1455.",
+            ? `Using override: ${safeRedirectDisplay(redirect)}`
+            : `No override set. Anti-API will bind a local callback port starting at ${OAUTH_CONFIG.callbackPort}.`,
     })
 
     const kiroEnv = [
@@ -225,6 +270,49 @@ function envDiagnostics(checks: DiagnosticCheck[]): void {
         title: "Kiro environment overrides",
         detail: kiroEnv.length > 0 ? `Configured: ${kiroEnv.join(", ")}` : "No Kiro env overrides set; default local paths and us-east-1 will be used.",
     })
+
+    const zedStatus = getZedCredentialsStatus()
+    pushCheck(checks, {
+        id: "zed.credentialsFile",
+        provider: "zed",
+        status: zedStatus === "ready" ? "pass" : "warn",
+        title: "Zed credential file",
+        detail: zedStatus === "ready"
+            ? "Configured Zed credential file is readable and owner-only."
+            : zedStatus === "not_configured"
+                ? `Set ${"ANTI_API_ZED_CREDENTIALS_FILE"} to import a Zed account explicitly.`
+                : "Configured Zed credential file is missing, too broad, or invalid.",
+    })
+}
+
+async function checkTcpPort(port: number): Promise<"free" | "busy"> {
+    return new Promise(resolve => {
+        const listener = createServer()
+        let settled = false
+        const finish = (result: "free" | "busy") => {
+            if (settled) return
+            settled = true
+            resolve(result)
+        }
+        listener.once("error", () => finish("busy"))
+        listener.listen({ host: "127.0.0.1", port }, () => {
+            listener.close(() => finish("free"))
+        })
+    })
+}
+
+async function callbackPortCheck(checks: DiagnosticCheck[]): Promise<void> {
+    const ports = Array.from({ length: 11 }, (_, index) => OAUTH_CONFIG.callbackPort + index)
+    const statuses = await Promise.all(ports.map(async port => `${port}:${await checkTcpPort(port)}`))
+    pushCheck(checks, {
+        id: "antigravity.callbackPorts",
+        provider: "antigravity",
+        status: "pass",
+        title: "OAuth callback ports",
+        detail: "Callback port scan completed.",
+        command: `TCP 127.0.0.1:${OAUTH_CONFIG.callbackPort}-${OAUTH_CONFIG.callbackPort + 10}`,
+        output: statuses.join(" "),
+    })
 }
 
 export async function runAccountDiagnostics(): Promise<DiagnosticReport> {
@@ -235,11 +323,13 @@ export async function runAccountDiagnostics(): Promise<DiagnosticReport> {
     envDiagnostics(checks)
 
     await Promise.all([
-        commandCheck(checks, "system.bun", "system", "Bun runtime", "bun --version", "Bun is available.", "Bun command is not available from this environment.", "warn"),
-        commandCheck(checks, "codex.cli", "codex", "Codex CLI", "command -v codex && codex --version", "Codex CLI is available.", "Codex CLI is missing or not runnable. Browser OAuth may still work, but CLI import can fail.", "warn"),
-        commandCheck(checks, "kiro.cli", "kiro", "Kiro CLI", "command -v kiro || command -v kiro-cli", "Kiro CLI is available.", "Kiro CLI was not found in PATH. Local Kiro IDE credentials may still be importable.", "warn"),
-        commandCheck(checks, "zed.keychain", "zed", "Zed Keychain entry", "security find-internet-password -s zed.dev", "Zed Keychain entry is present.", "Zed Keychain entry was not found or access was denied. Open Zed and sign in first.", "warn"),
-        commandCheck(checks, "antigravity.callbackPorts", "antigravity", "OAuth callback ports", "for p in {1455..1465}; do lsof -nP -iTCP:$p -sTCP:LISTEN >/dev/null 2>&1 && echo \"$p:busy\" || echo \"$p:free\"; done", "Callback port scan completed.", "Could not scan callback ports.", "warn"),
+        commandCheck(checks, "system.bun", "system", "Bun runtime", process.execPath, ["--version"], "Bun is available.", "Bun runtime is not available from this environment.", "warn"),
+        commandCheck(checks, "codex.cli", "codex", "Codex CLI", "codex", ["--version"], "Codex CLI is available.", "Codex CLI is missing or not runnable. Browser OAuth may still work, but CLI import can fail.", "warn"),
+        commandAnyCheck(checks, "kiro.cli", "kiro", "Kiro CLI", [
+            { command: "kiro", args: ["--version"] },
+            { command: "kiro-cli", args: ["--version"] },
+        ], "Kiro CLI is available.", "Kiro CLI was not found in PATH. Local Kiro IDE credentials may still be importable.", "warn"),
+        callbackPortCheck(checks),
     ])
 
     return {

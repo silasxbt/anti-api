@@ -19,9 +19,6 @@ export interface State {
     verbose: boolean
     // 动态获取的CloudAICompanion项目ID
     cloudaicompanionProject: string | null
-    // language_server gRPC连接信息
-    languageServerPort: number | null
-    csrfToken: string | null
     // Cascade 会话ID
     cascadeId: string | null
     // 公共隧道 URL
@@ -38,9 +35,6 @@ export const state: State = {
     port: 44444,  // 🆕 修正为 anti-api 实际端口
     verbose: false,
     cloudaicompanionProject: null,
-    languageServerPort: null,
-    csrfToken: null,
     cascadeId: null,
     publicUrl: null,
 }
-

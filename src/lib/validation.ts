@@ -60,7 +60,7 @@ export function validateChatRequest(payload: any): ValidationResult {
 
     // Optional fields validation
     if (payload.max_tokens !== undefined) {
-        if (typeof payload.max_tokens !== "number" || payload.max_tokens <= 0) {
+        if (typeof payload.max_tokens !== "number" || !Number.isFinite(payload.max_tokens) || payload.max_tokens <= 0) {
             return { valid: false, error: "max_tokens must be a positive number" }
         }
         if (payload.max_tokens > MAX_TOKENS_LIMIT) {
@@ -103,6 +103,9 @@ export function validateAnthropicRequest(payload: any): ValidationResult {
     if (!payload.model || typeof payload.model !== "string") {
         return { valid: false, error: "Model is required and must be a string" }
     }
+    if (payload.model.length > MAX_MODEL_NAME_LENGTH) {
+        return { valid: false, error: `Model name too long (max ${MAX_MODEL_NAME_LENGTH} characters)` }
+    }
 
     // Messages validation
     if (!Array.isArray(payload.messages)) {
@@ -110,6 +113,9 @@ export function validateAnthropicRequest(payload: any): ValidationResult {
     }
     if (payload.messages.length === 0) {
         return { valid: false, error: "Messages array cannot be empty" }
+    }
+    if (payload.messages.length > MAX_MESSAGES_PER_REQUEST) {
+        return { valid: false, error: `Too many messages (max ${MAX_MESSAGES_PER_REQUEST})` }
     }
 
     for (let i = 0; i < payload.messages.length; i++) {
@@ -124,8 +130,23 @@ export function validateAnthropicRequest(payload: any): ValidationResult {
 
     // max_tokens validation (required for Anthropic)
     if (payload.max_tokens !== undefined) {
-        if (typeof payload.max_tokens !== "number" || payload.max_tokens <= 0) {
+        if (typeof payload.max_tokens !== "number" || !Number.isFinite(payload.max_tokens) || payload.max_tokens <= 0) {
             return { valid: false, error: "max_tokens must be a positive number" }
+        }
+        if (payload.max_tokens > MAX_TOKENS_LIMIT) {
+            return { valid: false, error: `max_tokens too large (max ${MAX_TOKENS_LIMIT})` }
+        }
+    }
+
+    // Keep the Anthropic-compatible endpoint bounded by the same limits as the
+    // OpenAI-compatible endpoint. This prevents an otherwise valid payload from
+    // expanding memory/work in downstream provider conversions.
+    if (payload.tools !== undefined) {
+        if (!Array.isArray(payload.tools)) {
+            return { valid: false, error: "tools must be an array" }
+        }
+        if (payload.tools.length > MAX_TOOLS_PER_REQUEST) {
+            return { valid: false, error: `Too many tools (max ${MAX_TOOLS_PER_REQUEST})` }
         }
     }
 

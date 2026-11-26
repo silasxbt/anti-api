@@ -8,22 +8,28 @@ import { defineCommand, runMain } from "citty"
 import consola from "consola"
 
 import { server, publicServer } from "./server"
-import { getPublicGatewayHost, getPublicGatewayPort, getPublicGatewayToken } from "./lib/public-access"
+import { getControlPlaneToken, getPublicGatewayHost, getPublicGatewayPort, getPublicGatewayToken, isContainerControlPlaneEnabled } from "./lib/public-access"
 import { isLoopbackAddress } from "./lib/local-request"
 import { setupAntigravityToken } from "./lib/token"
-import { getLanguageServerInfo } from "./lib/port-finder"
 import { state } from "./lib/state"
 import { initAuth, isAuthenticated, saveAuth, startOAuthLogin } from "./services/antigravity/login"
 import { getProjectID } from "./services/antigravity/oauth"
 import { accountManager } from "./services/antigravity/account-manager"
 import { getSetting } from "./services/settings"
 import { logoutIdeSession, getIdeAuthStatus } from "./services/antigravity/ide-switch"
+import { openBrowser } from "./lib/open-browser"
+import { LOG_LEVELS, resolveLogLevel } from "./lib/log-level"
+import { startAntigravityIdeVersionUpdater } from "./lib/antigravity-client"
+import { safeErrorMessage } from "./lib/redaction"
 
 function getLocalHost(): string {
     const host = process.env.ANTI_API_HOST?.trim() || "127.0.0.1"
     if (!isLoopbackAddress(host)) {
-        if (process.env.ANTI_API_CONTAINER_CONTROL_PLANE === "1" && host === "0.0.0.0") {
+        if (isContainerControlPlaneEnabled() && host === "0.0.0.0" && getControlPlaneToken()) {
             return host
+        }
+        if (isContainerControlPlaneEnabled() && host === "0.0.0.0") {
+            throw new Error("ANTI_API_CONTROL_TOKEN is required when the container control plane listens on 0.0.0.0")
         }
         throw new Error("ANTI_API_HOST must be a loopback address. Use ANTI_API_PUBLIC_HOST/PORT/TOKEN for LAN or tunnel inference.")
     }
@@ -43,36 +49,6 @@ function startPublicGateway(localPort: number): { port: number; stop: () => void
     })
     consola.info(`Public inference gateway: http://${getPublicGatewayHost()}:${port}`)
     return { port, stop: () => serverInstance.stop(true) }
-}
-
-/**
- * 打开浏览器
- * 在 Docker/无头环境中静默失败
- */
-function openBrowser(url: string): void {
-    if (process.env.ANTI_API_NO_OPEN === "1") {
-        return
-    }
-    const platform = process.platform
-    let cmd: string
-    let args: string[]
-
-    if (platform === "darwin") {
-        cmd = "open"
-        args = [url]
-    } else if (platform === "win32") {
-        cmd = "cmd"
-        args = ["/c", "start", url]
-    } else {
-        cmd = "xdg-open"
-        args = [url]
-    }
-
-    try {
-        Bun.spawn([cmd, ...args], { stdout: "ignore", stderr: "ignore" })
-    } catch {
-        // 在 Docker/无头环境中静默忽略
-    }
 }
 
 const start = defineCommand({
@@ -96,13 +72,10 @@ const start = defineCommand({
     },
     async run({ args }) {
         state.port = parseInt(args.port, 10)
-        state.verbose = args.verbose
-
-        if (args.verbose) {
-            consola.level = 4 // debug
-        } else {
-            consola.level = 0 // silent
-        }
+        const logLevel = resolveLogLevel(process.env, args.verbose)
+        state.verbose = logLevel >= LOG_LEVELS.debug
+        consola.level = logLevel
+        startAntigravityIdeVersionUpdater()
 
         // 尝试加载已保存的 OAuth 认证
         initAuth()
@@ -113,7 +86,7 @@ const start = defineCommand({
             try {
                 await setupAntigravityToken()
             } catch (error) {
-                consola.debug("Failed to read token from IDE:", (error as Error).message)
+                consola.debug("Failed to read token from IDE:", safeErrorMessage(error))
             }
         }
 
@@ -127,15 +100,8 @@ const start = defineCommand({
                     consola.success(`Project ID refreshed: ${projectId}`)
                 }
             } catch (error) {
-                consola.debug("Project ID refresh failed:", (error as Error).message)
+                consola.debug("Project ID refresh failed:", safeErrorMessage(error))
             }
-        }
-
-        // 获取 language_server 信息 (用于配额查询等)
-        const lsInfo = await getLanguageServerInfo()
-        if (lsInfo) {
-            state.languageServerPort = lsInfo.port
-            state.csrfToken = lsInfo.csrfToken
         }
 
         // 打印启动 banner
@@ -167,10 +133,10 @@ const start = defineCommand({
                     if (result.url) {
                         consola.success(`ngrok tunnel: ${result.url}`)
                     } else if (result.error) {
-                        consola.warn(`ngrok: ${result.error}`)
+                        consola.warn(`ngrok: ${safeErrorMessage(result.error)}`)
                     }
                 } catch (error) {
-                    consola.warn(`ngrok: ${(error as Error).message}`)
+                    consola.warn("ngrok startup failed:", safeErrorMessage(error))
                 }
             }, 3000)
         }
@@ -211,7 +177,7 @@ const addAccount = defineCommand({
             consola.success(`Account added: ${result.email}`)
             consola.info(`Anti-API now manages ${accountManager.count()} authorized account(s)`)
         } else {
-            consola.error(`Failed to add account: ${result.error}`)
+            consola.error(`Failed to add account: ${safeErrorMessage(result.error)}`)
         }
     },
 })
@@ -261,8 +227,10 @@ const remote = defineCommand({
         }
 
         state.port = parseInt(args.port, 10)
-        state.verbose = true
-        consola.level = 0
+        const logLevel = resolveLogLevel()
+        state.verbose = logLevel >= LOG_LEVELS.debug
+        consola.level = logLevel
+        startAntigravityIdeVersionUpdater()
         initAuth()
 
         Bun.serve({
@@ -283,7 +251,7 @@ const remote = defineCommand({
         const { startNgrok, stopNgrok } = await import("./services/tunnel-manager")
         const result = await startNgrok(state.port)
         if (!result.url) {
-            consola.error(result.error || "ngrok failed to start")
+            consola.error(safeErrorMessage(result.error || "ngrok failed to start"))
             process.exitCode = 1
             return
         }
@@ -334,7 +302,7 @@ const logoutIde = defineCommand({
         const result = await logoutIdeSession()
 
         if (!result.success) {
-            consola.error(`Logout failed: ${result.error}`)
+            consola.error(`Logout failed: ${safeErrorMessage(result.error)}`)
             process.exit(1)
         }
 

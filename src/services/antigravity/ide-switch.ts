@@ -23,6 +23,7 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { existsSync } from "node:fs"
 import consola from "consola"
+import { safeErrorMessage } from "~/lib/redaction"
 
 const execAsync = promisify(exec)
 
@@ -105,7 +106,7 @@ export function getIdeAuthStatus(): IdeAuthInfo {
             name: data.name || null,
         }
     } catch (error) {
-        consola.debug("Failed to read IDE auth status:", (error as Error).message)
+        consola.debug("Failed to read IDE auth status:", safeErrorMessage(error))
         return { loggedIn: false, email: null, name: null }
     }
 }
@@ -244,5 +245,4 @@ export async function logoutIdeSession(): Promise<IdeLogoutResult> {
         }
     }
 }
-
 

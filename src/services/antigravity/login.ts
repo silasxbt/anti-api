@@ -10,7 +10,11 @@ import consola from "consola"
 import { tightenPrivateFile, writePrivateFile } from "~/lib/private-file"
 import {
     startOAuthCallbackServer,
-    generateState,
+    resolveOAuthCallbackServerOptions,
+    getAntigravityOAuthRedirectUri,
+    createOAuthPkceSession,
+    consumeOAuthPkceVerifier,
+    discardOAuthPkceSession,
     generateAuthURL,
     exchangeCode,
     fetchUserInfo,
@@ -19,6 +23,8 @@ import {
 } from "./oauth"
 import { generateMockProjectId } from "./project-id"
 import { ensureDataDir, getDataDir, getLegacyProjectDataDir } from "~/lib/data-dir"
+import { openBrowser } from "~/lib/open-browser"
+import { safeErrorMessage } from "~/lib/redaction"
 
 const AUTH_FILE = join(getDataDir(), "auth.json")
 const LEGACY_AUTH_FILE = join(getLegacyProjectDataDir(), "auth.json")
@@ -30,6 +36,14 @@ interface AuthData {
     userName?: string
     expiresAt?: number
     projectId?: string
+}
+
+function publicOAuthError(error: unknown): string {
+    const message = error instanceof Error ? error.message : ""
+    if (/^(Authentication timeout \(5 minutes\)|Missing code or state in callback|State mismatch - possible CSRF attack|Token exchange failed \(\d{3}\)\.|Failed to get user info: \d+|ANTI_API_OAUTH_REDIRECT_URL|OAuth callback port)/.test(message)) {
+        return message
+    }
+    return "Authentication failed. Check the browser login and callback port, then retry."
 }
 
 /**
@@ -56,7 +70,7 @@ export function initAuth(): void {
             }
         }
     } catch (error) {
-        consola.warn("Failed to load saved auth:", error)
+        consola.warn("Failed to load saved auth:", safeErrorMessage(error))
     }
 }
 
@@ -79,7 +93,7 @@ export function saveAuth(): void {
         writePrivateFile(AUTH_FILE, JSON.stringify(data, null, 2))
         consola.success("Authentication saved")
     } catch (error) {
-        consola.error("Failed to save auth:", error)
+        consola.error("Failed to save auth:", safeErrorMessage(error))
     }
 }
 
@@ -102,7 +116,7 @@ export function clearAuth(): void {
             writePrivateFile(LEGACY_AUTH_FILE, "{}")
         }
     } catch (error) {
-        consola.warn("Failed to clear auth file:", error)
+        consola.warn("Failed to clear auth file:", safeErrorMessage(error))
     }
 }
 
@@ -140,32 +154,34 @@ export function setAuth(accessToken: string, refreshToken?: string, email?: stri
  */
 export async function startOAuthLogin(): Promise<{ success: boolean; error?: string; email?: string }> {
     let oauthServer: { stop: () => void } | null = null
+    let timeoutId: ReturnType<typeof setTimeout> | null = null
+    let oauthState: string | null = null
     try {
+        const oauthSession = createOAuthPkceSession()
+        const loginState = oauthSession.state
+        oauthState = loginState
+        const configuredRedirect = process.env.ANTI_API_OAUTH_REDIRECT_URL?.trim()
 
         // 1. 启动回调服务器
-        const { server, port, waitForCallback } = await startOAuthCallbackServer()
+        const { server, port, waitForCallback } = await startOAuthCallbackServer({
+            ...resolveOAuthCallbackServerOptions(configuredRedirect),
+            expectedState: loginState,
+        })
         oauthServer = server
 
         // 2. 生成授权 URL
-        const oauthState = generateState()
-        const redirectUri = process.env.ANTI_API_OAUTH_REDIRECT_URL || `http://localhost:${port}/oauth-callback`
-        const authUrl = generateAuthURL(redirectUri, oauthState)
+        const redirectUri = getAntigravityOAuthRedirectUri(port, configuredRedirect)
+        const authUrl = generateAuthURL(redirectUri, loginState, oauthSession.codeVerifier)
 
         // 3. 打开浏览器
         console.log(`\n========================================\n🔗 請在瀏覽器中開啟以下網址進行 Google Antigravity 授權：\n\n${authUrl}\n========================================\n`)
-        if (process.env.ANTI_API_OAUTH_NO_OPEN !== "1") {
-            try {
-                const openCmd = process.platform === "darwin" ? "open" : (process.platform === "win32" ? "cmd" : "xdg-open")
-                const openArgs = process.platform === "win32" ? ["/c", "start", authUrl] : [authUrl]
-                Bun.spawn([openCmd, ...openArgs], { stdout: "ignore", stderr: "ignore" })
-            } catch {
-                consola.warn("Failed to open browser automatically")
-            }
+        if (!openBrowser(authUrl, { disabledEnv: "ANTI_API_OAUTH_NO_OPEN" })) {
+            consola.debug("Browser launch skipped or unavailable; open the URL above manually")
         }
 
         // 4. 等待回调（5分钟超时）
         const timeoutPromise = new Promise<never>((_, reject) => {
-            setTimeout(() => reject(new Error("Authentication timeout (5 minutes)")), 5 * 60 * 1000)
+            timeoutId = setTimeout(() => reject(new Error("Authentication timeout (5 minutes)")), 5 * 60 * 1000)
         })
 
         const callbackResult = await Promise.race([
@@ -179,19 +195,23 @@ export async function startOAuthLogin(): Promise<{ success: boolean; error?: str
 
         // 6. 检查回调结果
         if (callbackResult.error) {
-            return { success: false, error: callbackResult.error }
+            return { success: false, error: publicOAuthError(new Error(callbackResult.error)) }
         }
 
         if (!callbackResult.code || !callbackResult.state) {
             return { success: false, error: "Missing code or state in callback" }
         }
 
-        if (callbackResult.state !== oauthState) {
+        if (callbackResult.state !== loginState) {
             return { success: false, error: "State mismatch - possible CSRF attack" }
         }
 
         // 7. 交换 code 获取 tokens
-        const tokens = await exchangeCode(callbackResult.code, redirectUri)
+        const codeVerifier = consumeOAuthPkceVerifier(loginState)
+        if (!codeVerifier) {
+            return { success: false, error: "OAuth session expired or already used" }
+        }
+        const tokens = await exchangeCode(callbackResult.code, redirectUri, codeVerifier)
 
         // 8. 获取用户信息
         const userInfo = await fetchUserInfo(tokens.accessToken)
@@ -219,9 +239,12 @@ export async function startOAuthLogin(): Promise<{ success: boolean; error?: str
 
         return { success: true, email: userInfo.email }
     } catch (error) {
-        consola.error("OAuth login failed:", error)
-        return { success: false, error: (error as Error).message }
+        const message = publicOAuthError(error)
+        consola.error(`OAuth login failed: ${message}`)
+        return { success: false, error: message }
     } finally {
+        if (timeoutId) clearTimeout(timeoutId)
+        if (oauthState) discardOAuthPkceSession(oauthState)
         if (oauthServer) {
             try {
                 oauthServer.stop()
@@ -248,7 +271,7 @@ export async function refreshToken(): Promise<boolean> {
         consola.success("Token refreshed successfully")
         return true
     } catch (error) {
-        consola.error("Token refresh failed:", error)
+        consola.error("Token refresh failed:", safeErrorMessage(error))
         return false
     }
 }

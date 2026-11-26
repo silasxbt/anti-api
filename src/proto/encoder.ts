@@ -140,6 +140,23 @@ export function getModelEnumValue(modelName: string): number | undefined {
         return MODEL_ENUM.GEMINI_4_ARGON_MEDIUM
     }
 
+    // Gemini 3.1 models use the same Antigravity enum families as Gemini 3.
+    // Keep this check ahead of the Gemini 3 matcher because `gemini_3_1_*`
+    // does not contain the contiguous `gemini_3_pro`/`gemini_3_flash` token.
+    if (normalized.includes("gemini_3_1_pro")) {
+        if (normalized.includes("high")) {
+            return MODEL_ENUM.GEMINI_3_PRO_HIGH
+        }
+        if (normalized.includes("low")) {
+            return MODEL_ENUM.GEMINI_3_PRO_LOW
+        }
+        return MODEL_ENUM.GEMINI_3_PRO
+    }
+
+    if (normalized.includes("gemini_3_1_flash")) {
+        return MODEL_ENUM.GEMINI_3_FLASH
+    }
+
     // Gemini 3 Pro (High/Low)
     if (normalized.includes("gemini_3_pro")) {
         if (normalized.includes("high")) {

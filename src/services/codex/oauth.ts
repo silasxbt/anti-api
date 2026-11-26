@@ -6,6 +6,8 @@ import { join } from "path"
 import { ensurePrivateDir, writePrivateFile } from "~/lib/private-file"
 import { authStore } from "~/services/auth/store"
 import type { AuthSource, ProviderAccount } from "~/services/auth/types"
+import { openBrowser } from "~/lib/open-browser"
+import { redactSensitiveText, safeErrorMessage } from "~/lib/redaction"
 
 const CODEX_AUTH_FILE = "~/.codex/auth.json"
 const CODEX_PROXY_AUTH_DIR = "~/.cli-proxy-api"
@@ -76,6 +78,42 @@ type CodexOAuthSession = {
 let activeSession: CodexOAuthSession | null = null
 let callbackServer: any | null = null
 let callbackServerPort: number | null = null
+
+/**
+ * Codex registers one loopback redirect URI.  The callback listener may be
+ * reached through another loopback spelling (127.0.0.1 or ::1), but that
+ * request origin must never be copied into the token exchange request.
+ */
+export function getCodexOAuthRedirectUri(port: number): string {
+    return `http://localhost:${port}${CODEX_OAUTH_CONFIG.callbackPath}`
+}
+
+/** Docker publishes callback ports only to host loopback; the container must
+ * accept the NATed connection on its own interface. */
+export function getCodexCallbackHostname(): "127.0.0.1" | "0.0.0.0" {
+    return process.env.ANTI_API_DOCKER_OAUTH_CALLBACK === "1" ? "0.0.0.0" : "127.0.0.1"
+}
+
+/** Compare state values without making a mismatch's common prefix observable. */
+export function isCodexOAuthStateValid(expected: string | undefined, actual: string | undefined): boolean {
+    if (!expected || !actual || expected.length !== actual.length || expected.length > 512) {
+        return false
+    }
+    let difference = 0
+    for (let index = 0; index < expected.length; index++) {
+        difference |= expected.charCodeAt(index) ^ actual.charCodeAt(index)
+    }
+    return difference === 0
+}
+
+/** Do not reflect arbitrary OAuth provider text through the local API/UI. */
+export function sanitizeCodexOAuthError(value: unknown): string {
+    const raw = typeof value === "string" ? value.trim() : ""
+    if (/^[a-zA-Z0-9._-]{1,64}$/.test(raw)) {
+        return `Codex OAuth authorization failed (${raw})`
+    }
+    return "Codex OAuth authorization failed"
+}
 
 function decodeJwt(token: string): Record<string, any> | null {
     const parts = token.split(".")
@@ -261,18 +299,14 @@ function formatOAuthError(data: any, fallback: string, status?: number): string 
         } else if (typeof data.message === "string") {
             message = data.message
         } else {
-            try {
-                message = JSON.stringify(data)
-            } catch {
-                message = fallback
-            }
+            message = fallback
         }
     }
 
     if (status) {
-        return `${message} (status ${status})`
+        return redactSensitiveText(`${message} (status ${status})`)
     }
-    return message
+    return redactSensitiveText(message)
 }
 
 function parseExpiresAt(value: unknown): number | undefined {
@@ -669,19 +703,6 @@ export async function getCodexCliLoginStatus(sessionId: string): Promise<{
     }
 }
 
-function openBrowser(url: string): void {
-    const platform = process.platform
-    let cmd = "xdg-open"
-    let args = [url]
-    if (platform === "darwin") {
-        cmd = "open"
-    } else if (platform === "win32") {
-        cmd = "cmd"
-        args = ["/c", "start", url]
-    }
-    Bun.spawn([cmd, ...args], { stdout: "ignore", stderr: "ignore" })
-}
-
 function buildCodexAuthorizeUrl(port: number): {
     state: string
     authUrl: string
@@ -690,7 +711,7 @@ function buildCodexAuthorizeUrl(port: number): {
     codeVerifier?: string
 } {
     const state = crypto.randomUUID()
-    const redirectUri = `http://localhost:${port}${CODEX_OAUTH_CONFIG.callbackPath}`
+    const redirectUri = getCodexOAuthRedirectUri(port)
     const params = new URLSearchParams({
         client_id: CODEX_OAUTH_CONFIG.clientId,
         redirect_uri: redirectUri,
@@ -745,7 +766,7 @@ export async function importCodexAuthFile(): Promise<ProviderAccount | null> {
                     expiresAt = now + refreshed.expiresIn * 1000
                 }
             } catch (error) {
-                consola.warn("Codex refresh failed during import:", error)
+                consola.warn("Codex refresh failed during import:", safeErrorMessage(error))
                 return null
             }
         }
@@ -760,7 +781,7 @@ export async function importCodexAuthFile(): Promise<ProviderAccount | null> {
                     expiresAt = now + refreshed.expiresIn * 1000
                 }
             } catch (error) {
-                consola.warn("Codex refresh failed during import:", error)
+                consola.warn("Codex refresh failed during import:", safeErrorMessage(error))
                 return null
             }
         }
@@ -789,11 +810,11 @@ export async function importCodexAuthFile(): Promise<ProviderAccount | null> {
         try {
             saveCodexProxyAuthFile(account, idToken)
         } catch (error) {
-            consola.warn("Codex proxy auth save failed:", error)
+            consola.warn("Codex proxy auth save failed:", safeErrorMessage(error))
         }
         return account
     } catch (error) {
-        consola.warn("Codex auth file import failed:", error)
+        consola.warn("Codex auth file import failed:", safeErrorMessage(error))
         return null
     }
 }
@@ -826,7 +847,7 @@ export async function importCodexProxyAuthFiles(): Promise<ProviderAccount[]> {
                         expiresAt = Date.now() + refreshed.expiresIn * 1000
                     }
                 } catch (error) {
-                    consola.warn(`Codex proxy refresh failed for ${file}:`, error)
+                    consola.warn(`Codex proxy refresh failed for ${file}:`, safeErrorMessage(error))
                     continue
                 }
             }
@@ -861,7 +882,7 @@ export async function importCodexProxyAuthFiles(): Promise<ProviderAccount[]> {
             authStore.saveAccount(account)
             accounts.set(account.id, account)
         } catch (error) {
-            consola.warn(`Codex proxy auth import failed for ${file}:`, error)
+            consola.warn(`Codex proxy auth import failed for ${file}:`, safeErrorMessage(error))
         }
     }
 
@@ -934,18 +955,25 @@ export async function pollCodexOAuthSession(state: string): Promise<{
         return { status: "pending" }
     }
 
-    const callback = activeSession.callback
+    // Consume the callback before doing network or storage work.  This makes
+    // polling one-shot and prevents a code from being replayed after a failed
+    // exchange or a concurrent poll request.
+    const session = activeSession
+    const callback = session.callback!
+    activeSession = null
+
     if (callback.error) {
-        activeSession = null
-        return { status: "error", message: callback.error }
+        return { status: "error", message: sanitizeCodexOAuthError(callback.error) }
     }
 
-    if (!callback.code || callback.state !== state) {
+    if (!callback.code || !isCodexOAuthStateValid(session.state, callback.state)) {
         return { status: "error", message: "Invalid OAuth callback" }
     }
 
-    const redirectUri = callback.redirectUri || activeSession.redirectUri
-    const tokenResponse = await exchangeCodexCode(callback.code, redirectUri, activeSession.codeVerifier)
+    // Always use the redirect URI captured when the authorization URL was
+    // generated.  `callback.redirectUri` is derived from an HTTP request and
+    // is therefore untrusted, even when it points at loopback.
+    const tokenResponse = await exchangeCodexCode(callback.code, session.redirectUri, session.codeVerifier)
     const claims = tokenResponse.idToken ? decodeJwt(tokenResponse.idToken) : null
     const email = claims?.email
     const accountId = claims?.sub || email || `codex-${Date.now()}`
@@ -965,7 +993,7 @@ export async function pollCodexOAuthSession(state: string): Promise<{
     try {
         saveCodexProxyAuthFile(account, tokenResponse.idToken)
     } catch (error) {
-        consola.warn("Codex proxy auth save failed:", error)
+        consola.warn("Codex proxy auth save failed:", safeErrorMessage(error))
     }
     activeSession = null
 
@@ -974,8 +1002,8 @@ export async function pollCodexOAuthSession(state: string): Promise<{
 
 export async function startCodexOAuthLogin(): Promise<ProviderAccount> {
     const state = crypto.randomUUID()
-    const { server, port, waitForCallback } = await startOAuthCallbackServer(CODEX_OAUTH_CONFIG.callbackPort)
-    const redirectUri = `http://localhost:${port}${CODEX_OAUTH_CONFIG.callbackPath}`
+    const { server, port, waitForCallback } = await startOAuthCallbackServer(CODEX_OAUTH_CONFIG.callbackPort, state)
+    const redirectUri = getCodexOAuthRedirectUri(port)
 
     const params = new URLSearchParams({
         client_id: CODEX_OAUTH_CONFIG.clientId,
@@ -997,20 +1025,19 @@ export async function startCodexOAuthLogin(): Promise<ProviderAccount> {
     const authUrl = `${CODEX_OAUTH_CONFIG.authorizeUrl}?${params.toString()}`
     consola.info("Codex OAuth callback server started")
 
-    openBrowser(authUrl)
+    openBrowser(authUrl, { disabledEnv: "ANTI_API_OAUTH_NO_OPEN" })
 
     const result = await waitForCallback()
     server.stop()
 
     if (result.error) {
-        throw new Error(result.error)
+        throw new Error(sanitizeCodexOAuthError(result.error))
     }
-    if (!result.code || result.state !== state) {
+    if (!result.code || !isCodexOAuthStateValid(state, result.state)) {
         throw new Error("Invalid OAuth callback state")
     }
 
-    const effectiveRedirect = result.redirectUri || redirectUri
-    const tokenResponse = await exchangeCodexCode(result.code, effectiveRedirect, codeVerifier)
+    const tokenResponse = await exchangeCodexCode(result.code, redirectUri, codeVerifier)
     const claims = tokenResponse.idToken ? decodeJwt(tokenResponse.idToken) : null
     const email = claims?.email
     const accountId = claims?.sub || email || `codex-${Date.now()}`
@@ -1030,7 +1057,7 @@ export async function startCodexOAuthLogin(): Promise<ProviderAccount> {
     try {
         saveCodexProxyAuthFile(account, tokenResponse.idToken)
     } catch (error) {
-        consola.warn("Codex proxy auth save failed:", error)
+        consola.warn("Codex proxy auth save failed:", safeErrorMessage(error))
     }
     return account
 }
@@ -1151,7 +1178,7 @@ async function refreshCodexProxyAccessToken(
     if (target.protocol !== "https:") {
         throw new Error("ANTI_API_CODEX_PROXY_REFRESH_URL must use HTTPS.")
     }
-    consola.warn(`Sending a Codex refresh token to the explicitly configured third-party host: ${target.host}`)
+    consola.warn("Sending a Codex refresh token to an explicitly configured third-party host")
 
     const params = new URLSearchParams()
     params.set("refresh_token", refreshToken)
@@ -1311,24 +1338,73 @@ export async function debugCodexOAuth(): Promise<{
 
 function startCodexCallbackServer(
     port: number,
-    onResult: (result: CodexCallbackResult) => void
+    onResult: (result: CodexCallbackResult) => void,
+    expectedState?: () => string | undefined
 ): any {
+    let acceptedState: string | undefined
     return Bun.serve({
+        // OAuth authorization codes must only be delivered to this local
+        // process. Do not let Bun's default wildcard bind expose the callback
+        // listener to the LAN or public interfaces.
+        hostname: getCodexCallbackHostname(),
         port,
         fetch(req) {
-            const url = new URL(req.url)
-            if (url.pathname === CODEX_OAUTH_CONFIG.callbackPath) {
-                const code = url.searchParams.get("code")
-                const state = url.searchParams.get("state")
-                const error = url.searchParams.get("error")
-                const redirectUri = `${url.origin}${url.pathname}`
-                onResult({
-                    code: code || undefined,
-                    state: state || undefined,
-                    error: error || undefined,
-                    redirectUri,
+            if (req.method !== "GET") {
+                return new Response("Method Not Allowed", { status: 405, headers: { Allow: "GET" } })
+            }
+
+            let url: URL
+            try {
+                url = new URL(req.url)
+            } catch {
+                return new Response("Invalid callback URL", { status: 400 })
+            }
+            if (url.pathname !== CODEX_OAUTH_CONFIG.callbackPath) {
+                return new Response("Not Found", { status: 404 })
+            }
+
+            const redirectUri = getSafeCodexRedirectUri(url, port)
+            if (!redirectUri) {
+                return new Response("Invalid callback host", { status: 400 })
+            }
+
+            const code = url.searchParams.get("code")
+            const state = url.searchParams.get("state")
+            const error = url.searchParams.get("error")
+
+            // Bind the callback to the state that created this listener. A
+            // callback with another state must not wake the waiting login or
+            // overwrite a pending session.
+            const expected = expectedState?.()
+            if (!isCodexOAuthStateValid(expected, state || undefined)) {
+                return new Response("Invalid OAuth callback state", {
+                    status: 400,
+                    headers: { "Cache-Control": "no-store" },
                 })
-                return new Response(`
+            }
+            if (acceptedState && isCodexOAuthStateValid(acceptedState, state || undefined)) {
+                return new Response("OAuth callback already received", {
+                    status: 409,
+                    headers: { "Cache-Control": "no-store" },
+                })
+            }
+            if (!code && !error) {
+                return new Response("Missing OAuth callback result", {
+                    status: 400,
+                    headers: { "Cache-Control": "no-store" },
+                })
+            }
+
+            acceptedState = state || undefined
+            onResult({
+                code: code || undefined,
+                state: state || undefined,
+                error: error || undefined,
+                // Keep this field for callers that inspect the callback, but
+                // it is never used for token exchange (see poll/login above).
+                redirectUri: getCodexOAuthRedirectUri(port),
+            })
+            return new Response(`
                     <!DOCTYPE html>
                     <html>
                     <head>
@@ -1343,11 +1419,33 @@ function startCodexCallbackServer(
                         <p>You can close this window.</p>
                     </body>
                     </html>
-                `, { headers: { "Content-Type": "text/html" } })
-            }
-            return new Response("Not Found", { status: 404 })
+                `, {
+                headers: {
+                    "Content-Type": "text/html; charset=utf-8",
+                    "Cache-Control": "no-store",
+                },
+            })
         },
     })
+}
+
+export function getSafeCodexRedirectUri(url: URL, port: number): string | null {
+    const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "")
+    const isLoopback = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1"
+    if (
+        url.protocol !== "http:" ||
+        !isLoopback ||
+        url.port !== String(port) ||
+        url.pathname !== CODEX_OAUTH_CONFIG.callbackPath ||
+        url.username ||
+        url.password
+    ) {
+        return null
+    }
+    // Canonicalize every accepted loopback spelling to the URI registered in
+    // the OAuth client. This keeps callback request metadata out of token
+    // exchange and avoids localhost/127.0.0.1 redirect mismatches.
+    return getCodexOAuthRedirectUri(port)
 }
 
 function ensureCodexCallbackServer(): any {
@@ -1361,10 +1459,11 @@ function ensureCodexCallbackServer(): any {
             const port = startPort + offset
             try {
                 callbackServer = startCodexCallbackServer(port, (result) => {
-                    if (activeSession && activeSession.state === result.state) {
-                        activeSession.callback = result
+                    const session = activeSession
+                    if (session && isCodexOAuthStateValid(session.state, result.state)) {
+                        session.callback = { ...result, redirectUri: session.redirectUri }
                     }
-                })
+                }, () => activeSession?.state)
                 callbackServerPort = port
                 break
             } catch (error) {
@@ -1379,7 +1478,7 @@ function ensureCodexCallbackServer(): any {
     }
 }
 
-async function startOAuthCallbackServer(port: number): Promise<{
+async function startOAuthCallbackServer(port: number, expectedState: string): Promise<{
     server: any
     port: number
     waitForCallback: () => Promise<{ code?: string; state?: string; error?: string; redirectUri?: string }>
@@ -1400,7 +1499,7 @@ async function startOAuthCallbackServer(port: number): Promise<{
                 if (callbackResolve) {
                     callbackResolve(result)
                 }
-            })
+            }, () => expectedState)
             boundPort = candidate
             break
         } catch (error) {
