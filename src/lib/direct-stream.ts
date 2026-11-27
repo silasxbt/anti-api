@@ -1206,10 +1206,38 @@ export function claudeMessagesToResponsesInput(messages: ClaudeMessage[]): {
         const userParts: any[] = []
         for (const block of blocks) {
             if (block.type === "tool_result") {
+                let output: string | any[]
+                if (typeof block.content === "string") {
+                    output = block.content
+                } else if (Array.isArray(block.content)) {
+                    const outParts: any[] = []
+                    for (const part of block.content) {
+                        if (part?.type === "text" && typeof part.text === "string") {
+                            outParts.push({ type: "input_text", text: part.text })
+                        } else if (part?.type === "image" && part.source) {
+                            const url = part.source.type === "base64"
+                                ? `data:${part.source.media_type};base64,${part.source.data}`
+                                : part.source.url
+                            if (url) outParts.push({ type: "input_image", image_url: url })
+                        } else if (part?.type === "audio" && part.source) {
+                            if (part.source.type === "base64") {
+                                outParts.push({
+                                    type: "input_audio",
+                                    input_audio: { data: part.source.data, format: part.source.media_type.replace("audio/", "") },
+                                })
+                            } else if (part.source.url) {
+                                outParts.push({ type: "input_audio", audio_url: { url: part.source.url } })
+                            }
+                        }
+                    }
+                    output = outParts.length > 0 ? outParts : ""
+                } else {
+                    output = JSON.stringify(block.content ?? "")
+                }
                 input.push({
                     type: "function_call_output",
                     call_id: block.tool_use_id || randomId("call"),
-                    output: typeof block.content === "string" ? block.content : JSON.stringify(block.content ?? ""),
+                    output,
                 })
             } else if (block.type === "text" && block.text) {
                 userParts.push({ type: "input_text", text: block.text })

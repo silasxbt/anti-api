@@ -17,7 +17,7 @@ export interface ClaudeContentBlock {
     name?: string
     input?: any
     tool_use_id?: string
-    content?: string
+    content?: string | ClaudeContentBlock[]
     source?: {
         type: "base64"
         media_type: string

@@ -514,4 +514,42 @@ describe("eventsToResponsesSse", () => {
         expect(last.data.response.output_text).toBe("Partial output")
         expect(last.data.response.output[0].status).toBe("incomplete")
     })
+
+    test("preserves input_image parts inside function_call_output instead of stringifying base64", () => {
+        const payload: ResponsesCreateRequest = {
+            model: "gemini-4-hydrogen",
+            input: [
+                {
+                    type: "function_call",
+                    call_id: "call_vision_1",
+                    name: "vision_analyze",
+                    arguments: '{"image_url":"map.jpg"}',
+                },
+                {
+                    type: "function_call_output",
+                    call_id: "call_vision_1",
+                    output: [
+                        { type: "input_text", text: "Image loaded into your context." },
+                        { type: "input_image", image_url: "data:image/jpeg;base64,AQID" },
+                    ] as any,
+                },
+            ],
+        }
+
+        const routed = responsesToRoutedInput(payload)
+        expect(routed.messages).toHaveLength(2)
+        expect(routed.messages[1]).toEqual({
+            role: "user",
+            content: [
+                {
+                    type: "tool_result",
+                    tool_use_id: "call_vision_1",
+                    content: [
+                        { type: "text", text: "Image loaded into your context." },
+                        { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "AQID" } },
+                    ],
+                },
+            ],
+        })
+    })
 })

@@ -392,7 +392,7 @@ function extractTextContent(content: any): string {
         for (const block of content) {
             if (block.type === "text" && block.text) parts.push(block.text)
             else if (block.type === "tool_use") parts.push("[Tool: " + block.name + "]")
-            else if (block.type === "tool_result" && typeof block.content === "string") parts.push(block.content)
+            else if (block.type === "tool_result") parts.push(mergeToolResultContent(block.content))
         }
         return parts.join("\n") || "[No text]"
     }
@@ -416,6 +416,9 @@ function mergeToolResultContent(content: unknown, isError?: boolean): string {
             .filter(Boolean)
             .join("\n")
         if (merged.trim()) return merged
+        if (content.some((block) => block && typeof block === "object" && (block.type === "image" || block.type === "audio" || block.type === "document"))) {
+            return "[Media attached]"
+        }
     }
     if (content != null) return JSON.stringify(content)
     return isError ? "Tool execution failed with no output." : "Command executed successfully."
@@ -578,6 +581,63 @@ function isGeminiModel(model?: string): boolean {
     return /gemini|argon/i.test(model)
 }
 
+async function mediaBlockToAntigravityPart(
+    block: any,
+    imageBudget: ImageInputBudget,
+    options: { signal?: AbortSignal } = {},
+): Promise<any | null> {
+    if (!block || typeof block !== "object") return null
+
+    if (block.type === "image" && block.source?.type === "base64") {
+        return {
+            inlineData: {
+                mimeType: block.source.media_type,
+                data: block.source.data,
+            },
+        }
+    }
+
+    if (block.type === "image" && block.source?.type === "url") {
+        if (imageBudget.remainingBytes <= 0) {
+            throw new RequestValidationError("image inputs exceed the 16 MiB per-request limit")
+        }
+        const image = await fetchRemoteImageAsBase64(block.source.url, {
+            signal: options.signal,
+            maxBytes: imageBudget.remainingBytes,
+        })
+        imageBudget.addFetchedBytes(decodedBase64ImageBytes(image.data, true))
+        return {
+            inlineData: {
+                mimeType: image.media_type,
+                data: image.data,
+            },
+        }
+    }
+
+    if (block.source?.type === "base64" && (block.type === "audio" || (block.type === "document" && block.source.media_type.startsWith("audio/")))) {
+        return {
+            inlineData: {
+                mimeType: block.source.media_type,
+                data: block.source.data,
+            },
+        }
+    }
+
+    if (block.type === "audio" && block.source?.type === "url") {
+        const audio = await fetchRemoteAudioAsBase64(block.source.url, {
+            signal: options.signal,
+        })
+        return {
+            inlineData: {
+                mimeType: audio.media_type,
+                data: audio.data,
+            },
+        }
+    }
+
+    return null
+}
+
 export async function buildAntigravityParts(
     content: ClaudeMessage["content"],
     toolIdToName: Map<string, string>,
@@ -602,54 +662,9 @@ export async function buildAntigravityParts(
             continue
         }
 
-        if (block.type === "image" && block.source?.type === "base64") {
-            parts.push({
-                inlineData: {
-                    mimeType: block.source.media_type,
-                    data: block.source.data,
-                },
-            })
-            continue
-        }
-
-        if (block.type === "image" && block.source?.type === "url") {
-            if (imageBudget.remainingBytes <= 0) {
-                throw new RequestValidationError("image inputs exceed the 16 MiB per-request limit")
-            }
-            const image = await fetchRemoteImageAsBase64(block.source.url, {
-                signal: options.signal,
-                maxBytes: imageBudget.remainingBytes,
-            })
-            imageBudget.addFetchedBytes(decodedBase64ImageBytes(image.data, true))
-            parts.push({
-                inlineData: {
-                    mimeType: image.media_type,
-                    data: image.data,
-                },
-            })
-            continue
-        }
-
-        if (block.source?.type === "base64" && (block.type === "audio" || (block.type === "document" && block.source.media_type.startsWith("audio/")))) {
-            parts.push({
-                inlineData: {
-                    mimeType: block.source.media_type,
-                    data: block.source.data,
-                },
-            })
-            continue
-        }
-
-        if (block.type === "audio" && block.source?.type === "url") {
-            const audio = await fetchRemoteAudioAsBase64(block.source.url, {
-                signal: options.signal,
-            })
-            parts.push({
-                inlineData: {
-                    mimeType: audio.media_type,
-                    data: audio.data,
-                },
-            })
+        const mediaPart = await mediaBlockToAntigravityPart(block, imageBudget, options)
+        if (mediaPart) {
+            parts.push(mediaPart)
             continue
         }
 
@@ -695,6 +710,15 @@ export async function buildAntigravityParts(
             }
             if (toolUseId) functionResponse.id = toolUseId
             parts.push({ functionResponse })
+
+            if (Array.isArray(block.content)) {
+                for (const nested of block.content) {
+                    const nestedMedia = await mediaBlockToAntigravityPart(nested, imageBudget, options)
+                    if (nestedMedia) {
+                        parts.push(nestedMedia)
+                    }
+                }
+            }
             continue
         }
     }

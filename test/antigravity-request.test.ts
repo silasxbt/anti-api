@@ -216,3 +216,44 @@ test("parseApiResponse handles MAX_TOKENS without content gracefully", () => {
     expect(res.usage.outputTokens).toBe(65536)
 })
 
+test("Antigravity request builder emits inlineData for images inside tool_result instead of stringifying", async () => {
+    const toolIdToName = new Map<string, string>([["call_vision_1", "vision_analyze"]])
+    const parts = await buildAntigravityParts([
+        {
+            type: "tool_result",
+            tool_use_id: "call_vision_1",
+            content: [
+                { type: "text", text: "Image loaded." },
+                { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "AQID" } },
+            ],
+        },
+    ], toolIdToName)
+
+    expect(parts).toEqual([
+        {
+            functionResponse: {
+                name: "vision_analyze",
+                id: "call_vision_1",
+                response: { result: "Image loaded." },
+            },
+        },
+        {
+            inlineData: {
+                mimeType: "image/jpeg",
+                data: "AQID",
+            },
+        },
+    ])
+})
+
+test("Antigravity request builder counts tool_result images against image budget", async () => {
+    const toolBlocks = Array.from({ length: 17 }, (_, idx) => ({
+        type: "tool_result" as const,
+        tool_use_id: `call_${idx}`,
+        content: [{ type: "image" as const, source: { type: "base64" as const, media_type: "image/png", data: "AQID" } }],
+    }))
+    await expect(
+        claudeToAntigravity("gemini-4-hydrogen", [{ role: "user", content: toolBlocks }])
+    ).rejects.toThrow(/Too many images/)
+})
+

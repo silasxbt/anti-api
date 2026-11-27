@@ -361,10 +361,33 @@ function toContentBlocks(content: string | ClaudeContentBlock[]): ClaudeContentB
     return [...content]
 }
 
-function serializeFunctionOutput(output: unknown, itemIndex: number): string {
+const RESPONSES_MEDIA_PART_TYPES = new Set(["input_image", "image_url", "input_audio", "audio_url"])
+
+function translateFunctionOutput(output: unknown, itemIndex: number): string | ClaudeContentBlock[] {
     if (output === null || output === undefined) return ""
     if (typeof output === "string") return output
     if (Array.isArray(output)) {
+        const hasMedia = output.some(
+            part => isRecord(part) && typeof part.type === "string" && RESPONSES_MEDIA_PART_TYPES.has(part.type)
+        )
+        if (hasMedia) {
+            const blocks: ClaudeContentBlock[] = []
+            for (let i = 0; i < output.length; i++) {
+                const part = output[i]
+                if (isRecord(part) && (part.type === "input_text" || part.type === "text" || part.type === "output_text")) {
+                    if (typeof part.text !== "string") {
+                        throw new RequestValidationError(`function_call_output part at index ${i} must include text`)
+                    }
+                    blocks.push({ type: "text", text: part.text })
+                } else if (isRecord(part) && typeof part.type === "string" && RESPONSES_MEDIA_PART_TYPES.has(part.type)) {
+                    blocks.push(translateResponsesContentPart(part as unknown as ResponsesContentPart, i))
+                } else {
+                    blocks.push({ type: "text", text: JSON.stringify(part) })
+                }
+            }
+            return blocks
+        }
+
         const texts: string[] = []
         for (let i = 0; i < output.length; i++) {
             const part = output[i]
@@ -475,11 +498,11 @@ export function translateResponsesInput(
             if (typeof item.call_id !== "string" || !item.call_id.trim()) {
                 throw new RequestValidationError(`function_call_output at index ${index} must include call_id`)
             }
-            const outputText = serializeFunctionOutput(item.output, index)
+            const outputContent = translateFunctionOutput(item.output, index)
             const toolResultBlock: ClaudeContentBlock = {
                 type: "tool_result",
                 tool_use_id: item.call_id,
-                content: outputText,
+                content: outputContent,
             }
 
             const lastMessage = messages[messages.length - 1]

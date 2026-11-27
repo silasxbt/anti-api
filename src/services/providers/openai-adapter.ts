@@ -166,7 +166,11 @@ export function toOpenAIMessages(messages: ClaudeMessage[]): OpenAIChatMessage[]
                     result.push({
                         role: "tool",
                         tool_call_id: block.tool_use_id || "tool",
-                        content: typeof block.content === "string" ? block.content : JSON.stringify(block.content || {}),
+                        content: typeof block.content === "string"
+                            ? block.content
+                            : Array.isArray(block.content)
+                              ? toOpenAIContent(block.content)
+                              : JSON.stringify(block.content || {}),
                     })
                 }
             }

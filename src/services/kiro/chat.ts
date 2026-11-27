@@ -48,11 +48,25 @@ function toolResultsFromMessage(message: ClaudeMessage): ToolResult[] {
     if (typeof message.content === "string") return []
     return message.content
         .filter(block => block.type === "tool_result")
-        .map(block => ({
-            toolUseId: block.tool_use_id,
-            content: [{ text: typeof block.content === "string" ? block.content : JSON.stringify(block.content || "") }],
-            status: (block as any).is_error ? ToolResultStatus.ERROR : ToolResultStatus.SUCCESS,
-        }))
+        .map(block => {
+            let text: string
+            if (typeof block.content === "string") {
+                text = block.content
+            } else if (Array.isArray(block.content)) {
+                const merged = block.content
+                    .map(b => (b && typeof b === "object" && typeof b.text === "string" ? b.text : ""))
+                    .filter(Boolean)
+                    .join("\n")
+                text = merged || "[Media attached]"
+            } else {
+                text = JSON.stringify(block.content || "")
+            }
+            return {
+                toolUseId: block.tool_use_id,
+                content: [{ text }],
+                status: (block as any).is_error ? ToolResultStatus.ERROR : ToolResultStatus.SUCCESS,
+            }
+        })
 }
 
 function toolUsesFromMessage(message: ClaudeMessage): ToolUse[] | undefined {

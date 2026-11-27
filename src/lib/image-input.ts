@@ -122,6 +122,25 @@ export class ImageInputBudget {
     }
 }
 
+function registerImageBlock(budget: ImageInputBudget, block: any): void {
+    const source = block.source
+    if (!source || typeof source !== "object") {
+        throw new RequestValidationError("image block must include a source")
+    }
+    if (source.type === "base64") {
+        budget.registerInlineImage(source.data)
+        return
+    }
+    if (source.type === "url") {
+        if (typeof source.url !== "string" || !source.url.trim()) {
+            throw new RequestValidationError("image URL source must include a URL")
+        }
+        budget.registerRemoteImage()
+        return
+    }
+    throw new RequestValidationError("image source type is not supported")
+}
+
 /** Validate image count and inline bytes before any provider request conversion. */
 export function createImageInputBudget(messages: ClaudeMessage[]): ImageInputBudget {
     const budget = new ImageInputBudget()
@@ -129,23 +148,17 @@ export function createImageInputBudget(messages: ClaudeMessage[]): ImageInputBud
     for (const message of messages) {
         if (!Array.isArray(message.content)) continue
         for (const block of message.content) {
-            if (!block || typeof block !== "object" || block.type !== "image") continue
-            const source = block.source
-            if (!source || typeof source !== "object") {
-                throw new RequestValidationError("image block must include a source")
-            }
-            if (source.type === "base64") {
-                budget.registerInlineImage(source.data)
+            if (!block || typeof block !== "object") continue
+            if (block.type === "image") {
+                registerImageBlock(budget, block)
                 continue
             }
-            if (source.type === "url") {
-                if (typeof source.url !== "string" || !source.url.trim()) {
-                    throw new RequestValidationError("image URL source must include a URL")
+            if (block.type === "tool_result" && Array.isArray(block.content)) {
+                for (const nested of block.content) {
+                    if (!nested || typeof nested !== "object" || nested.type !== "image") continue
+                    registerImageBlock(budget, nested)
                 }
-                budget.registerRemoteImage()
-                continue
             }
-            throw new RequestValidationError("image source type is not supported")
         }
     }
 

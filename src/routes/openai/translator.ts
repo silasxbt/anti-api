@@ -432,15 +432,27 @@ export function translateMessages(messages: OpenAIMessage[]): ClaudeMessage[] {
             if (typeof msg.tool_call_id !== "string" || !msg.tool_call_id) {
                 throw new RequestValidationError("tool message must include tool_call_id")
             }
-            if (msg.content !== null && typeof msg.content !== "string") {
-                throw new RequestValidationError("tool message content must be a string or null")
+            let toolContent: string | ClaudeContentBlock[]
+            if (msg.content === null || msg.content === undefined) {
+                toolContent = ""
+            } else if (typeof msg.content === "string") {
+                toolContent = msg.content
+            } else if (Array.isArray(msg.content)) {
+                const translated = translateOpenAIContent(msg.content)
+                toolContent = typeof translated === "string"
+                    ? translated
+                    : translated.some(b => b.type === "image" || b.type === "audio")
+                      ? translated
+                      : translated.map(b => b.text || "").filter(Boolean).join("\n")
+            } else {
+                throw new RequestValidationError("tool message content must be a string, array, or null")
             }
             return {
                 role: "user" as const,
                 content: [{
                     type: "tool_result" as const,
                     tool_use_id: msg.tool_call_id,
-                    content: msg.content || "",
+                    content: toolContent,
                 }],
             }
         }

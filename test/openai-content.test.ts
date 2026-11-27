@@ -124,3 +124,32 @@ test("OpenAI audio content supports input_audio and audio_url", () => {
         { type: "audio", source: { type: "url", url: "https://example.com/sound.mp3" } },
     ])
 })
+
+test("OpenAI tool role supports multimodal content arrays with image_url", () => {
+    const messages = translateMessages([
+        {
+            role: "tool",
+            tool_call_id: "call_img_1",
+            content: [
+                { type: "text", text: "Loaded image" },
+                { type: "image_url", image_url: { url: "data:image/jpeg;base64,AQID" } },
+            ],
+        } as any,
+    ])
+
+    expect(messages).toEqual([
+        {
+            role: "user",
+            content: [
+                {
+                    type: "tool_result",
+                    tool_use_id: "call_img_1",
+                    content: [
+                        { type: "text", text: "Loaded image" },
+                        { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "AQID" } },
+                    ],
+                },
+            ],
+        },
+    ])
+})

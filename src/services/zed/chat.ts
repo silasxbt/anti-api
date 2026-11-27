@@ -318,6 +318,9 @@ function mergeToolResultContent(content: unknown): string {
             .filter(Boolean)
             .join("\n")
         if (merged.trim()) return merged
+        if (content.some((block) => block && typeof block === "object" && ((block as any).type === "image" || (block as any).type === "audio"))) {
+            return "[Media attached]"
+        }
     }
     if (content != null) return JSON.stringify(content)
     return ""
